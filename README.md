@@ -75,31 +75,32 @@ API-server CRUD + the reconcile loop, not a full pod-scheduling cluster. CI addi
 runs a real `kind` deploy of the Helm chart (`.github/workflows/integration.yml`'s
 `kind-deploy` job) to catch chart/RBAC/rollout issues envtest can't.
 
-## Decisions made here, flagged back to booth-architecture
+## Decisions made here, since resolved at the architecture level
 
 Per this repo's brief, three of `agent-briefs/core.md`'s open questions needed a
-concrete answer before v0 could be built, and are documented (with reasoning) in
-`docs/decisions/`:
+concrete answer before v0 could be built. Each was documented with reasoning in
+`docs/decisions/`, flagged back, and has since been reviewed and promoted to a
+`booth-architecture` ADR:
 
-- **0001 — workspace-role claim shape**: the `groups` claim →
-  `/workspaces/<slug>/<owner|editor|viewer>` grammar, and how the active workspace is
-  resolved per-request (`X-Workspace` header, validated against the token).
-- **0002 — NATS subject naming**: `booth.<workspace>.<event-type>` subjects, one shared
-  `BOOTH_EVENTS` JetStream stream, and a minimal event envelope.
-- **0005 — module lifecycle desired state**: v0 ships on-demand install/uninstall only
-  (no drift-reconciling desired-state store); where a Module Store catalog of installable
-  modules actually lives is unresolved and needs `booth-design`'s Module Store design.
+- **0001 — workspace-role claim shape** → **ADR 0025**, accepted exactly as proposed. The
+  `groups` claim → `/workspaces/<slug>/<owner|editor|viewer>` grammar, and how the active
+  workspace is resolved per-request (`X-Workspace` header, validated against the token),
+  are now settled architecture-wide, not just a booth-core convention.
+- **0002 — NATS subject naming** → **ADR 0026**, accepted exactly as proposed.
+  `booth.<workspace>.<event-type>` subjects, one shared `BOOTH_EVENTS` JetStream stream,
+  and the event envelope are now the contract every publishing/subscribing module builds
+  against.
+- **0005 — module lifecycle desired state** → **ADR 0027**, resolved differently than any
+  of the three candidates this repo's decision considered: a new mandatory repo,
+  `booth-module-store`, owns the installable-module catalog and Module Store UI end to
+  end, calling this repo's existing on-demand install/uninstall API. **No code changes
+  were required here** — see `docs/decisions/0005` for detail.
 
-Two more are recorded but don't need architecture-level sign-off (repo-internal
+Two more are recorded but never needed architecture-level sign-off (repo-internal
 conventions, not cross-cutting contracts):
 
 - **0003 — local-dev registry fallback** shape.
 - **0004 — backend language** choice (Go) and why.
-
-**These need review and promotion to `booth-architecture` ADRs (0001, 0002, 0005) before
-another module bakes in an assumption about them** — per the ground rule in
-`booth-architecture`'s README, this repo doesn't get to unilaterally settle cross-cutting
-contract questions.
 
 ## What's built vs. what's left, against the v0 definition of done
 

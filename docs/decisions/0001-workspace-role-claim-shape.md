@@ -1,8 +1,8 @@
 # booth-core decision 0001: Workspace-role claim shape
 
-Status: proposed by booth-core, needs to return to booth-architecture as an ADR before
-any other module treats it as settled (per `agent-briefs/core.md`'s open questions and
-`ARCHITECTURE.md`'s ground rule).
+Status: **promoted, accepted as-is** —
+`../../../booth-architecture/decisions/0025-workspace-role-claim-shape.md` (2026-09-17).
+No rework needed; this file is kept as the detailed reasoning behind that ADR.
 
 ## Context
 
@@ -80,7 +80,5 @@ managing membership day-to-day, that's a real v1 reconsideration — not resolve
 
 ## Flagged back
 
-This is a booth-core proposal, not a unilaterally-settled cross-cutting decision. It
-should be reviewed and, if accepted, promoted to a `booth-architecture` ADR (filling in
-`ARCHITECTURE.md` §7's "exact workspace-role claim shape" item) before `booth-design` or
-any other module bakes in an assumption about it.
+Resolved: promoted to `booth-architecture` ADR 0025, accepted exactly as proposed here.
+`booth-design` and any other module can now build against this shape as settled.

@@ -1,8 +1,8 @@
 # booth-core decision 0002: NATS subject naming convention
 
-Status: proposed by booth-core, needs to return to booth-architecture as an ADR before
-any module publishes/subscribes against it (per `agent-briefs/core.md`'s open questions
-and `contracts/core-platform-api.md`'s "explicitly not decided yet" list).
+Status: **promoted, accepted as-is** —
+`../../../booth-architecture/decisions/0026-nats-subject-naming.md` (2026-09-17). No
+rework needed; this file is kept as the detailed reasoning behind that ADR.
 
 ## Context
 
@@ -74,6 +74,5 @@ schema is each event type's own concern to define (e.g. ADR 0018's follow-up for
 
 ## Flagged back
 
-Booth-core proposal, not unilaterally settled. Needs review and promotion to a
-`booth-architecture` ADR before another module bakes in an assumption about subject
-shape or the envelope format.
+Resolved: promoted to `booth-architecture` ADR 0026, accepted exactly as proposed here.
+Any module can now build its publish/subscribe wiring against this shape as settled.
