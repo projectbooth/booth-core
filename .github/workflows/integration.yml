@@ -1,0 +1,79 @@
+name: Integration
+
+# Layer 3 (contracts/testing-strategy.md, ADR 0024): real-cluster integration tests.
+# Runs on merge to main and nightly, not on every push/PR, since it's slower than the
+# unit+contract layer.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 7 * * *" # nightly
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  envtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install setup-envtest
+        run: go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.19
+
+      - name: Provision envtest binaries
+        run: |
+          echo "KUBEBUILDER_ASSETS=$($(go env GOPATH)/bin/setup-envtest use 1.31.0 -p path)" >> "$GITHUB_ENV"
+
+      - name: Run real-API-server integration tests
+        run: go test ./test/integration/... -v -timeout 120s
+
+  kind-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: booth-core-ci
+
+      - uses: azure/setup-helm@v4
+
+      - name: Build and load booth-core image
+        run: |
+          docker build -t booth-core:ci .
+          kind load docker-image booth-core:ci --name booth-core-ci
+
+      - name: helm dependency update
+        working-directory: charts/booth-core
+        run: helm dependency update
+
+      - name: Install booth-core chart
+        working-directory: charts/booth-core
+        run: |
+          helm install booth-core . \
+            --namespace booth-system --create-namespace \
+            --set image.repository=booth-core \
+            --set image.tag=ci \
+            --set image.pullPolicy=Never \
+            --set oidc.issuerUrl=https://keycloak.example.com/realms/booth \
+            --set oidc.clientId=booth-core \
+            --set iframeSigningKey=ci-placeholder \
+            --wait --timeout 5m
+
+      - name: Verify rollout
+        run: |
+          kubectl -n booth-system get pods
+          kubectl -n booth-system rollout status deployment/booth-core --timeout=120s
+          kubectl -n booth-system get boothmodules.booth.projectbooth.io || true
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          kubectl -n booth-system get all
+          kubectl -n booth-system logs deployment/booth-core --tail=200 || true

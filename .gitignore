@@ -1,0 +1,7 @@
+/bin/
+*.exe
+*.test
+*.out
+.envtest-bin/
+charts/*/charts/*.tgz
+dist/

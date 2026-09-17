@@ -1,0 +1,67 @@
+# Default values for booth-core. See docs/decisions/ for the reasoning behind each
+# subsystem's shape.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/projectbooth/booth-core
+  tag: "" # defaults to Chart.appVersion; overridden by CI to the published tag (contracts/testing-strategy.md)
+  pullPolicy: IfNotPresent
+
+service:
+  port: 8080
+
+# Every deployment of Project Booth must run booth-core, so this chart is expected to be
+# installed once per deployment, into its own namespace (default booth-system).
+namespaceOverride: ""
+
+oidc:
+  # Required: the OIDC issuer URL and client ID (ADR 0004). Left empty by default —
+  # every real install must set these, whether pointed at the bundled Keycloak or an
+  # external IdP.
+  issuerUrl: ""
+  clientId: ""
+  requireAudience: true
+  groupsClaim: groups
+
+# Iframe-proxy session signing key (ui-integration.md). Required for more than one
+# replica — see docs/decisions and internal/gateway/iframetoken.go's doc comment for why
+# a shared key (not a per-pod ephemeral one) matters once replicaCount > 1. Populate via
+# --set-string or a pre-created Secret referenced through existingSecret below; left
+# empty here deliberately rather than defaulting to a value that would ship identically
+# across every install.
+iframeSigningKey: ""
+# existingSecret, if set, names a pre-existing Secret with a BOOTH_IFRAME_SIGNING_KEY key
+# to use instead of iframeSigningKey above.
+existingSecret: ""
+
+postgres:
+  # DSN for core's own database on the shared PostgreSQL cluster (ADR 0014). Left empty
+  # by default; wiring the shared cluster itself is not yet part of this chart (workspace
+  # metadata persistence is tracked as follow-up work, not yet part of v0's HTTP surface).
+  dsn: ""
+
+# NATS is bundled as a subchart (ADR 0021) — every booth-core install gets an event bus,
+# since core is the one mandatory repo. JetStream is enabled for at-least-once delivery
+# (ADR 0021's reasoning).
+nats:
+  enabled: true
+  config:
+    jetstream:
+      enabled: true
+      fileStore:
+        pvc:
+          size: 5Gi
+
+resources: {}
+
+serviceAccount:
+  create: true
+  name: ""
+
+# RBAC is intentionally broad in v0 (see templates/rbac.yaml's comment) since the
+# lifecycle manager (internal/lifecycle) installs arbitrary module charts, which can
+# create arbitrary namespaced resources. Tightening this to a real least-privilege policy
+# is flagged as follow-up work, not solved here.
+rbac:
+  create: true

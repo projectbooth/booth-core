@@ -1,0 +1,6 @@
+.git
+bin/
+.envtest-bin/
+charts/
+docs/
+*.md

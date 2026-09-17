@@ -1,0 +1,72 @@
+name: CI
+
+# Layers 1-2 (contracts/testing-strategy.md, ADR 0024): unit + contract tests, no
+# cluster needed. Runs on every push and PR; branch protection on main requires this
+# to pass before merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify gofmt
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: Unit + contract tests
+        # test/integration is excluded here: it needs envtest's kube-apiserver/etcd
+        # binaries and belongs to the layer-3 workflow (integration.yml), not this
+        # fast, cluster-free layer.
+        run: go test -race -count=1 $(go list ./... | grep -v /test/integration)
+
+  helm-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: helm dependency update
+        working-directory: charts/booth-core
+        run: helm dependency update
+
+      - name: helm lint
+        working-directory: charts/booth-core
+        run: |
+          helm lint . \
+            --set oidc.issuerUrl=https://keycloak.example.com/realms/booth \
+            --set oidc.clientId=booth-core \
+            --set iframeSigningKey=ci-placeholder
+
+      - name: helm template (render check)
+        working-directory: charts/booth-core
+        run: |
+          helm template booth-core . \
+            --namespace booth-system \
+            --set oidc.issuerUrl=https://keycloak.example.com/realms/booth \
+            --set oidc.clientId=booth-core \
+            --set iframeSigningKey=ci-placeholder \
+            --include-crds > /dev/null

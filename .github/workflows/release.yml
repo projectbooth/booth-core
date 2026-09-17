@@ -1,0 +1,68 @@
+name: Release
+
+# agent-briefs/core.md's extra obligation: every other module's layer-3 integration
+# tests, and booth-e2e's nightly smoke test, need a stable, versioned booth-core build to
+# deploy against, not main at an arbitrary commit. Pushing a `vX.Y.Z` tag publishes both
+# the container image and the Helm chart (packaged, with the image tag pinned to match)
+# at that version.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/projectbooth/booth-core:${{ steps.version.outputs.version }}
+            ghcr.io/projectbooth/booth-core:latest
+
+  chart:
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: helm dependency update
+        working-directory: charts/booth-core
+        run: helm dependency update
+
+      - name: Package chart at the release version
+        working-directory: charts/booth-core
+        run: |
+          helm package . \
+            --version "${{ needs.image.outputs.version }}" \
+            --app-version "${{ needs.image.outputs.version }}" \
+            --destination ../../dist
+
+      - name: Attach chart to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tgz
+          generate_release_notes: true

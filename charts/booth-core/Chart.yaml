@@ -1,0 +1,14 @@
+apiVersion: v2
+name: booth-core
+description: >
+  Project Booth's mandatory control plane: pluggable-OIDC auth, multi-workspace
+  management, module registry/lifecycle, gateway, and event bus.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/projectbooth/booth-core
+dependencies:
+  - name: nats
+    version: "2.14.6"
+    repository: "https://nats-io.github.io/k8s/helm/charts/"
+    condition: nats.enabled

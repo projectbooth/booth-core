@@ -1,0 +1,15 @@
+# Example static registry for local development without a real Kubernetes cluster
+# (ADR 0019's noted convenience). Point BOOTH_DEV_REGISTRY_PATH at a copy of this file
+# to run booth-core against hand-run module stub processes instead of a real cluster.
+modules:
+  - id: storage
+    displayName: Storage
+    icon: drive
+    version: 0.1.0
+    contractVersion: 0.1.0
+    hasOwnUi: true
+    uiIntegrationMode: native
+    healthCheckPath: /health
+    navPath: /storage
+    navGroup: manage
+    host: localhost:9001

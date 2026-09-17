@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "booth-core.fullname" . }}
+  labels:
+    {{- include "booth-core.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "booth-core.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "booth-core.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "booth-core.serviceAccountName" . }}
+      containers:
+        - name: booth-core
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: BOOTH_HTTP_ADDR
+              value: ":8080"
+            - name: BOOTH_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: BOOTH_OIDC_ISSUER_URL
+              value: {{ .Values.oidc.issuerUrl | quote }}
+            - name: BOOTH_OIDC_CLIENT_ID
+              value: {{ .Values.oidc.clientId | quote }}
+            - name: BOOTH_OIDC_REQUIRE_AUDIENCE
+              value: {{ .Values.oidc.requireAudience | quote }}
+            - name: BOOTH_OIDC_GROUPS_CLAIM
+              value: {{ .Values.oidc.groupsClaim | quote }}
+            {{- if .Values.nats.enabled }}
+            - name: BOOTH_NATS_URL
+              value: "nats://{{ .Release.Name }}-nats:4222"
+            {{- end }}
+            - name: BOOTH_IFRAME_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "booth-core.secretName" . }}
+                  key: BOOTH_IFRAME_SIGNING_KEY
+            {{- if or .Values.postgres.dsn .Values.existingSecret }}
+            - name: BOOTH_POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "booth-core.secretName" . }}
+                  key: BOOTH_POSTGRES_DSN
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
