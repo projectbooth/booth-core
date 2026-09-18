@@ -68,13 +68,13 @@ func run() error {
 		}()
 	}
 
-	verifier, err := auth.NewVerifier(ctx, cfg.OIDC)
-	if err != nil {
-		if cfg.DevRegistryPath == "" {
-			return fmt.Errorf("creating OIDC verifier: %w", err)
-		}
-		log.Printf("dev mode: OIDC verifier unavailable (%v); /api routes requiring auth will fail until BOOTH_OIDC_ISSUER_URL is set", err)
-	}
+	// The OIDC provider (e.g. Keycloak) may not be reachable the instant core boots —
+	// nothing in the Helm chart guarantees ordering between them, especially on a fresh
+	// cluster bring-up. Rather than crash-looping until it happens to be up, retry in
+	// the background and let auth.Middleware serve 503s on auth-gated routes until a
+	// verifier is ready; /healthz and unauthenticated routes work immediately either way.
+	verifierHolder := &auth.VerifierHolder{}
+	go initVerifierWithRetry(ctx, cfg.OIDC, verifierHolder)
 
 	iframeSecret, err := iframeSigningSecret()
 	if err != nil {
@@ -96,7 +96,7 @@ func run() error {
 	}
 
 	router := api.NewRouter(api.Deps{
-		Verifier:     verifier,
+		Verifier:     verifierHolder,
 		Registry:     reg,
 		Gateway:      gw,
 		IframeTokens: iframeTokens,
@@ -117,6 +117,44 @@ func run() error {
 		return fmt.Errorf("http server: %w", err)
 	}
 	return nil
+}
+
+// initVerifierWithRetry retries auth.NewVerifier with backoff until it succeeds or ctx
+// is canceled, storing the result in holder once ready. If no issuer URL is configured
+// at all (the local-dev-without-OIDC case config.Load() already permits), it logs once
+// and returns rather than retrying forever against an empty URL.
+func initVerifierWithRetry(ctx context.Context, cfg config.OIDCConfig, holder *auth.VerifierHolder) {
+	if cfg.IssuerURL == "" {
+		log.Print("no BOOTH_OIDC_ISSUER_URL configured; /api routes requiring auth will always 503")
+		return
+	}
+
+	const maxBackoff = 30 * time.Second
+	backoff := time.Second
+
+	for {
+		verifier, err := auth.NewVerifier(ctx, cfg)
+		if err == nil {
+			holder.Store(verifier)
+			log.Print("OIDC verifier ready")
+			return
+		}
+
+		log.Printf("OIDC verifier not ready yet (%v); retrying in %s", err, backoff)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
 }
 
 func startRegistryController(reg *registry.Registry) (ctrl.Manager, error) {

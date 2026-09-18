@@ -42,10 +42,18 @@ func FromContext(ctx context.Context) (Identity, bool) {
 // Middleware verifies the request's bearer token, resolves the requested active
 // workspace against the token's memberships, and attaches the result to the request
 // context for downstream handlers (core's own API and the gateway's proxy handler both
-// use this).
-func Middleware(verifier *Verifier) func(http.Handler) http.Handler {
+// use this). It takes a *VerifierHolder rather than a *Verifier directly so the HTTP
+// server can start accepting requests before the configured OIDC provider is reachable —
+// see VerifierHolder's doc comment.
+func Middleware(holder *VerifierHolder) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			verifier, ready := holder.Get()
+			if !ready {
+				http.Error(w, "auth is not ready yet (OIDC provider not yet reachable)", http.StatusServiceUnavailable)
+				return
+			}
+
 			token := bearerToken(r)
 			if token == "" {
 				http.Error(w, "missing bearer token", http.StatusUnauthorized)

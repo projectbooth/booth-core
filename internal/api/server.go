@@ -19,7 +19,7 @@ import (
 
 // Deps is everything the HTTP layer needs, assembled by cmd/core/main.go.
 type Deps struct {
-	Verifier     *auth.Verifier
+	Verifier     *auth.VerifierHolder
 	Registry     *registry.Registry
 	Gateway      *gateway.Gateway
 	IframeTokens *gateway.IframeTokenIssuer

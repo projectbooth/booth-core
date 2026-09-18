@@ -5,7 +5,7 @@ name: CI
 # to pass before merge.
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 permissions:
