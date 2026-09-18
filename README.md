@@ -102,6 +102,30 @@ conventions, not cross-cutting contracts):
 - **0003 — local-dev registry fallback** shape.
 - **0004 — backend language** choice (Go) and why.
 
+## Follow-up fixes from downstream consumers' first build passes (2026-09-18)
+
+`booth-module-store` and `booth-design` both built against this repo's real API and
+flagged concrete gaps, resolved as **ADR 0028** and two direct bug reports respectively:
+
+- **`POST /api/modules/{id}/install` accepts a `chartRef` string** (e.g.
+  `oci://host/path/chart-name`) paired with `chartVersion`, as an alternative to the
+  structured `chart` object — resolved internally by `internal/lifecycle.ParseChartRef`,
+  lifted from `booth-module-store`'s own interim parser (ADR 0028). `chartRef` takes
+  precedence if a caller supplies both; at least one of `chartRef` or `chart` is now
+  required (previously an empty structured `chart` object would fail later, inside Helm,
+  with a less legible error).
+- **`GET /api/modules` now includes `uiIntegrationMode`** in each entry — it was already
+  on the underlying `BoothModule` spec but missing from the response `moduleView`,
+  so `booth-design`'s shell couldn't distinguish native modules from iframe-proxy ones.
+- **`GET /api/me`'s nested fields now serialize lowerCamelCase** (`workspace`/`role`
+  inside `memberships[]`/`active`) — `auth.Membership` was missing `json` struct tags,
+  so those two fields alone came back capitalized while everything else in the response
+  was already lowerCamelCase.
+
+`contracts/core-platform-api.md` already documented ADR 0028's accepted shape ahead of
+this implementation; the only wording gap filled in was calling out the `chartVersion`
+companion field explicitly, since the contract's prose only named `chartRef`.
+
 ## What's built vs. what's left, against the v0 definition of done
 
 Built and tested (unit/contract tests in-repo; the CRD reconcile loop additionally

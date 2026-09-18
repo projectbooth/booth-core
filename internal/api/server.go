@@ -5,6 +5,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -97,14 +98,15 @@ func handleListModules(reg *registry.Registry) http.HandlerFunc {
 		out := make([]moduleView, 0, len(modules))
 		for _, m := range modules {
 			view := moduleView{
-				ID:          m.Spec.ID,
-				DisplayName: m.Spec.DisplayName,
-				Icon:        m.Spec.Icon,
-				Version:     m.Spec.Version,
-				HasOwnUI:    m.Spec.HasOwnUI,
-				NavPath:     m.Spec.NavPath,
-				NavGroup:    string(m.Spec.NavGroup),
-				Phase:       string(m.Status.Phase),
+				ID:                m.Spec.ID,
+				DisplayName:       m.Spec.DisplayName,
+				Icon:              m.Spec.Icon,
+				Version:           m.Spec.Version,
+				HasOwnUI:          m.Spec.HasOwnUI,
+				UIIntegrationMode: string(m.Spec.UIIntegrationMode),
+				NavPath:           m.Spec.NavPath,
+				NavGroup:          string(m.Spec.NavGroup),
+				Phase:             string(m.Status.Phase),
 			}
 			// ADR 0023: adminNavPath is only surfaced to owners.
 			if m.Spec.AdminNavPath != "" && identity.Active.Role.IsAdmin() {
@@ -118,15 +120,16 @@ func handleListModules(reg *registry.Registry) http.HandlerFunc {
 }
 
 type moduleView struct {
-	ID           string `json:"id"`
-	DisplayName  string `json:"displayName"`
-	Icon         string `json:"icon,omitempty"`
-	Version      string `json:"version"`
-	HasOwnUI     bool   `json:"hasOwnUi"`
-	NavPath      string `json:"navPath,omitempty"`
-	NavGroup     string `json:"navGroup,omitempty"`
-	AdminNavPath string `json:"adminNavPath,omitempty"`
-	Phase        string `json:"phase"`
+	ID                string `json:"id"`
+	DisplayName       string `json:"displayName"`
+	Icon              string `json:"icon,omitempty"`
+	Version           string `json:"version"`
+	HasOwnUI          bool   `json:"hasOwnUi"`
+	UIIntegrationMode string `json:"uiIntegrationMode,omitempty"`
+	NavPath           string `json:"navPath,omitempty"`
+	NavGroup          string `json:"navGroup,omitempty"`
+	AdminNavPath      string `json:"adminNavPath,omitempty"`
+	Phase             string `json:"phase"`
 }
 
 func handleIframeURL(issuer *gateway.IframeURLIssuer) http.HandlerFunc {
@@ -170,10 +173,19 @@ func requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 // reference itself comes from (a Module Store catalog, a hand-typed admin form) is left
 // to the caller per docs/decisions/0005-module-lifecycle-desired-state.md — this
 // endpoint only performs the install/upgrade action.
+//
+// A caller supplies exactly one of ChartRef (a single string, e.g.
+// "oci://host/path/chart-name" — contracts/module-registry-protocol.md's registry-entry
+// shape, paired with ChartVersion) or the structured Chart object, per ADR 0028. ChartRef
+// exists so a registry-consuming caller (booth-module-store today) can pass a registry
+// entry's chartRef/chartVersion straight through unparsed — booth-core is the one place
+// that parsing lives now, not every caller independently.
 type installRequest struct {
-	Namespace string         `json:"namespace"`
-	Chart     chartRefBody   `json:"chart"`
-	Values    map[string]any `json:"values"`
+	Namespace    string         `json:"namespace"`
+	Chart        chartRefBody   `json:"chart"`
+	ChartRef     string         `json:"chartRef,omitempty"`
+	ChartVersion string         `json:"chartVersion,omitempty"`
+	Values       map[string]any `json:"values"`
 }
 
 type chartRefBody struct {
@@ -196,17 +208,16 @@ func handleInstallModule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ref, err := resolveChartRef(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	mgr, err := lifecycle.NewManager(req.Namespace)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-
-	ref := lifecycle.ChartRef{
-		Path:      req.Chart.Path,
-		RepoURL:   req.Chart.RepoURL,
-		ChartName: req.Chart.ChartName,
-		Version:   req.Chart.Version,
 	}
 
 	if err := mgr.Install(moduleID, ref, req.Values); err != nil {
@@ -216,6 +227,29 @@ func handleInstallModule(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusAccepted)
 }
+
+// resolveChartRef implements ADR 0028's either/or: a ChartRef string takes precedence
+// when present (parsed via lifecycle.ParseChartRef, the same logic lifted from
+// booth-module-store's interim parser); otherwise the structured Chart object is used
+// as-is, matching pre-ADR-0028 behavior exactly.
+func resolveChartRef(req installRequest) (lifecycle.ChartRef, error) {
+	if req.ChartRef != "" {
+		return lifecycle.ParseChartRef(req.ChartRef, req.ChartVersion)
+	}
+
+	ref := lifecycle.ChartRef{
+		Path:      req.Chart.Path,
+		RepoURL:   req.Chart.RepoURL,
+		ChartName: req.Chart.ChartName,
+		Version:   req.Chart.Version,
+	}
+	if ref.IsZero() {
+		return lifecycle.ChartRef{}, errChartRequired
+	}
+	return ref, nil
+}
+
+var errChartRequired = errors.New("either chartRef or chart is required")
 
 func handleUninstallModule(w http.ResponseWriter, r *http.Request) {
 	moduleID := chi.URLParam(r, "id")

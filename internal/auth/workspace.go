@@ -24,8 +24,8 @@ func (r Role) IsAdmin() bool {
 
 // Membership is one workspace/role pair derived from a token's groups claim.
 type Membership struct {
-	Workspace string
-	Role      Role
+	Workspace string `json:"workspace"`
+	Role      Role   `json:"role"`
 }
 
 var groupEntryPattern = regexp.MustCompile(`^/workspaces/([a-z0-9-]+)/(owner|editor|viewer)$`)
