@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	boothv1alpha1 "github.com/projectbooth/booth-core/api/v1alpha1"
 	"github.com/projectbooth/booth-core/internal/api"
@@ -166,7 +167,16 @@ func startRegistryController(reg *registry.Registry) (ctrl.Manager, error) {
 		return nil, err
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{Scheme: scheme})
+	// Metrics and health-probe servers are both disabled: controller-runtime's
+	// manager defaults its metrics server to :8080, which collides with booth-core's
+	// own HTTP server in this same process — this bit us for real (see git history),
+	// not a hypothetical. Nothing currently scrapes controller-runtime's own metrics
+	// endpoint separately from booth-core's own /healthz.
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+	})
 	if err != nil {
 		return nil, fmt.Errorf("creating controller manager: %w", err)
 	}
