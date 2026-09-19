@@ -137,9 +137,17 @@ jobs:
                     command: ["sh", "-ec"]
                     args:
                       - |
-                        nats --server "$NATS_URL" --creds /creds/nats.creds rtt
-                        if nats --server "$NATS_URL" rtt; then
-                          echo "anonymous connection unexpectedly succeeded"; exit 1
+                        # `nats rtt` exits 0 even when it can't connect, so assert on its
+                        # output rather than its exit status.
+                        with_creds=$(nats --server "$NATS_URL" --creds /creds/nats.creds rtt 2>&1) || true
+                        echo "$with_creds"
+                        if echo "$with_creds" | grep -qi "failed"; then
+                          echo "the provisioned credential was rejected"; exit 1
+                        fi
+                        anonymous=$(nats --server "$NATS_URL" rtt 2>&1) || true
+                        echo "$anonymous"
+                        if ! echo "$anonymous" | grep -qi "authorization violation"; then
+                          echo "an anonymous connection was not refused"; exit 1
                         fi
                         echo "auth enforced: credential accepted, anonymous refused"
                 volumes:
