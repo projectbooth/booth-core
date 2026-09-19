@@ -25,6 +25,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/auth"
 	"github.com/projectbooth/booth-core/internal/config"
 	"github.com/projectbooth/booth-core/internal/devregistry"
+	"github.com/projectbooth/booth-core/internal/directory"
 	"github.com/projectbooth/booth-core/internal/eventbus"
 	"github.com/projectbooth/booth-core/internal/gateway"
 	"github.com/projectbooth/booth-core/internal/natsauth"
@@ -118,6 +119,23 @@ func run() error {
 
 	gw := gateway.New(reg)
 
+	// User directory (ADR 0047): PostgreSQL when a DSN is configured (ADR 0014), otherwise
+	// in memory. The memory fallback loses entries on restart but repopulates itself as
+	// users make authenticated requests, so it degrades rather than breaks.
+	var users directory.Store
+	if cfg.PostgresDSN != "" {
+		pg, err := directory.NewPostgresStore(ctx, cfg.PostgresDSN)
+		if err != nil {
+			return fmt.Errorf("configuring user directory: %w", err)
+		}
+		defer pg.Close()
+		users = pg
+	} else {
+		log.Print("BOOTH_POSTGRES_DSN is not set; the user directory is in-memory and will be empty after a restart " +
+			"until users make authenticated requests again (ADR 0047)")
+		users = directory.NewMemoryStore()
+	}
+
 	// Event bus: NATS/JetStream (ADR 0021). Connected in the background: NATS may not be
 	// up yet (with auth on, its pod is waiting on the ConfigMap core just wrote), and a
 	// developer running only the HTTP surface locally shouldn't need NATS at all.
@@ -136,6 +154,9 @@ func run() error {
 		Gateway:      gw,
 		IframeTokens: iframeTokens,
 		IframeURLs:   iframeURLs,
+
+		Directory:         users,
+		DirectoryRecorder: directory.NewRecorder(users),
 	})
 
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: router}

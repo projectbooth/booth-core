@@ -16,9 +16,13 @@ import (
 // Claims is the subset of a verified ID/access token booth-core cares about. Extra
 // claims a provider includes are ignored, not rejected.
 type Claims struct {
-	Subject string   `json:"sub"`
-	Email   string   `json:"email"`
-	Groups  []string `json:"-"` // populated from config.OIDCConfig.GroupsClaim, name varies by provider
+	Subject string `json:"sub"`
+	Email   string `json:"email"`
+	// PreferredUsername and Name are the display claims the user directory records
+	// (ADR 0047). Either may be empty — not every provider/client scope includes them.
+	PreferredUsername string   `json:"preferred_username"`
+	Name              string   `json:"name"`
+	Groups            []string `json:"-"` // populated from config.OIDCConfig.GroupsClaim, name varies by provider
 }
 
 // Verifier verifies bearer tokens against a configured OIDC provider's published JWKS,
@@ -76,6 +80,12 @@ func (v *Verifier) Verify(ctx context.Context, rawToken string) (*Claims, error)
 	}
 	if email, ok := raw["email"].(string); ok {
 		claims.Email = email
+	}
+	if v, ok := raw["preferred_username"].(string); ok {
+		claims.PreferredUsername = v
+	}
+	if v, ok := raw["name"].(string); ok {
+		claims.Name = v
 	}
 	claims.Groups = extractStringSlice(raw, v.groupsClaim)
 

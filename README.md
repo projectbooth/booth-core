@@ -26,6 +26,8 @@ internal/gateway/      Sync request routing + iframe-proxy (ADR 0007, ui-integra
 internal/registry/     BoothModule CRD controller + in-memory module registry (ADR 0019)
 internal/devregistry/  Static-file registry fallback for local dev without a cluster
 internal/eventbus/      NATS/JetStream pub-sub (ADR 0007, 0021)
+internal/natsauth/      Event-bus authentication: credentials + per-subject permissions (ADR 0049)
+internal/directory/     Minimal user directory: sub -> display claims (ADR 0047)
 internal/secrets/       Secret/ConfigMap provisioning (ADR 0020)
 internal/lifecycle/     Module install/uninstall via the Helm SDK (ADR 0003)
 internal/api/           HTTP router tying the above together
@@ -66,6 +68,12 @@ go vet ./...
 gofmt -l .                 # should print nothing
 go test $(go list ./... | grep -v /test/integration)   # layers 1-2, no cluster
 ```
+
+Two suites run real servers in-process rather than mocks: `internal/natsauth` starts a real
+NATS/JetStream server to prove event-bus permissions are enforced, and `internal/directory`
+runs its store contract against a real PostgreSQL (an embedded build, downloaded on first
+run — no Docker; set `BOOTH_SKIP_POSTGRES_TESTS=1` to skip offline, or
+`BOOTH_TEST_POSTGRES_DSN` to use your own).
 
 Layer 3 (`test/integration/`) needs `KUBEBUILDER_ASSETS` pointed at envtest's
 kube-apiserver/etcd binaries (`go install
@@ -126,6 +134,27 @@ flagged concrete gaps, resolved as **ADR 0028** and two direct bug reports respe
 this implementation; the only wording gap filled in was calling out the `chartVersion`
 companion field explicitly, since the contract's prose only named `chartRef`.
 
+## Event-bus authentication and the user directory (2026-09-19)
+
+Two action items from `booth-catalog`'s first build pass; reasoning and the calls that need
+architecture-level review are in `docs/decisions/0006` and `0007`.
+
+**ADR 0049 — the event bus is authenticated.** Previously any pod that could reach NATS could
+forge a `dashboard.*` event into any workspace as any publisher. Now NATS runs in JWT
+operator/account mode with core as the credential authority: it mints a signed, expiring
+credential per module whose publish permissions come from the module's `BoothModule`
+`spec.events` (`publish`/`subscribe` lists of event-type patterns). No `events` means no
+credential. Credentials are written to the module's namespace as the Secret
+`booth-event-bus-credentials` (`nats.creds`, `url`) via the ADR 0020 mechanism, and a
+NetworkPolicy restricts who can reach NATS at all. No module can delete or purge the shared
+stream. **Modules that connect to NATS today must declare `events` and read that Secret** —
+see decision 0006 for the residual limits (notably: `publishedBy` is still advisory).
+
+**ADR 0047 — user directory.** `GET /api/users/{sub}` and `GET /api/users?q=&limit=`,
+populated from every verified token. Reads are scoped to the caller's active workspace (a
+call beyond ADR 0047's text, flagged in decision 0007). Backed by PostgreSQL when
+`BOOTH_POSTGRES_DSN` is set, otherwise an in-memory fallback that repopulates itself.
+
 ## What's built vs. what's left, against the v0 definition of done
 
 Built and tested (unit/contract tests in-repo; the CRD reconcile loop additionally
@@ -137,7 +166,9 @@ verified against a real API server via `test/integration/`):
 - Gateway: sync module-to-module/UI routing with identity attachment; iframe-proxy
   (token-in-query-param + scoped cookie, plus the root-relative-follow-up-call fallback
   ui-integration.md calls out as a known failure mode to design around).
-- Event bus: NATS/JetStream wiring, `BOOTH_EVENTS` stream, publish/subscribe helpers.
+- Event bus: NATS/JetStream wiring, `BOOTH_EVENTS` stream, publish/subscribe helpers —
+  authenticated, with per-module scoped credentials (ADR 0049).
+- User directory (ADR 0047).
 - Secrets/ConfigMap provisioning primitive (ADR 0020).
 - Module install/uninstall via the Helm SDK, admin-role-gated (scoped per decision 0005).
 - Helm chart: bundles NATS (subchart), the CRD, RBAC, the core Deployment/Service.
@@ -150,8 +181,10 @@ Not yet built:
   started" in `MODULE_REGISTRY.md`); nothing to host yet.
 - Workspace *metadata* persistence (display name, settings) on the shared PostgreSQL
   cluster (ADR 0014) — membership/role itself is token-derived per decision 0001 and
-  needs no database, but workspace creation/metadata does. `internal/config` already
-  reads a Postgres DSN; no schema/queries exist yet.
+  needs no database, but workspace creation/metadata does. Only the user directory uses
+  the Postgres DSN so far (one `booth_users` table); no workspace-metadata schema yet. Who
+  provisions the shared PostgreSQL cluster and core's database (ADR 0014) is still open —
+  the chart deploys none, so a default install uses the directory's in-memory fallback.
 - Drift detection/reconciliation for module lifecycle (decision 0005's flagged gap).
 - Least-privilege RBAC for the lifecycle manager (currently broad by necessity/default —
   see `charts/booth-core/templates/rbac.yaml`'s comment).

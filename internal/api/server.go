@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/projectbooth/booth-core/internal/auth"
+	"github.com/projectbooth/booth-core/internal/directory"
 	"github.com/projectbooth/booth-core/internal/gateway"
 	"github.com/projectbooth/booth-core/internal/lifecycle"
 	"github.com/projectbooth/booth-core/internal/registry"
@@ -24,6 +25,11 @@ type Deps struct {
 	Gateway      *gateway.Gateway
 	IframeTokens *gateway.IframeTokenIssuer
 	IframeURLs   *gateway.IframeURLIssuer
+
+	// Directory serves GET /api/users; DirectoryRecorder feeds it from verified tokens
+	// (ADR 0047). Both optional: nil disables the routes / the recording respectively.
+	Directory         directory.Store
+	DirectoryRecorder *directory.Recorder
 }
 
 // NewRouter builds booth-core's full HTTP router.
@@ -37,13 +43,19 @@ func NewRouter(deps Deps) http.Handler {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	authed := auth.Middleware(deps.Verifier)
+	// Every authenticated route feeds the user directory from the token it just verified
+	// (ADR 0047).
+	var authOpts []auth.Option
+	if deps.DirectoryRecorder != nil {
+		authOpts = append(authOpts, auth.WithClaimsObserver(deps.DirectoryRecorder.Observe))
+	}
+	authed := auth.Middleware(deps.Verifier, authOpts...)
 
 	// ADR 0034: GET /api/me is the one route where X-Workspace is optional — it's how a
 	// client learns its memberships, so it can't already know a slug. Kept in its own
 	// group so no other route inherits the relaxation.
 	r.Group(func(r chi.Router) {
-		r.Use(auth.Middleware(deps.Verifier, auth.WorkspaceOptional))
+		r.Use(auth.Middleware(deps.Verifier, append([]auth.Option{auth.WorkspaceOptional}, authOpts...)...))
 		r.Get("/api/me", handleMe)
 	})
 
@@ -51,6 +63,10 @@ func NewRouter(deps Deps) http.Handler {
 		r.Use(authed)
 
 		r.Get("/api/modules", handleListModules(deps.Registry))
+		if deps.Directory != nil {
+			r.Get("/api/users", handleSearchUsers(deps.Directory))
+			r.Get("/api/users/{sub}", handleGetUser(deps.Directory))
+		}
 		r.Get("/api/modules/{id}/iframe-url", handleIframeURL(deps.IframeURLs))
 		r.Post("/api/modules/{id}/install", requireAdmin(handleInstallModule))
 		r.Delete("/api/modules/{id}", requireAdmin(handleUninstallModule))

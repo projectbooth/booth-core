@@ -51,6 +51,19 @@ type Option func(*middlewareConfig)
 
 type middlewareConfig struct {
 	workspaceOptional bool
+	observer          ClaimsObserver
+}
+
+// ClaimsObserver is called once for every request whose token verified, before workspace
+// resolution, with the verified claims and the workspace memberships derived from them.
+// It exists so the user directory (ADR 0047) can record identities opportunistically from
+// the auth path core already runs, without auth depending on the directory. It runs on the
+// request path, so it must be fast and must not fail the request.
+type ClaimsObserver func(ctx context.Context, claims *Claims, memberships []Membership)
+
+// WithClaimsObserver registers an observer for verified tokens.
+func WithClaimsObserver(o ClaimsObserver) Option {
+	return func(c *middlewareConfig) { c.observer = o }
 }
 
 // WorkspaceOptional makes the X-Workspace header optional (ADR 0034): when it's absent,
@@ -94,6 +107,9 @@ func Middleware(holder *VerifierHolder, opts ...Option) func(http.Handler) http.
 			}
 
 			memberships := DeriveMemberships(claims.Groups)
+			if cfg.observer != nil {
+				cfg.observer(r.Context(), claims, memberships)
+			}
 
 			var active Membership
 			requestedWorkspace := r.Header.Get(HeaderWorkspace)
