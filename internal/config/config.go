@@ -40,9 +40,14 @@ type Config struct {
 	// watch" — the production path.
 	DevRegistryPath string
 
-	// PostgresDSN is the connection string for core's own database on the shared
-	// PostgreSQL cluster (ADR 0014) — workspaces, module registry cache, users.
+	// PostgresDSN, if set, is used verbatim as the connection string for core's own
+	// database (workspace metadata, the user directory) instead of core provisioning one
+	// itself. Leave it empty to use the provisioned database (Postgres below).
 	PostgresDSN string
+
+	// Postgres locates the shared PostgreSQL server core provisions module databases on
+	// (ADR 0053) and its own. Provisioning is on only when Postgres.Host is set.
+	Postgres PostgresConfig
 
 	// KubeNamespace is the namespace booth-core itself runs in, used as the default
 	// namespace for module BoothModule watches and Secret/ConfigMap provisioning.
@@ -70,6 +75,33 @@ type OIDCConfig struct {
 	// (ARCHITECTURE.md §6, ADR 0004, ADR 0008). Configurable because not every OIDC
 	// provider names this claim "groups".
 	GroupsClaim string
+}
+
+// PostgresConfig is the shared-PostgreSQL configuration (ADR 0053). The bundled Helm chart
+// fills it in for its bundled server; an operator running at scale sets it to point at an
+// external cluster.
+type PostgresConfig struct {
+	// Host, if set, turns database provisioning on.
+	Host string
+	Port int
+
+	// ModuleHost is the address written into module DSNs (must resolve from any namespace).
+	// Defaults to Host qualified with core's namespace, like the NATS module URL.
+	ModuleHost string
+
+	AdminUser     string
+	AdminPassword string
+	AdminDatabase string
+	SSLMode       string
+
+	// Bundled means the server is the chart's own StatefulSet: core generates its admin
+	// password (the StatefulSet reads the same Secret) instead of taking one from config,
+	// and locks down the maintenance databases.
+	Bundled bool
+
+	// RestrictMaintenanceAccess revokes PUBLIC connect on the maintenance databases; always
+	// on for a bundled server, opt-in for an external one.
+	RestrictMaintenanceAccess bool
 }
 
 func Load() (Config, error) {
@@ -103,6 +135,39 @@ func Load() (Config, error) {
 	}
 	cfg.NATSModuleURL = getEnv("BOOTH_NATS_MODULE_URL", qualifyNATSURL(cfg.NATSURL, cfg.KubeNamespace))
 
+	pg := PostgresConfig{
+		Host:          os.Getenv("BOOTH_POSTGRES_HOST"),
+		AdminUser:     getEnv("BOOTH_POSTGRES_ADMIN_USER", "postgres"),
+		AdminPassword: os.Getenv("BOOTH_POSTGRES_ADMIN_PASSWORD"),
+		AdminDatabase: getEnv("BOOTH_POSTGRES_ADMIN_DATABASE", "postgres"),
+		SSLMode:       os.Getenv("BOOTH_POSTGRES_SSLMODE"),
+		Port:          5432,
+	}
+	if v := os.Getenv("BOOTH_POSTGRES_PORT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 65535 {
+			return Config{}, fmt.Errorf("BOOTH_POSTGRES_PORT: %q is not a valid port", v)
+		}
+		pg.Port = n
+	}
+	for env, dst := range map[string]*bool{
+		"BOOTH_POSTGRES_BUNDLED":                     &pg.Bundled,
+		"BOOTH_POSTGRES_RESTRICT_MAINTENANCE_ACCESS": &pg.RestrictMaintenanceAccess,
+	} {
+		if v := os.Getenv(env); v != "" {
+			b, err := strconv.ParseBool(v)
+			if err != nil {
+				return Config{}, fmt.Errorf("%s: %w", env, err)
+			}
+			*dst = b
+		}
+	}
+	if pg.Bundled {
+		pg.RestrictMaintenanceAccess = true
+	}
+	pg.ModuleHost = getEnv("BOOTH_POSTGRES_MODULE_HOST", qualifyHost(pg.Host, cfg.KubeNamespace))
+	cfg.Postgres = pg
+
 	if cfg.DevRegistryPath == "" {
 		if cfg.OIDC.IssuerURL == "" {
 			return Config{}, fmt.Errorf("BOOTH_OIDC_ISSUER_URL is required")
@@ -129,6 +194,15 @@ func qualifyNATSURL(raw, namespace string) string {
 	}
 	u.Host = host
 	return u.String()
+}
+
+// qualifyHost turns an in-namespace service name into one resolvable from any namespace.
+// A host that's empty or already contains a dot (a FQDN or an IP) is returned unchanged.
+func qualifyHost(host, namespace string) string {
+	if host == "" || strings.Contains(host, ".") || strings.Contains(host, ":") {
+		return host
+	}
+	return host + "." + namespace + ".svc.cluster.local"
 }
 
 func getEnv(key, fallback string) string {

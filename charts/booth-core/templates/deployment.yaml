@@ -52,6 +52,34 @@ spec:
                 secretKeyRef:
                   name: {{ include "booth-core.secretName" . }}
                   key: BOOTH_IFRAME_SIGNING_KEY
+            {{- if .Values.postgresql.enabled }}
+            # Bundled server (ADR 0053): core generates its admin password Secret, which the
+            # StatefulSet reads too, and provisions databases on it.
+            - name: BOOTH_POSTGRES_BUNDLED
+              value: "true"
+            - name: BOOTH_POSTGRES_HOST
+              value: "{{ .Release.Name }}-postgresql"
+            - name: BOOTH_POSTGRES_SSLMODE
+              value: "disable"
+            {{- else if .Values.postgres.external.host }}
+            - name: BOOTH_POSTGRES_HOST
+              value: {{ .Values.postgres.external.host | quote }}
+            - name: BOOTH_POSTGRES_PORT
+              value: {{ .Values.postgres.external.port | quote }}
+            - name: BOOTH_POSTGRES_ADMIN_USER
+              value: {{ .Values.postgres.external.adminUser | quote }}
+            - name: BOOTH_POSTGRES_ADMIN_DATABASE
+              value: {{ .Values.postgres.external.adminDatabase | quote }}
+            - name: BOOTH_POSTGRES_SSLMODE
+              value: {{ .Values.postgres.external.sslmode | quote }}
+            - name: BOOTH_POSTGRES_RESTRICT_MAINTENANCE_ACCESS
+              value: {{ .Values.postgres.external.restrictMaintenanceAccess | quote }}
+            - name: BOOTH_POSTGRES_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "postgres.external.existingSecret.name is required when postgres.external.host is set" .Values.postgres.external.existingSecret.name }}
+                  key: {{ .Values.postgres.external.existingSecret.key }}
+            {{- end }}
             {{- if or .Values.postgres.dsn .Values.existingSecret }}
             - name: BOOTH_POSTGRES_DSN
               valueFrom:

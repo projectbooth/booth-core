@@ -128,3 +128,34 @@ func TestRecorder_IgnoresTokensWithoutASubject(t *testing.T) {
 		t.Fatalf("upserts = %d, want 0", cs.upserts)
 	}
 }
+
+// Core starts on memory and switches to Postgres later. The new store starts empty, so after
+// Reset a user is re-recorded on their very next request rather than after the debounce.
+func TestSwitchable_SwapAndResetRepopulateImmediately(t *testing.T) {
+	sw := NewSwitchable(NewMemoryStore())
+	r, _ := newTestRecorder(sw)
+	c := claimsFor("u1", "alice", "a@example.com")
+
+	r.Observe(context.Background(), c, acmeOwner)
+	if _, ok, _ := sw.Get(context.Background(), "u1", "acme"); !ok {
+		t.Fatal("not recorded in the initial store")
+	}
+
+	second := NewMemoryStore()
+	sw.Swap(second)
+	if _, ok, _ := sw.Get(context.Background(), "u1", "acme"); ok {
+		t.Fatal("swap should present the new (empty) store")
+	}
+
+	// Without Reset the debounce would suppress this write.
+	r.Observe(context.Background(), c, acmeOwner)
+	if _, ok, _ := second.Get(context.Background(), "u1", "acme"); ok {
+		t.Fatal("expected the debounce to suppress the write until Reset (documenting why Reset exists)")
+	}
+
+	r.Reset()
+	r.Observe(context.Background(), c, acmeOwner)
+	if _, ok, _ := second.Get(context.Background(), "u1", "acme"); !ok {
+		t.Fatal("user not re-recorded into the swapped-in store after Reset")
+	}
+}

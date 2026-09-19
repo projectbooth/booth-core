@@ -35,11 +35,54 @@ iframeSigningKey: ""
 # to use instead of iframeSigningKey above.
 existingSecret: ""
 
+# PostgreSQL (ADR 0053): "batteries included, swappable", like NATS and Keycloak.
+#
+# By default a small single-node PostgreSQL is deployed with this release — fine for a
+# self-hosted or development install, and it gives booth-core's own user directory real
+# persistence out of the box. It is NOT highly available; at scale, point at an external HA
+# cluster instead (postgresql.enabled=false and fill in postgres.external below).
+#
+# Either way, booth-core provisions a database and login role for itself and for every module
+# whose BoothModule declares `database.enabled: true`, and delivers each module's connection
+# details as the Secret `booth-database-credentials` in the module's namespace. Nothing is
+# ever dropped automatically: uninstalling a module keeps its data.
+postgresql:
+  enabled: true
+  image:
+    repository: postgres
+    tag: 16-alpine
+    pullPolicy: IfNotPresent
+  persistence:
+    size: 8Gi
+    storageClass: "" # empty = the cluster default
+  resources: {}
+
 postgres:
-  # DSN for core's own database on the shared PostgreSQL cluster (ADR 0014). Left empty
-  # by default; wiring the shared cluster itself is not yet part of this chart (workspace
-  # metadata persistence is tracked as follow-up work, not yet part of v0's HTTP surface).
+  # dsn, if set, is used verbatim as booth-core's OWN database connection string instead of
+  # core provisioning one (an escape hatch; normally leave empty).
   dsn: ""
+
+  # Used only when postgresql.enabled is false. Leave host empty to turn database
+  # provisioning off entirely (modules then get no database from core).
+  external:
+    host: ""
+    port: 5432
+    # The account core provisions with. It must be able to create roles and databases and to
+    # give a database to the role it created — in practice a superuser, or your provider's
+    # equivalent (e.g. rds_superuser).
+    adminUser: postgres
+    adminDatabase: postgres
+    # A Secret holding the admin password (created by you, in this release's namespace).
+    existingSecret:
+      name: ""
+      key: password
+    # Use require or stronger against anything that isn't on a trusted network.
+    sslmode: require
+    # Also stop module roles connecting to the maintenance databases (postgres, template1),
+    # which PostgreSQL allows by default and which lets a module list the other databases and
+    # roles on the server. Off by default because it changes privileges on a cluster core
+    # doesn't own and other tenants may share; the bundled server always has it on.
+    restrictMaintenanceAccess: false
 
 # NATS is bundled as a subchart (ADR 0021) — every booth-core install gets an event bus,
 # since core is the one mandatory repo. JetStream is enabled for at-least-once delivery
@@ -85,11 +128,12 @@ nats:
   natsBox:
     enabled: false
 
-# Restricts who can reach the event bus at all — defense in depth beneath credential
-# auth. Admits booth-core, NATS's own cluster traffic, and any namespace core has labelled
-# `booth.projectbooth.io/event-bus-client=true` (it labels the namespace of each module
-# that declares `events`). Enforced only if the cluster's CNI implements NetworkPolicy
-# (k3s does; some minimal CNIs don't).
+# Restricts who can reach the event bus (and the bundled PostgreSQL) at all — defense in depth
+# beneath credential auth. NATS admits booth-core, its own cluster traffic, and namespaces core
+# has labelled `booth.projectbooth.io/event-bus-client=true`; PostgreSQL admits booth-core and
+# namespaces labelled `booth.projectbooth.io/database-client=true`. Core applies each label to
+# the namespace of a module that declares `events` / `database`. Enforced only if the cluster's
+# CNI implements NetworkPolicy (k3s does; some minimal CNIs don't).
 networkPolicy:
   enabled: true
 

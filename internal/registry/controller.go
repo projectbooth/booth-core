@@ -2,11 +2,12 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,6 +41,16 @@ type Controller struct {
 	// EventBus, if set, provisions each module's event-bus credentials from its manifest
 	// on every reconcile (ADR 0049). Nil means event-bus auth is disabled.
 	EventBus EventBusProvisioner
+
+	// Database, if set, provisions each module's PostgreSQL database and credentials from
+	// its manifest on every reconcile (ADR 0053). Nil means database provisioning is off.
+	Database DatabaseProvisioner
+}
+
+// DatabaseProvisioner makes a module's database and credential Secret match its manifest.
+// Implemented by dbprov.Provisioner.
+type DatabaseProvisioner interface {
+	Ensure(ctx context.Context, mod *boothv1alpha1.BoothModule) error
 }
 
 // EventBusProvisioner makes a module's event-bus credentials match its manifest.
@@ -71,7 +82,7 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	var mod boothv1alpha1.BoothModule
 	if err := c.Get(ctx, req.NamespacedName, &mod); err != nil {
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			// Uninstalled: the chart removed the BoothModule resource. Since ID is the
 			// registry's key and req.Name is the Kubernetes object name (not
 			// necessarily identical if a chart names its resource differently), we
@@ -100,13 +111,23 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 	}
 
-	// Provision after the registry/health work so a credential problem never hides a
-	// module's health. Returning the error requeues with backoff; the next attempt also
-	// re-runs the health check, so polling continues while this is failing.
+	// Provision after the registry/health work so a provisioning problem never hides a
+	// module's health. Errors are returned (joined, so one failing doesn't skip the other),
+	// which requeues with backoff; the next attempt also re-runs the health check, so
+	// polling continues while this is failing.
+	var provisionErrs []error
 	if c.EventBus != nil {
 		if err := c.EventBus.Ensure(ctx, &mod); err != nil {
-			return ctrl.Result{}, fmt.Errorf("provisioning event-bus credentials for %q: %w", mod.Spec.ID, err)
+			provisionErrs = append(provisionErrs, fmt.Errorf("event-bus credentials: %w", err))
 		}
+	}
+	if c.Database != nil {
+		if err := c.Database.Ensure(ctx, &mod); err != nil {
+			provisionErrs = append(provisionErrs, fmt.Errorf("database: %w", err))
+		}
+	}
+	if err := errors.Join(provisionErrs...); err != nil {
+		return ctrl.Result{}, fmt.Errorf("provisioning for module %q: %w", mod.Spec.ID, err)
 	}
 
 	return ctrl.Result{RequeueAfter: healthPollInterval}, nil

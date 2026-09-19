@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -191,5 +192,38 @@ func TestReconcile_NoProvisionerIsFine(t *testing.T) {
 	rc, _ := newControllerWithModule(t)
 	if _, err := rc.Reconcile(context.Background(), reqFor("superset", "booth-system")); err != nil {
 		t.Fatalf("Reconcile without an event-bus provisioner: %v", err)
+	}
+}
+
+// ADR 0053: the database provisioner is called on every reconcile, independently of the
+// event-bus one — a failure in one must not skip the other.
+func TestReconcile_ProvisionsDatabaseAndKeepsGoingWhenEventBusFails(t *testing.T) {
+	rc, _ := newControllerWithModule(t)
+	bus := &recordingProvisioner{err: errors.New("bus down")}
+	db := &recordingProvisioner{}
+	rc.EventBus = bus
+	rc.Database = db
+
+	_, err := rc.Reconcile(context.Background(), reqFor("superset", "booth-system"))
+	if err == nil {
+		t.Fatal("expected the event-bus failure to be returned")
+	}
+	if len(db.calls) != 1 {
+		t.Fatalf("database provisioner calls = %v, want 1: an event-bus failure must not skip it", db.calls)
+	}
+	if !strings.Contains(err.Error(), "event-bus") {
+		t.Errorf("error %q doesn't say which provisioner failed", err)
+	}
+}
+
+func TestReconcile_DatabaseProvisioningErrorIsReturned(t *testing.T) {
+	rc, reg := newControllerWithModule(t)
+	rc.Database = &recordingProvisioner{err: errors.New("postgres not up yet")}
+
+	if _, err := rc.Reconcile(context.Background(), reqFor("superset", "booth-system")); err == nil {
+		t.Fatal("expected the error so the reconcile is retried with backoff")
+	}
+	if _, ok := reg.Get("superset"); !ok {
+		t.Fatal("module health must still be recorded while its database can't be provisioned")
 	}
 }

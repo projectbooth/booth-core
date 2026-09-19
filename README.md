@@ -28,6 +28,8 @@ internal/devregistry/  Static-file registry fallback for local dev without a clu
 internal/eventbus/      NATS/JetStream pub-sub (ADR 0007, 0021)
 internal/natsauth/      Event-bus authentication: credentials + per-subject permissions (ADR 0049)
 internal/directory/     Minimal user directory: sub -> display claims (ADR 0047)
+internal/dbprov/        Shared PostgreSQL: per-module database + role provisioning (ADR 0053)
+internal/testpg/        Real PostgreSQL for tests (embedded, no Docker)
 internal/secrets/       Secret/ConfigMap provisioning (ADR 0020)
 internal/lifecycle/     Module install/uninstall via the Helm SDK (ADR 0003)
 internal/api/           HTTP router tying the above together
@@ -155,6 +157,18 @@ populated from every verified token. Reads are scoped to the caller's active wor
 call beyond ADR 0047's text, flagged in decision 0007). Backed by PostgreSQL when
 `BOOTH_POSTGRES_DSN` is set, otherwise an in-memory fallback that repopulates itself.
 
+## Shared PostgreSQL and per-module databases (2026-09-19)
+
+**ADR 0053.** The chart bundles a default single-node PostgreSQL (a small StatefulSet on the
+official image), swappable for an external HA cluster via `postgresql.enabled=false` and
+`postgres.external.*`. Core provisions a database and login role for itself and for every module
+whose `BoothModule` declares `database: {enabled: true}`, and delivers the connection details as
+the Secret `booth-database-credentials` (`dsn` plus `host`/`port`/`database`/`username`/
+`password`) in the module's namespace. Roles are unprivileged and each database is closed to every
+other module's credentials. Uninstalling a module **never drops its data**. Core's own user
+directory uses the same mechanism, so a default install now persists it. See
+`docs/decisions/0008` — including its limits: the bundled server is single-node with no backup.
+
 ## What's built vs. what's left, against the v0 definition of done
 
 Built and tested (unit/contract tests in-repo; the CRD reconcile loop additionally
@@ -168,7 +182,8 @@ verified against a real API server via `test/integration/`):
   ui-integration.md calls out as a known failure mode to design around).
 - Event bus: NATS/JetStream wiring, `BOOTH_EVENTS` stream, publish/subscribe helpers —
   authenticated, with per-module scoped credentials (ADR 0049).
-- User directory (ADR 0047).
+- User directory (ADR 0047), persistent on a default install via the bundled PostgreSQL.
+- Shared PostgreSQL provisioning (ADR 0053): bundled default, per-module databases and roles.
 - Secrets/ConfigMap provisioning primitive (ADR 0020).
 - Module install/uninstall via the Helm SDK, admin-role-gated (scoped per decision 0005).
 - Helm chart: bundles NATS (subchart), the CRD, RBAC, the core Deployment/Service.
@@ -179,12 +194,9 @@ Not yet built:
 
 - Hosting `booth-design`'s shell — blocked on that repo existing (currently "not
   started" in `MODULE_REGISTRY.md`); nothing to host yet.
-- Workspace *metadata* persistence (display name, settings) on the shared PostgreSQL
-  cluster (ADR 0014) — membership/role itself is token-derived per decision 0001 and
-  needs no database, but workspace creation/metadata does. Only the user directory uses
-  the Postgres DSN so far (one `booth_users` table); no workspace-metadata schema yet. Who
-  provisions the shared PostgreSQL cluster and core's database (ADR 0014) is still open —
-  the chart deploys none, so a default install uses the directory's in-memory fallback.
+- Workspace *metadata* persistence (display name, settings) — membership/role is
+  token-derived per decision 0001 and needs no database, but workspace creation/metadata does.
+  The database it would live in now exists (`booth_core`); no workspace-metadata schema yet.
 - Drift detection/reconciliation for module lifecycle (decision 0005's flagged gap).
 - Least-privilege RBAC for the lifecycle manager (currently broad by necessity/default —
   see `charts/booth-core/templates/rbac.yaml`'s comment).

@@ -41,6 +41,16 @@ func NewRecorder(store Store) *Recorder {
 	return &Recorder{Store: store, Interval: DefaultRecordInterval, Now: time.Now, seen: map[string]seenEntry{}}
 }
 
+// Reset forgets which identities have been written, so the next request from each user
+// writes them again. Call it after swapping the backing store (see Switchable): the new store
+// starts empty, and without this a user wouldn't be re-recorded until the debounce interval
+// passed.
+func (r *Recorder) Reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen = map[string]seenEntry{}
+}
+
 // Observe records the identity behind a verified token. It never fails the request: a
 // directory that's down or slow costs a log line, not a login.
 func (r *Recorder) Observe(ctx context.Context, claims *auth.Claims, memberships []auth.Membership) {

@@ -115,6 +115,23 @@ type BoothModuleSpec struct {
 	// (see docs/decisions/0006-event-bus-authentication.md).
 	// +optional
 	Events *EventBusAccess `json:"events,omitempty"`
+
+	// Database signals that this module needs its own PostgreSQL database (ADR 0053).
+	// Core then creates a database and role scoped to this module on the shared cluster and
+	// delivers the connection details as a Secret in the module's namespace, ahead of the
+	// module needing them. Omit it and the module gets nothing. Core provisions the
+	// database only; what a module puts in it (schema, migrations) is the module's own.
+	// Proposed manifest addition, pending an architecture ADR (see
+	// docs/decisions/0008-shared-postgres.md).
+	// +optional
+	Database *DatabaseRequirement `json:"database,omitempty"`
+}
+
+// DatabaseRequirement is the manifest-level signal that a module needs a database. It's a
+// struct rather than a bare boolean so it can grow without another manifest field.
+type DatabaseRequirement struct {
+	// Enabled requests a database for this module.
+	Enabled bool `json:"enabled"`
 }
 
 // EventBusAccess lists the event types a module may use, as dotted patterns matching

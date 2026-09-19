@@ -2,14 +2,10 @@ package directory
 
 import (
 	"context"
-	"fmt"
-	"net"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
-	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
+	"github.com/projectbooth/booth-core/internal/testpg"
 )
 
 // The same behavioural suite runs against every Store implementation, so the in-memory
@@ -19,18 +15,10 @@ func TestMemoryStore(t *testing.T) {
 	runStoreContract(t, func(t *testing.T) Store { return NewMemoryStore() })
 }
 
-// PostgreSQL is exercised against a real server. If BOOTH_TEST_POSTGRES_DSN is set it's
-// used as-is (a scratch database you don't mind tables in); otherwise an embedded Postgres
-// is downloaded once and started — no Docker required. Set BOOTH_SKIP_POSTGRES_TESTS=1 to
-// skip (e.g. offline).
+// PostgreSQL is exercised against a real server (see internal/testpg for how one is
+// obtained and how to skip).
 func TestPostgresStore(t *testing.T) {
-	if os.Getenv("BOOTH_SKIP_POSTGRES_TESTS") != "" {
-		t.Skip("BOOTH_SKIP_POSTGRES_TESTS set")
-	}
-	dsn := os.Getenv("BOOTH_TEST_POSTGRES_DSN")
-	if dsn == "" {
-		dsn = startEmbeddedPostgres(t)
-	}
+	dsn := testpg.Start(t).DSN("postgres")
 
 	runStoreContract(t, func(t *testing.T) Store {
 		s, err := NewPostgresStore(context.Background(), dsn)
@@ -47,30 +35,6 @@ func TestPostgresStore(t *testing.T) {
 		}
 		return s
 	})
-}
-
-func startEmbeddedPostgres(t *testing.T) string {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := uint32(l.Addr().(*net.TCPAddr).Port)
-	_ = l.Close()
-
-	dir := t.TempDir()
-	pg := embeddedpostgres.NewDatabase(embeddedpostgres.DefaultConfig().
-		Version(embeddedpostgres.V16).
-		Port(port).
-		DataPath(filepath.Join(dir, "data")).
-		RuntimePath(filepath.Join(dir, "runtime")).
-		Logger(nil).
-		StartTimeout(90 * time.Second))
-	if err := pg.Start(); err != nil {
-		t.Fatalf("starting embedded postgres (set BOOTH_SKIP_POSTGRES_TESTS=1 to skip): %v", err)
-	}
-	t.Cleanup(func() { _ = pg.Stop() })
-	return fmt.Sprintf("postgres://postgres:postgres@localhost:%d/postgres?sslmode=disable", port)
 }
 
 func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {

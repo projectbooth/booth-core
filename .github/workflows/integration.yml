@@ -157,6 +157,70 @@ jobs:
           kubectl -n ci-superset wait --for=condition=complete job/bus-check --timeout=180s
           kubectl -n ci-superset logs job/bus-check
 
+      # ADR 0053, end to end on the real bundled PostgreSQL: core provisions its own database
+      # (so the user directory becomes persistent), and provisions a per-module database when a
+      # BoothModule signals it needs one, delivered as a working DSN whose credentials cannot
+      # cross into any other database.
+      - name: Verify database provisioning
+        run: |
+          set -eu
+          kubectl -n booth-system get secret booth-postgres-admin
+
+          echo "Waiting for core to provision its own database..."
+          for i in $(seq 1 80); do
+            if kubectl -n booth-system logs deployment/booth-core | grep -q "user directory is now persistent"; then
+              echo "core database provisioned; the user directory is persistent"; break
+            fi
+            [ "$i" = 80 ] && { echo "core never provisioned its database"; exit 1; }
+            sleep 3
+          done
+          kubectl -n booth-system get secret booth-core-database
+
+          # The module from the previous step now also asks for a database.
+          kubectl -n ci-superset patch boothmodule superset --type merge -p '{"spec":{"database":{"enabled":true}}}'
+          echo "Waiting for the module's database credentials..."
+          for i in $(seq 1 40); do
+            kubectl -n ci-superset get secret booth-database-credentials >/dev/null 2>&1 && break
+            [ "$i" = 40 ] && { echo "database credential Secret never appeared"; exit 1; }
+            sleep 3
+          done
+          kubectl get namespace ci-superset -o jsonpath='{.metadata.labels}' | grep -q database-client
+
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: db-check, namespace: ci-superset}
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: psql
+                    image: postgres:16-alpine
+                    env:
+                      - name: DSN
+                        valueFrom: {secretKeyRef: {name: booth-database-credentials, key: dsn}}
+                    command: ["sh", "-ec"]
+                    args:
+                      - |
+                        # The module can use its own database.
+                        psql "$DSN" -v ON_ERROR_STOP=1                           -c 'create table t (x int)' -c 'insert into t values (42)' -c 'select x from t'
+
+                        # ...but its credentials can't open any other database on the server.
+                        core_dsn=$(echo "$DSN" | sed 's#/booth_mod_superset#/booth_core#')
+                        if psql "$core_dsn" -c 'select 1' >/dev/null 2>&1; then
+                          echo "module credentials opened core's database"; exit 1
+                        fi
+                        maint_dsn=$(echo "$DSN" | sed 's#/booth_mod_superset#/postgres#')
+                        if psql "$maint_dsn" -c 'select 1' >/dev/null 2>&1; then
+                          echo "module credentials opened the maintenance database"; exit 1
+                        fi
+                        echo "database provisioned and isolated"
+          EOF
+          kubectl -n ci-superset wait --for=condition=complete job/db-check --timeout=180s
+          kubectl -n ci-superset logs job/db-check
+
       - name: Dump logs on failure
         if: failure()
         run: |
@@ -164,3 +228,5 @@ jobs:
           kubectl -n booth-system logs deployment/booth-core --tail=200 || true
           kubectl -n booth-system logs statefulset/booth-core-nats -c nats --tail=100 || true
           kubectl -n ci-superset logs job/bus-check --tail=50 || true
+          kubectl -n booth-system logs statefulset/booth-core-postgresql --tail=60 || true
+          kubectl -n ci-superset logs job/db-check --tail=50 || true

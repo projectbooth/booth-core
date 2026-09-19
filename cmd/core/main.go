@@ -24,6 +24,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/api"
 	"github.com/projectbooth/booth-core/internal/auth"
 	"github.com/projectbooth/booth-core/internal/config"
+	"github.com/projectbooth/booth-core/internal/dbprov"
 	"github.com/projectbooth/booth-core/internal/devregistry"
 	"github.com/projectbooth/booth-core/internal/directory"
 	"github.com/projectbooth/booth-core/internal/eventbus"
@@ -54,6 +55,10 @@ func run() error {
 	// the registry controller, each module's.
 	var authority *natsauth.Authority
 
+	// dbProv is non-nil only when database provisioning is on in a real cluster (ADR 0053);
+	// core uses it for its own database too.
+	var dbProv *dbprov.Provisioner
+
 	// Module discovery: real BoothModule CRD watch in a real cluster (ADR 0019), or a
 	// static file for local development without one (ADR 0019's noted convenience,
 	// agent-briefs/core.md's third open question).
@@ -72,14 +77,18 @@ func run() error {
 			return err
 		}
 
-		var provisioner registry.EventBusProvisioner
-		if cfg.EventBusAuth {
-			// A direct (uncached) client: the manager's cache would otherwise hold every
-			// Secret in the cluster in memory just to read a few of ours.
-			direct, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+		// A direct (uncached) client for provisioning: the manager's cache would otherwise
+		// hold every Secret in the cluster in memory just to read a few of ours.
+		var direct client.Client
+		if cfg.EventBusAuth || cfg.Postgres.Host != "" {
+			direct, err = client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
 			if err != nil {
-				return fmt.Errorf("creating Kubernetes client for event-bus auth: %w", err)
+				return fmt.Errorf("creating Kubernetes client for provisioning: %w", err)
 			}
+		}
+
+		var busProvisioner registry.EventBusProvisioner
+		if cfg.EventBusAuth {
 			// Must complete before anything waits on NATS: the NATS pod can't start until
 			// the ConfigMap this writes exists. Fatal on failure — running with the bus
 			// authentication the operator asked for silently absent would be worse.
@@ -87,11 +96,39 @@ func run() error {
 			if err != nil {
 				return fmt.Errorf("bootstrapping event-bus authentication: %w", err)
 			}
-			provisioner = natsauth.NewModuleProvisioner(direct, authority, cfg.NATSModuleURL)
+			busProvisioner = natsauth.NewModuleProvisioner(direct, authority, cfg.NATSModuleURL)
 			log.Printf("event-bus authentication enabled (account %s)", authority.AccountPublicKey())
 		}
 
-		mgr, err := startRegistryController(scheme, reg, provisioner)
+		// Database provisioning (ADR 0053). Same ordering rule as the bus: for the bundled
+		// server the admin-password Secret must exist before its pod can start, so this
+		// runs before anything waits on Postgres — and construction never contacts it.
+		var dbProvisioner registry.DatabaseProvisioner
+		if cfg.Postgres.Host != "" {
+			pw := cfg.Postgres.AdminPassword
+			if cfg.Postgres.Bundled {
+				pw, err = dbprov.EnsureAdminPassword(ctx, direct, cfg.KubeNamespace)
+				if err != nil {
+					return fmt.Errorf("bootstrapping the bundled PostgreSQL admin credential: %w", err)
+				}
+			}
+			admin, err := dbprov.NewAdmin(ctx, dbprov.Config{
+				Host: cfg.Postgres.Host, Port: cfg.Postgres.Port, ModuleHost: cfg.Postgres.ModuleHost,
+				AdminUser: cfg.Postgres.AdminUser, AdminPassword: pw, AdminDatabase: cfg.Postgres.AdminDatabase,
+				SSLMode: cfg.Postgres.SSLMode, RestrictMaintenanceAccess: cfg.Postgres.RestrictMaintenanceAccess,
+			})
+			if err != nil {
+				return fmt.Errorf("configuring database provisioning: %w", err)
+			}
+			defer admin.Close()
+			dbProv = dbprov.NewProvisioner(direct, admin)
+			dbProvisioner = dbProv
+			log.Printf("database provisioning enabled (server %s:%d, bundled=%v)", cfg.Postgres.Host, cfg.Postgres.Port, cfg.Postgres.Bundled)
+		} else {
+			log.Print("BOOTH_POSTGRES_HOST is not set; module databases will not be provisioned (ADR 0053)")
+		}
+
+		mgr, err := startRegistryController(scheme, reg, busProvisioner, dbProvisioner)
 		if err != nil {
 			return fmt.Errorf("starting registry controller: %w", err)
 		}
@@ -119,21 +156,27 @@ func run() error {
 
 	gw := gateway.New(reg)
 
-	// User directory (ADR 0047): PostgreSQL when a DSN is configured (ADR 0014), otherwise
-	// in memory. The memory fallback loses entries on restart but repopulates itself as
+	// User directory (ADR 0047). It always starts serving from memory, and switches to
+	// PostgreSQL as soon as a database is available: immediately for an explicit DSN, or once
+	// core has provisioned its own database on the shared server (ADR 0053), which can take
+	// a while on a fresh install. Memory loses entries on restart but repopulates itself as
 	// users make authenticated requests, so it degrades rather than breaks.
-	var users directory.Store
-	if cfg.PostgresDSN != "" {
+	users := directory.NewSwitchable(directory.NewMemoryStore())
+	recorder := directory.NewRecorder(users)
+	switch {
+	case cfg.PostgresDSN != "":
 		pg, err := directory.NewPostgresStore(ctx, cfg.PostgresDSN)
 		if err != nil {
 			return fmt.Errorf("configuring user directory: %w", err)
 		}
 		defer pg.Close()
-		users = pg
-	} else {
-		log.Print("BOOTH_POSTGRES_DSN is not set; the user directory is in-memory and will be empty after a restart " +
-			"until users make authenticated requests again (ADR 0047)")
-		users = directory.NewMemoryStore()
+		users.Swap(pg)
+		log.Print("user directory: using the database from BOOTH_POSTGRES_DSN")
+	case dbProv != nil:
+		go persistDirectory(ctx, dbProv, cfg.KubeNamespace, users, recorder)
+	default:
+		log.Print("no database is configured (BOOTH_POSTGRES_DSN / BOOTH_POSTGRES_HOST); the user directory is " +
+			"in-memory and will be empty after a restart until users make authenticated requests again (ADR 0047)")
 	}
 
 	// Event bus: NATS/JetStream (ADR 0021). Connected in the background: NATS may not be
@@ -156,7 +199,7 @@ func run() error {
 		IframeURLs:   iframeURLs,
 
 		Directory:         users,
-		DirectoryRecorder: directory.NewRecorder(users),
+		DirectoryRecorder: recorder,
 	})
 
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: router}
@@ -249,7 +292,37 @@ func newScheme() (*runtime.Scheme, error) {
 	return scheme, nil
 }
 
-func startRegistryController(scheme *runtime.Scheme, reg *registry.Registry, eventBus registry.EventBusProvisioner) (ctrl.Manager, error) {
+// persistDirectory provisions core's own database and switches the user directory onto it,
+// retrying with backoff until the server is reachable (the bundled one may still be starting).
+func persistDirectory(ctx context.Context, p *dbprov.Provisioner, namespace string, users *directory.Switchable, recorder *directory.Recorder) {
+	const maxBackoff = 30 * time.Second
+	backoff := time.Second
+	for {
+		dsn, err := p.EnsureCore(ctx, namespace)
+		if err == nil {
+			var pg *directory.PostgresStore
+			if pg, err = directory.NewPostgresStore(ctx, dsn); err == nil {
+				users.Swap(pg)
+				recorder.Reset() // the new store is empty; re-record users on their next request
+				log.Print("user directory is now persistent (core database provisioned)")
+				<-ctx.Done()
+				pg.Close()
+				return
+			}
+		}
+		log.Printf("core database not ready yet (%v); retrying in %s", err, backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+func startRegistryController(scheme *runtime.Scheme, reg *registry.Registry, eventBus registry.EventBusProvisioner, database registry.DatabaseProvisioner) (ctrl.Manager, error) {
 	// Metrics and health-probe servers are both disabled: controller-runtime's
 	// manager defaults its metrics server to :8080, which collides with booth-core's
 	// own HTTP server in this same process — this bit us for real (see git history),
@@ -266,6 +339,7 @@ func startRegistryController(scheme *runtime.Scheme, reg *registry.Registry, eve
 
 	controller := registry.NewController(mgr.GetClient(), reg)
 	controller.EventBus = eventBus
+	controller.Database = database
 	if err := controller.SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setting up registry controller: %w", err)
 	}

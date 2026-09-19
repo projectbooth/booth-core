@@ -68,6 +68,22 @@ spec:
                   ContractVersion is the module-manifest.md + core-platform-api.md contract
                   version this module targets. Core supports current and previous major.
                 type: string
+              database:
+                description: |-
+                  Database signals that this module needs its own PostgreSQL database (ADR 0053).
+                  Core then creates a database and role scoped to this module on the shared cluster and
+                  delivers the connection details as a Secret in the module's namespace, ahead of the
+                  module needing them. Omit it and the module gets nothing. Core provisions the
+                  database only; what a module puts in it (schema, migrations) is the module's own.
+                  Proposed manifest addition, pending an architecture ADR (see
+                  docs/decisions/0008-shared-postgres.md).
+                properties:
+                  enabled:
+                    description: Enabled requests a database for this module.
+                    type: boolean
+                required:
+                - enabled
+                type: object
               displayName:
                 description: DisplayName is the human-readable name shown in the shell
                   UI.
