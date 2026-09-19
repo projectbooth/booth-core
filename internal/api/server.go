@@ -39,10 +39,17 @@ func NewRouter(deps Deps) http.Handler {
 
 	authed := auth.Middleware(deps.Verifier)
 
+	// ADR 0034: GET /api/me is the one route where X-Workspace is optional — it's how a
+	// client learns its memberships, so it can't already know a slug. Kept in its own
+	// group so no other route inherits the relaxation.
+	r.Group(func(r chi.Router) {
+		r.Use(auth.Middleware(deps.Verifier, auth.WorkspaceOptional))
+		r.Get("/api/me", handleMe)
+	})
+
 	r.Group(func(r chi.Router) {
 		r.Use(authed)
 
-		r.Get("/api/me", handleMe)
 		r.Get("/api/modules", handleListModules(deps.Registry))
 		r.Get("/api/modules/{id}/iframe-url", handleIframeURL(deps.IframeURLs))
 		r.Post("/api/modules/{id}/install", requireAdmin(handleInstallModule))
@@ -78,12 +85,17 @@ func handleMe(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no identity", http.StatusUnauthorized)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"subject":     identity.Claims.Subject,
 		"email":       identity.Claims.Email,
 		"memberships": identity.Memberships,
-		"active":      identity.Active,
-	})
+	}
+	// ADR 0034: omit "active" entirely when no X-Workspace header was sent — a
+	// present-but-empty object would defeat the client's `active ?? fallback` logic.
+	if identity.HasActive() {
+		body["active"] = identity.Active
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func handleListModules(reg *registry.Registry) http.HandlerFunc {

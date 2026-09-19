@@ -43,6 +43,31 @@ func TestHandleMe(t *testing.T) {
 	}
 }
 
+// ADR 0034: with no active workspace resolved, "active" must be absent from the JSON
+// entirely, not a zero-value {workspace:"",role:""}.
+func TestHandleMe_OmitsActiveWhenUnresolved(t *testing.T) {
+	identity := auth.Identity{
+		Claims:      &auth.Claims{Subject: "user-1"},
+		Memberships: []auth.Membership{{Workspace: "acme-analytics", Role: auth.RoleViewer}},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/me", nil)
+	req = req.WithContext(auth.WithIdentityForTesting(req.Context(), identity))
+	rec := httptest.NewRecorder()
+
+	handleMe(rec, req)
+
+	var body map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	if _, present := body["active"]; present {
+		t.Errorf("active key present (%v), want omitted", body["active"])
+	}
+	if body["memberships"] == nil {
+		t.Error("memberships should still be returned")
+	}
+}
+
 // TestHandleMe_NestedFieldsUseLowerCamelCase guards against the casing bug booth-design
 // flagged: memberships[].workspace/role and active.workspace/role must serialize
 // lowerCamelCase like every other field in this API, not capitalized Go field names.
