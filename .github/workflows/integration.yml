@@ -79,7 +79,8 @@ jobs:
       - name: Verify event-bus authentication
         run: |
           set -eu
-          kubectl -n booth-system get configmap booth-nats-auth secret booth-nats-keys
+          kubectl -n booth-system get configmap booth-nats-auth
+          kubectl -n booth-system get secret booth-nats-keys
 
           echo "Waiting for core to connect to the authenticated bus..."
           for i in $(seq 1 60); do
