@@ -72,8 +72,86 @@ jobs:
           kubectl -n booth-system rollout status deployment/booth-core --timeout=120s
           kubectl -n booth-system get boothmodules.booth.projectbooth.io || true
 
+      # ADR 0049, end to end on the real NATS server the chart deploys: the bus must
+      # require credentials, and a credential provisioned from a BoothModule manifest must
+      # actually work. Unit tests prove the permission model against an embedded server;
+      # this proves the chart wiring (include, mount, resolver) on the real thing.
+      - name: Verify event-bus authentication
+        run: |
+          set -eu
+          kubectl -n booth-system get configmap booth-nats-auth secret booth-nats-keys
+
+          echo "Waiting for core to connect to the authenticated bus..."
+          for i in $(seq 1 60); do
+            if kubectl -n booth-system logs deployment/booth-core | grep -q "event bus connected"; then
+              echo "core connected with its own credential"; break
+            fi
+            [ "$i" = 60 ] && { echo "core never connected to the event bus"; exit 1; }
+            sleep 3
+          done
+
+          kubectl create namespace ci-superset
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: booth.projectbooth.io/v1alpha1
+          kind: BoothModule
+          metadata:
+            name: superset
+            namespace: ci-superset
+          spec:
+            id: superset
+            displayName: Superset
+            version: 0.1.0
+            contractVersion: 0.1.0
+            hasOwnUi: false
+            healthCheckPath: /health
+            serviceRef: {name: superset, namespace: ci-superset, port: 8088}
+            events:
+              publish: ["dashboard.*"]
+          EOF
+
+          echo "Waiting for the provisioned credential..."
+          for i in $(seq 1 40); do
+            kubectl -n ci-superset get secret booth-event-bus-credentials >/dev/null 2>&1 && break
+            [ "$i" = 40 ] && { echo "credential Secret never appeared"; exit 1; }
+            sleep 3
+          done
+          kubectl get namespace ci-superset -o jsonpath='{.metadata.labels}' | grep -q event-bus-client
+
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: bus-check, namespace: ci-superset}
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: nats-box
+                    image: natsio/nats-box:0.19.7
+                    env:
+                      - name: NATS_URL
+                        valueFrom: {secretKeyRef: {name: booth-event-bus-credentials, key: url}}
+                    volumeMounts: [{name: creds, mountPath: /creds}]
+                    command: ["sh", "-ec"]
+                    args:
+                      - |
+                        nats --server "$NATS_URL" --creds /creds/nats.creds rtt
+                        if nats --server "$NATS_URL" rtt; then
+                          echo "anonymous connection unexpectedly succeeded"; exit 1
+                        fi
+                        echo "auth enforced: credential accepted, anonymous refused"
+                volumes:
+                  - name: creds
+                    secret: {secretName: booth-event-bus-credentials}
+          EOF
+          kubectl -n ci-superset wait --for=condition=complete job/bus-check --timeout=180s
+          kubectl -n ci-superset logs job/bus-check
+
       - name: Dump logs on failure
         if: failure()
         run: |
           kubectl -n booth-system get all
           kubectl -n booth-system logs deployment/booth-core --tail=200 || true
+          kubectl -n booth-system logs statefulset/booth-core-nats -c nats --tail=100 || true
+          kubectl -n ci-superset logs job/bus-check --tail=50 || true

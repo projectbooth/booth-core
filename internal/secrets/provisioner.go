@@ -36,13 +36,30 @@ func NewProvisioner(c client.Client) *Provisioner {
 // is composing credentials/config from Go strings, and Kubernetes handles the
 // base64 encoding of the underlying Secret's StringData field for us.
 func (p *Provisioner) ProvisionSecret(ctx context.Context, namespace, name string, data map[string]string, owner metav1.OwnerReference) error {
+	return p.ProvisionSecretWith(ctx, namespace, name, data, nil, &owner)
+}
+
+// ProvisionSecretWith is ProvisionSecret with optional annotations and an optional owner
+// (nil means unowned — needed when the Secret lives in a different namespace than its
+// logical owner, since Kubernetes ownerReferences can't cross namespaces).
+func (p *Provisioner) ProvisionSecretWith(ctx context.Context, namespace, name string, data, annotations map[string]string, owner *metav1.OwnerReference) error {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 	}
 
 	_, err := controllerutil.CreateOrUpdate(ctx, p.client, secret, func() error {
 		secret.StringData = data
-		secret.OwnerReferences = []metav1.OwnerReference{owner}
+		if annotations != nil {
+			if secret.Annotations == nil {
+				secret.Annotations = map[string]string{}
+			}
+			for k, v := range annotations {
+				secret.Annotations[k] = v
+			}
+		}
+		if owner != nil {
+			secret.OwnerReferences = []metav1.OwnerReference{*owner}
+		}
 		return nil
 	})
 	if err != nil {

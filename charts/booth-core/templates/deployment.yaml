@@ -38,6 +38,14 @@ spec:
             {{- if .Values.nats.enabled }}
             - name: BOOTH_NATS_URL
               value: "nats://{{ .Release.Name }}-nats:4222"
+            # Where modules (in other namespaces) reach the bus; written into their
+            # credential Secrets.
+            - name: BOOTH_NATS_MODULE_URL
+              value: "nats://{{ .Release.Name }}-nats.{{ .Release.Namespace }}.svc.cluster.local:4222"
+            # Always on in the chart: the NATS subchart is configured (values.yaml) to
+            # include the trust config core generates, so the two only work together.
+            - name: BOOTH_EVENTBUS_AUTH
+              value: "true"
             {{- end }}
             - name: BOOTH_IFRAME_SIGNING_KEY
               valueFrom:

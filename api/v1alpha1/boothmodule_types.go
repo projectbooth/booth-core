@@ -106,6 +106,34 @@ type BoothModuleSpec struct {
 	// and health-check reconciler have somewhere to route to.
 	// +kubebuilder:validation:Required
 	ServiceRef ServiceReference `json:"serviceRef"`
+
+	// Events declares which event-bus subjects this module may publish and subscribe to
+	// (ADR 0049). Core derives the module's NATS credentials — and their per-subject
+	// publish permissions — from exactly this, and provisions them as a Secret in the
+	// module's namespace. A module that omits it gets no bus credentials at all, i.e. it
+	// cannot connect to the bus. Proposed manifest addition, pending an architecture ADR
+	// (see docs/decisions/0006-event-bus-authentication.md).
+	// +optional
+	Events *EventBusAccess `json:"events,omitempty"`
+}
+
+// EventBusAccess lists the event types a module may use, as dotted patterns matching
+// docs/decisions/0002's event-type grammar (e.g. "dashboard.created", "dashboard.*").
+// Each is applied across all workspaces (booth.*.<pattern>): modules serve every
+// workspace, so NATS permissions can't usefully be narrower than that.
+type EventBusAccess struct {
+	// Publish lists event types this module may publish.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:items:Pattern=`^[a-z][a-z0-9]*(\.([a-z][a-z0-9]*|\*))+$`
+	Publish []string `json:"publish,omitempty"`
+
+	// Subscribe lists event types this module consumes. Grants access to the
+	// JetStream consumer API for the shared events stream.
+	// +optional
+	// +listType=set
+	// +kubebuilder:validation:items:Pattern=`^[a-z][a-z0-9]*(\.([a-z][a-z0-9]*|\*))+$`
+	Subscribe []string `json:"subscribe,omitempty"`
 }
 
 // ModulePhase summarizes a module's observed health, derived from polling

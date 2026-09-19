@@ -5,8 +5,10 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config is booth-core's full runtime configuration.
@@ -20,6 +22,17 @@ type Config struct {
 	// NATSURL is the connection string for the NATS server backing the event bus
 	// (ADR 0021). In-cluster, this points at the NATS service the Helm chart bundles.
 	NATSURL string
+
+	// EventBusAuth turns on event-bus authentication (ADR 0049): core bootstraps the
+	// NATS trust chain, connects with its own credential, and provisions per-module
+	// credentials from each BoothModule's declared events. Every real deployment should
+	// run with it on; the bundled Helm chart does. Off means the bus is unauthenticated.
+	EventBusAuth bool
+
+	// NATSModuleURL is the address written into each module's credential Secret. Modules
+	// live in other namespaces, so it must be resolvable from anywhere in the cluster
+	// (unlike NATSURL, which core itself uses from its own namespace).
+	NATSModuleURL string
 
 	// DevRegistryPath, if set, points at a static YAML file listing BoothModule-shaped
 	// entries for local development without a real Kubernetes cluster (ADR 0019's
@@ -81,6 +94,15 @@ func Load() (Config, error) {
 		cfg.OIDC.RequireAudience = b
 	}
 
+	if v := os.Getenv("BOOTH_EVENTBUS_AUTH"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("BOOTH_EVENTBUS_AUTH: %w", err)
+		}
+		cfg.EventBusAuth = b
+	}
+	cfg.NATSModuleURL = getEnv("BOOTH_NATS_MODULE_URL", qualifyNATSURL(cfg.NATSURL, cfg.KubeNamespace))
+
 	if cfg.DevRegistryPath == "" {
 		if cfg.OIDC.IssuerURL == "" {
 			return Config{}, fmt.Errorf("BOOTH_OIDC_ISSUER_URL is required")
@@ -91,6 +113,22 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// qualifyNATSURL turns an in-namespace NATS URL like nats://booth-core-nats:4222 into one
+// resolvable from any namespace (nats://booth-core-nats.<ns>.svc.cluster.local:4222).
+// URLs whose host is already qualified, or that don't parse, are returned unchanged.
+func qualifyNATSURL(raw, namespace string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || strings.Contains(u.Hostname(), ".") {
+		return raw
+	}
+	host := u.Hostname() + "." + namespace + ".svc.cluster.local"
+	if port := u.Port(); port != "" {
+		host += ":" + port
+	}
+	u.Host = host
+	return u.String()
 }
 
 func getEnv(key, fallback string) string {

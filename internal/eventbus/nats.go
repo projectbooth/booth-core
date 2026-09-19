@@ -20,9 +20,10 @@ type Bus struct {
 }
 
 // Connect dials the configured NATS server and ensures the shared BOOTH_EVENTS stream
-// exists (creating it if this is a fresh deployment).
-func Connect(ctx context.Context, url string) (*Bus, error) {
-	conn, err := nats.Connect(url, nats.Name("booth-core"))
+// exists (creating it if this is a fresh deployment). Extra options carry authentication
+// (ADR 0049).
+func Connect(ctx context.Context, url string, opts ...nats.Option) (*Bus, error) {
+	conn, err := nats.Connect(url, append([]nats.Option{nats.Name("booth-core")}, opts...)...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to NATS at %s: %w", url, err)
 	}

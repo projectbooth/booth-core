@@ -13,9 +13,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	boothv1alpha1 "github.com/projectbooth/booth-core/api/v1alpha1"
@@ -25,6 +27,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/devregistry"
 	"github.com/projectbooth/booth-core/internal/eventbus"
 	"github.com/projectbooth/booth-core/internal/gateway"
+	"github.com/projectbooth/booth-core/internal/natsauth"
 	"github.com/projectbooth/booth-core/internal/registry"
 )
 
@@ -45,6 +48,11 @@ func run() error {
 
 	reg := registry.New()
 
+	// authority is non-nil only when event-bus authentication is on and we're running in a
+	// real cluster (ADR 0049); it's used both to mint core's own bus credential and, via
+	// the registry controller, each module's.
+	var authority *natsauth.Authority
+
 	// Module discovery: real BoothModule CRD watch in a real cluster (ADR 0019), or a
 	// static file for local development without one (ADR 0019's noted convenience,
 	// agent-briefs/core.md's third open question).
@@ -58,7 +66,31 @@ func run() error {
 		}
 		log.Printf("dev mode: loaded %d module(s) from %s (no CRD watch)", len(modules), cfg.DevRegistryPath)
 	} else {
-		mgr, err := startRegistryController(reg)
+		scheme, err := newScheme()
+		if err != nil {
+			return err
+		}
+
+		var provisioner registry.EventBusProvisioner
+		if cfg.EventBusAuth {
+			// A direct (uncached) client: the manager's cache would otherwise hold every
+			// Secret in the cluster in memory just to read a few of ours.
+			direct, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+			if err != nil {
+				return fmt.Errorf("creating Kubernetes client for event-bus auth: %w", err)
+			}
+			// Must complete before anything waits on NATS: the NATS pod can't start until
+			// the ConfigMap this writes exists. Fatal on failure — running with the bus
+			// authentication the operator asked for silently absent would be worse.
+			authority, err = natsauth.LoadOrCreate(ctx, direct, cfg.KubeNamespace)
+			if err != nil {
+				return fmt.Errorf("bootstrapping event-bus authentication: %w", err)
+			}
+			provisioner = natsauth.NewModuleProvisioner(direct, authority, cfg.NATSModuleURL)
+			log.Printf("event-bus authentication enabled (account %s)", authority.AccountPublicKey())
+		}
+
+		mgr, err := startRegistryController(scheme, reg, provisioner)
 		if err != nil {
 			return fmt.Errorf("starting registry controller: %w", err)
 		}
@@ -86,15 +118,17 @@ func run() error {
 
 	gw := gateway.New(reg)
 
-	// Event bus: NATS/JetStream (ADR 0021). Non-fatal if unavailable at startup so a
-	// developer running just the HTTP surface locally isn't forced to also run NATS;
-	// every real deployment's Helm chart bundles NATS alongside core (ADR 0021).
-	bus, err := eventbus.Connect(ctx, cfg.NATSURL)
-	if err != nil {
-		log.Printf("event bus unavailable (%v); continuing without it", err)
+	// Event bus: NATS/JetStream (ADR 0021). Connected in the background: NATS may not be
+	// up yet (with auth on, its pod is waiting on the ConfigMap core just wrote), and a
+	// developer running only the HTTP surface locally shouldn't need NATS at all.
+	var busOpts []nats.Option
+	if authority != nil {
+		busOpts = append(busOpts, authority.ConnectOption("booth-core", natsauth.CoreGrants()))
 	} else {
-		defer bus.Close()
+		log.Print("WARNING: event-bus authentication is OFF (BOOTH_EVENTBUS_AUTH is not true or this is dev mode); " +
+			"any pod that can reach NATS can publish any event (ADR 0049)")
 	}
+	go maintainBus(ctx, cfg.NATSURL, busOpts)
 
 	router := api.NewRouter(api.Deps{
 		Verifier:     verifierHolder,
@@ -158,7 +192,32 @@ func initVerifierWithRetry(ctx context.Context, cfg config.OIDCConfig, holder *a
 	}
 }
 
-func startRegistryController(reg *registry.Registry) (ctrl.Manager, error) {
+// maintainBus connects to the event bus, retrying with backoff until it succeeds, then
+// holds the connection until ctx is canceled.
+func maintainBus(ctx context.Context, url string, opts []nats.Option) {
+	const maxBackoff = 30 * time.Second
+	backoff := time.Second
+	for {
+		bus, err := eventbus.Connect(ctx, url, opts...)
+		if err == nil {
+			log.Print("event bus connected")
+			<-ctx.Done()
+			bus.Close()
+			return
+		}
+		log.Printf("event bus not ready yet (%v); retrying in %s", err, backoff)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+func newScheme() (*runtime.Scheme, error) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
 		return nil, err
@@ -166,7 +225,10 @@ func startRegistryController(reg *registry.Registry) (ctrl.Manager, error) {
 	if err := boothv1alpha1.AddToScheme(scheme); err != nil {
 		return nil, err
 	}
+	return scheme, nil
+}
 
+func startRegistryController(scheme *runtime.Scheme, reg *registry.Registry, eventBus registry.EventBusProvisioner) (ctrl.Manager, error) {
 	// Metrics and health-probe servers are both disabled: controller-runtime's
 	// manager defaults its metrics server to :8080, which collides with booth-core's
 	// own HTTP server in this same process — this bit us for real (see git history),
@@ -182,6 +244,7 @@ func startRegistryController(reg *registry.Registry) (ctrl.Manager, error) {
 	}
 
 	controller := registry.NewController(mgr.GetClient(), reg)
+	controller.EventBus = eventBus
 	if err := controller.SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setting up registry controller: %w", err)
 	}

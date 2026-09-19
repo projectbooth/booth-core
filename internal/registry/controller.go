@@ -36,6 +36,17 @@ type Controller struct {
 	// real in-cluster Service DNS name; overridable in tests to point at an
 	// httptest server instead.
 	HealthCheckURL func(spec boothv1alpha1.BoothModuleSpec) string
+
+	// EventBus, if set, provisions each module's event-bus credentials from its manifest
+	// on every reconcile (ADR 0049). Nil means event-bus auth is disabled.
+	EventBus EventBusProvisioner
+}
+
+// EventBusProvisioner makes a module's event-bus credentials match its manifest.
+// Implemented by natsauth.ModuleProvisioner; an interface here so this package doesn't
+// depend on the NATS libraries.
+type EventBusProvisioner interface {
+	Ensure(ctx context.Context, mod *boothv1alpha1.BoothModule) error
 }
 
 // NewController wires a Controller with a sane default HTTP client and in-cluster
@@ -86,6 +97,15 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			// Don't fail reconciliation over a status-write conflict; the in-memory
 			// registry (what the gateway/API actually read from) is already correct,
 			// and the next poll will retry the status write.
+		}
+	}
+
+	// Provision after the registry/health work so a credential problem never hides a
+	// module's health. Returning the error requeues with backoff; the next attempt also
+	// re-runs the health check, so polling continues while this is failing.
+	if c.EventBus != nil {
+		if err := c.EventBus.Ensure(ctx, &mod); err != nil {
+			return ctrl.Result{}, fmt.Errorf("provisioning event-bus credentials for %q: %w", mod.Spec.ID, err)
 		}
 	}
 

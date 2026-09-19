@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -125,5 +126,70 @@ func TestReconcile_RemovesModuleOnDelete(t *testing.T) {
 
 	if _, ok := reg.Get("storage"); ok {
 		t.Fatal("expected module to be removed from registry after deletion")
+	}
+}
+
+type recordingProvisioner struct {
+	calls []string
+	err   error
+}
+
+func (r *recordingProvisioner) Ensure(_ context.Context, mod *boothv1alpha1.BoothModule) error {
+	r.calls = append(r.calls, mod.Spec.ID)
+	return r.err
+}
+
+func newControllerWithModule(t *testing.T) (*Controller, *Registry) {
+	t.Helper()
+	mod := &boothv1alpha1.BoothModule{
+		ObjectMeta: metav1.ObjectMeta{Name: "superset", Namespace: "booth-system"},
+		Spec: boothv1alpha1.BoothModuleSpec{
+			ID: "superset", HealthCheckPath: "/health",
+			ServiceRef: boothv1alpha1.ServiceReference{Name: "s", Namespace: "booth-system", Port: 1},
+		},
+	}
+	scheme := runtime.NewScheme()
+	_ = boothv1alpha1.AddToScheme(scheme)
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&boothv1alpha1.BoothModule{}).WithObjects(mod).Build()
+	reg := New()
+	rc := NewController(c, reg)
+	rc.HealthCheckURL = func(boothv1alpha1.BoothModuleSpec) string { return "http://127.0.0.1:1/health" }
+	return rc, reg
+}
+
+// ADR 0049: every reconcile asks the event-bus provisioner to make the module's
+// credentials match its manifest.
+func TestReconcile_ProvisionsEventBusCredentials(t *testing.T) {
+	rc, _ := newControllerWithModule(t)
+	rec := &recordingProvisioner{}
+	rc.EventBus = rec
+
+	if _, err := rc.Reconcile(context.Background(), reqFor("superset", "booth-system")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0] != "superset" {
+		t.Fatalf("provisioner calls = %v, want one call for superset", rec.calls)
+	}
+}
+
+// A credential failure must surface (so it's retried with backoff) but must not stop the
+// module's health from being recorded in the registry.
+func TestReconcile_ProvisioningErrorIsReturnedButHealthStillRecorded(t *testing.T) {
+	rc, reg := newControllerWithModule(t)
+	rc.EventBus = &recordingProvisioner{err: errors.New("boom")}
+
+	if _, err := rc.Reconcile(context.Background(), reqFor("superset", "booth-system")); err == nil {
+		t.Fatal("expected the provisioning error to be returned so the reconcile is retried")
+	}
+	if _, ok := reg.Get("superset"); !ok {
+		t.Fatal("module should still be in the registry when provisioning fails")
+	}
+}
+
+func TestReconcile_NoProvisionerIsFine(t *testing.T) {
+	rc, _ := newControllerWithModule(t)
+	if _, err := rc.Reconcile(context.Background(), reqFor("superset", "booth-system")); err != nil {
+		t.Fatalf("Reconcile without an event-bus provisioner: %v", err)
 	}
 }
