@@ -104,6 +104,21 @@ type PostgresConfig struct {
 	RestrictMaintenanceAccess bool
 }
 
+// StartupWarnings returns conditions an operator should know about at boot, as one-line
+// messages ready to log. Currently: an external PostgreSQL with the maintenance-database
+// restriction left off (ADR 0054).
+func (p PostgresConfig) StartupWarnings() []string {
+	var w []string
+	if p.Host != "" && !p.Bundled && !p.RestrictMaintenanceAccess {
+		w = append(w, "connected to an EXTERNAL PostgreSQL ("+p.Host+") with postgres.external.restrictMaintenanceAccess "+
+			"off: PostgreSQL lets any role connect to the maintenance databases (postgres, template1) by default, so a "+
+			"module's database credentials can list the names of every other database and role on that server (not their data). "+
+			"Core does not change privileges on a cluster it doesn't own; set postgres.external.restrictMaintenanceAccess=true "+
+			"once you've checked nothing else relies on that access (ADR 0054)")
+	}
+	return w
+}
+
 func Load() (Config, error) {
 	cfg := Config{
 		HTTPAddr:        getEnv("BOOTH_HTTP_ADDR", ":8080"),

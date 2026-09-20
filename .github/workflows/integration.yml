@@ -221,6 +221,194 @@ jobs:
           kubectl -n ci-superset wait --for=condition=complete job/db-check --timeout=180s
           kubectl -n ci-superset logs job/db-check
 
+      # ADR 0054: the scheduled pg_dump backup of the bundled PostgreSQL, run for real. Proves
+      # the backup is complete and usable — including restoring a module's database into a
+      # scratch database and reading its data back — and that retention prunes.
+      - name: Verify backup and restore (PVC)
+        run: |
+          set -eu
+          kubectl -n booth-system get cronjob booth-core-postgresql-backup
+
+          # 1. Run the actual CronJob once.
+          kubectl -n booth-system create job --from=cronjob/booth-core-postgresql-backup backup-now
+          kubectl -n booth-system wait --for=condition=complete job/backup-now --timeout=300s
+          kubectl -n booth-system logs job/backup-now
+
+          # 2. Inspect and use what it produced, from a pod that mounts the same PVC. The label
+          #    is what the PostgreSQL NetworkPolicy admits.
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: backup-verify, namespace: booth-system}
+          spec:
+            backoffLimit: 0
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/name: postgresql-backup
+                  app.kubernetes.io/instance: booth-core
+              spec:
+                restartPolicy: Never
+                securityContext: {runAsUser: 70, runAsGroup: 70, fsGroup: 70}
+                containers:
+                  - name: verify
+                    image: postgres:16-alpine
+                    env:
+                      - {name: PGHOST, value: booth-core-postgresql}
+                      - {name: PGUSER, value: postgres}
+                      - {name: PGSSLMODE, value: disable}
+                      - name: PGPASSWORD
+                        valueFrom: {secretKeyRef: {name: booth-postgres-admin, key: password}}
+                    command: ["sh", "-eu", "-c"]
+                    args:
+                      - |
+                        latest=$(ls -1d /backups/[0-9]*T*Z | sort | tail -1)
+                        echo "verifying $latest"; ls -l "$latest"
+
+                        # Complete, and containing what a restore needs.
+                        test -s "$latest/MANIFEST"
+                        test -s "$latest/globals.sql"
+                        grep -q 'CREATE ROLE booth_mod_superset' "$latest/globals.sql"
+                        test -s "$latest/booth_core.dump"
+                        test -s "$latest/booth_mod_superset.dump"
+
+                        # Restore the module's database into a scratch database and read its
+                        # data back: the table the module created earlier (value 42).
+                        createdb restore_check
+                        pg_restore --no-owner --dbname=restore_check "$latest/booth_mod_superset.dump"
+                        got=$(psql -Atq -d restore_check -c 'select x from t')
+                        test "$got" = 42 || { echo "restored data was '$got', expected 42"; exit 1; }
+                        dropdb restore_check
+                        echo "scratch restore verified"
+
+                        # The exact in-place restore command from docs/runbooks: after the
+                        # database has drifted from the backup, restoring rolls it back, and
+                        # the objects end up owned by the module's own role.
+                        psql -Atq -d booth_mod_superset -c 'insert into t values (99)'
+                        pg_restore --clean --if-exists --no-owner --role=booth_mod_superset                           --dbname=booth_mod_superset "$latest/booth_mod_superset.dump"
+                        got=$(psql -Atq -d booth_mod_superset -c "select string_agg(x::text, ',' order by x) from t")
+                        test "$got" = 42 || { echo "in-place restore left '$got', expected only 42"; exit 1; }
+                        owner=$(psql -Atq -d booth_mod_superset -c "select tableowner from pg_tables where tablename = 't'")
+                        test "$owner" = booth_mod_superset || { echo "restored table owned by '$owner'"; exit 1; }
+                        echo "in-place restore verified"
+
+                        # Retention: keep only the newest N, and never leave incomplete runs.
+                        for i in 1 2 3; do
+                          sleep 1
+                          BACKUP_MODE=pvc BACKUP_DIR=/backups RETENTION=2 sh /scripts/pg-backup.sh >/dev/null
+                        done
+                        n=$(ls -1d /backups/[0-9]*T*Z | wc -l)
+                        test "$n" = 2 || { echo "expected 2 backups after pruning, found $n"; ls -l /backups; exit 1; }
+                        if ls -d /backups/.incomplete-* >/dev/null 2>&1; then
+                          echo "an incomplete backup was left behind"; exit 1
+                        fi
+                        echo "backup, restore, and retention verified"
+                    volumeMounts:
+                      - {name: backups, mountPath: /backups}
+                      - {name: scripts, mountPath: /scripts, readOnly: true}
+                volumes:
+                  - name: backups
+                    persistentVolumeClaim: {claimName: booth-core-postgresql-backup}
+                  - name: scripts
+                    configMap: {name: booth-core-postgresql-backup-script}
+          EOF
+          kubectl -n booth-system wait --for=condition=complete job/backup-verify --timeout=300s
+          kubectl -n booth-system logs job/backup-verify
+
+      # The same backup, shipped to S3-compatible object storage (a MinIO in the cluster).
+      - name: Verify backup to object storage (S3)
+        run: |
+          set -eu
+          kubectl create namespace ci-minio
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: minio, namespace: ci-minio}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: minio}}
+            template:
+              metadata: {labels: {app: minio}}
+              spec:
+                containers:
+                  - name: minio
+                    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+                    args: ["server", "/data"]
+                    env:
+                      - {name: MINIO_ROOT_USER, value: ci-access-key}
+                      - {name: MINIO_ROOT_PASSWORD, value: ci-secret-key-0123456789}
+                    ports: [{containerPort: 9000}]
+                    readinessProbe: {httpGet: {path: /minio/health/ready, port: 9000}, periodSeconds: 3}
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: minio, namespace: ci-minio}
+          spec:
+            selector: {app: minio}
+            ports: [{port: 9000, targetPort: 9000}]
+          EOF
+          kubectl -n ci-minio rollout status deployment/minio --timeout=180s
+
+          kubectl -n booth-system create secret generic minio-creds \
+            --from-literal=AWS_ACCESS_KEY_ID=ci-access-key \
+            --from-literal=AWS_SECRET_ACCESS_KEY=ci-secret-key-0123456789
+
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: make-bucket, namespace: booth-system}
+          spec:
+            backoffLimit: 3
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: aws
+                    image: amazon/aws-cli:2.36.49
+                    envFrom: [{secretRef: {name: minio-creds}}]
+                    env: [{name: AWS_DEFAULT_REGION, value: us-east-1}]
+                    args: ["--endpoint-url", "http://minio.ci-minio:9000", "s3", "mb", "s3://booth-backups"]
+          EOF
+          kubectl -n booth-system wait --for=condition=complete job/make-bucket --timeout=180s
+
+          # Switch the chart's backup destination from the PVC to the bucket.
+          helm upgrade booth-core charts/booth-core --namespace booth-system --reuse-values \
+            --set postgresql.backup.s3.bucket=booth-backups \
+            --set postgresql.backup.s3.endpoint=http://minio.ci-minio:9000 \
+            --set postgresql.backup.s3.existingSecret=minio-creds \
+            --wait --timeout 5m
+
+          kubectl -n booth-system create job --from=cronjob/booth-core-postgresql-backup s3-backup-now
+          kubectl -n booth-system wait --for=condition=complete job/s3-backup-now --timeout=300s
+          kubectl -n booth-system logs job/s3-backup-now --all-containers
+
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: list-bucket, namespace: booth-system}
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: aws
+                    image: amazon/aws-cli:2.36.49
+                    envFrom: [{secretRef: {name: minio-creds}}]
+                    env: [{name: AWS_DEFAULT_REGION, value: us-east-1}]
+                    command: ["sh", "-ec"]
+                    args:
+                      - |
+                        out=$(aws --endpoint-url http://minio.ci-minio:9000 s3 ls --recursive s3://booth-backups/booth-postgres/)
+                        echo "$out"
+                        for f in globals.sql MANIFEST booth_core.dump booth_mod_superset.dump; do
+                          echo "$out" | grep -q "/$f\$" || { echo "missing $f in the bucket"; exit 1; }
+                        done
+                        echo "object-storage backup verified"
+          EOF
+          kubectl -n booth-system wait --for=condition=complete job/list-bucket --timeout=180s
+          kubectl -n booth-system logs job/list-bucket
+
       - name: Dump logs on failure
         if: failure()
         run: |
@@ -230,3 +418,8 @@ jobs:
           kubectl -n ci-superset logs job/bus-check --tail=50 || true
           kubectl -n booth-system logs statefulset/booth-core-postgresql --tail=60 || true
           kubectl -n ci-superset logs job/db-check --tail=50 || true
+          kubectl -n booth-system logs job/backup-now --tail=40 || true
+          kubectl -n booth-system logs job/backup-verify --tail=60 || true
+          kubectl -n booth-system logs job/s3-backup-now --all-containers --tail=40 || true
+          kubectl -n booth-system logs job/list-bucket --tail=40 || true
+          kubectl -n booth-system get pods,jobs

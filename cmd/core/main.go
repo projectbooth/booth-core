@@ -121,6 +121,9 @@ func run() error {
 				return fmt.Errorf("configuring database provisioning: %w", err)
 			}
 			defer admin.Close()
+			for _, w := range cfg.Postgres.StartupWarnings() {
+				log.Print("WARNING: " + w)
+			}
 			dbProv = dbprov.NewProvisioner(direct, admin)
 			dbProvisioner = dbProv
 			log.Printf("database provisioning enabled (server %s:%d, bundled=%v)", cfg.Postgres.Host, cfg.Postgres.Port, cfg.Postgres.Bundled)

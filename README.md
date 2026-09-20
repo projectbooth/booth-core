@@ -37,6 +37,7 @@ internal/config/        Env-var configuration
 config/crd/bases/       Generated BoothModule CRD YAML
 charts/booth-core/      Helm chart (bundles NATS, the CRD, RBAC, the core Deployment)
 docs/decisions/         Decisions this repo made on brief-flagged open questions (see below)
+docs/runbooks/          Operator runbooks (PostgreSQL backup, restore, major-version upgrade)
 test/contract/          Layer-2 tests: contract fixtures vs. Go types, no cluster needed
 test/integration/       Layer-3 tests: real (envtest) kube-apiserver, no Docker needed
 hack/                    Local-dev convenience files (example dev-registry.yaml, etc.)
@@ -167,7 +168,16 @@ the Secret `booth-database-credentials` (`dsn` plus `host`/`port`/`database`/`us
 `password`) in the module's namespace. Roles are unprivileged and each database is closed to every
 other module's credentials. Uninstalling a module **never drops its data**. Core's own user
 directory uses the same mechanism, so a default install now persists it. See
-`docs/decisions/0008` — including its limits: the bundled server is single-node with no backup.
+`docs/decisions/0008`.
+
+**Backup (ADR 0054).** The bundled server is single-node, but it is backed up: a daily `pg_dump`
+CronJob writes to a PVC (default) or an S3-compatible bucket (`postgresql.backup.s3.*`) — a
+baseline, **not** point-in-time recovery, and the default PVC doesn't survive losing the cluster.
+Restore and major-version upgrade are manual: `docs/runbooks/postgres-backup-restore.md`
+(`docs/decisions/0009`). Connecting to an **external** PostgreSQL with
+`postgres.external.restrictMaintenanceAccess` left off logs a startup warning (and prints one on
+`helm install`): PostgreSQL lets any role connect to the maintenance databases by default, so a
+module's credentials can list other databases' and roles' names.
 
 ## What's built vs. what's left, against the v0 definition of done
 

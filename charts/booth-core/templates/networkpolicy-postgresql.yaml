@@ -26,4 +26,9 @@ spec:
         - namespaceSelector:
             matchLabels:
               booth.projectbooth.io/database-client: "true"
+        # The scheduled backup job (templates/postgresql-backup.yaml) dumps over the network.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgresql-backup
+              app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}

@@ -1,0 +1,35 @@
+booth-core {{ .Chart.AppVersion }} installed in namespace {{ .Release.Namespace }}.
+
+{{- if .Values.postgresql.enabled }}
+
+PostgreSQL: a bundled single-node server is running ({{ .Release.Name }}-postgresql). It is for
+self-hosted and development installs and is NOT highly available.
+{{- if .Values.postgresql.backup.enabled }}
+  Backups: a daily pg_dump runs at "{{ .Values.postgresql.backup.schedule }}" and writes to
+  {{- if .Values.postgresql.backup.s3.bucket }} the S3 bucket "{{ .Values.postgresql.backup.s3.bucket }}".
+  {{- else }} the PVC "{{ .Release.Name }}-postgresql-backup" (kept on `helm uninstall`),
+  keeping the newest {{ .Values.postgresql.backup.retention }}. That PVC does not survive losing this cluster —
+  set postgresql.backup.s3.bucket, or copy it off-site, for real disaster recovery.
+  {{- end }}
+  This is a logical-backup baseline, not point-in-time recovery. Restore and major-version
+  upgrade are manual: docs/runbooks/postgres-backup-restore.md
+{{- else }}
+  WARNING: postgresql.backup.enabled is false — nothing backs up the bundled server.
+{{- end }}
+{{- else if .Values.postgres.external.host }}
+
+PostgreSQL: using the external server {{ .Values.postgres.external.host }}. Backing it up is your responsibility.
+{{- if not .Values.postgres.external.restrictMaintenanceAccess }}
+
+  WARNING: postgres.external.restrictMaintenanceAccess is false. PostgreSQL lets any role connect
+  to the maintenance databases (postgres, template1) by default, so a module's database
+  credentials can list the names of every other database and role on this server (not their
+  data). booth-core does not change privileges on a cluster it doesn't own. Set
+  postgres.external.restrictMaintenanceAccess=true once you have checked that nothing else on the
+  cluster relies on that access.
+{{- end }}
+{{- else }}
+
+PostgreSQL: none configured. Module databases will not be provisioned, and the user directory
+is in-memory (it empties on restart until users make requests again).
+{{- end }}

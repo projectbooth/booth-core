@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestQualifyNATSURL(t *testing.T) {
 	cases := []struct{ in, ns, want string }{
@@ -87,5 +90,51 @@ func TestLoad_RejectsBadPostgresPort(t *testing.T) {
 	t.Setenv("BOOTH_POSTGRES_PORT", "99999")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected an error for an out-of-range port")
+	}
+}
+
+// ADR 0054: operators must not be able to assume a protection that silently isn't there.
+func TestStartupWarnings(t *testing.T) {
+	warned := func(p PostgresConfig) bool { return len(p.StartupWarnings()) > 0 }
+
+	if !warned(PostgresConfig{Host: "pg.example.com"}) {
+		t.Error("expected a warning for an external server with the restriction off")
+	}
+	msg := PostgresConfig{Host: "pg.example.com"}.StartupWarnings()[0]
+	for _, want := range []string{"pg.example.com", "restrictMaintenanceAccess", "postgres", "template1"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("warning %q doesn't mention %q", msg, want)
+		}
+	}
+
+	for name, p := range map[string]PostgresConfig{
+		"external with the restriction on": {Host: "pg.example.com", RestrictMaintenanceAccess: true},
+		"bundled (always restricted)":      {Host: "booth-postgresql", Bundled: true, RestrictMaintenanceAccess: true},
+		"provisioning off":                 {},
+	} {
+		if warned(p) {
+			t.Errorf("%s: unexpected warning: %v", name, p.StartupWarnings())
+		}
+	}
+}
+
+// End to end through Load: the chart's external mode really does yield the warning, and the
+// bundled mode really doesn't.
+func TestLoad_ExternalDefaultsWarnBundledDoesNot(t *testing.T) {
+	t.Setenv("BOOTH_OIDC_ISSUER_URL", "https://idp")
+	t.Setenv("BOOTH_OIDC_CLIENT_ID", "c")
+	t.Setenv("BOOTH_POSTGRES_HOST", "pg.example.com")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Postgres.StartupWarnings()) == 0 {
+		t.Error("an external server left at defaults should warn")
+	}
+
+	t.Setenv("BOOTH_POSTGRES_BUNDLED", "true")
+	cfg, _ = Load()
+	if len(cfg.Postgres.StartupWarnings()) != 0 {
+		t.Errorf("bundled server warned: %v", cfg.Postgres.StartupWarnings())
 	}
 }

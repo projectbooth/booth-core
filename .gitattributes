@@ -1,0 +1,4 @@
+# Shell scripts are embedded into ConfigMaps by the Helm chart and run under sh in a Linux
+# container; a CRLF checkout on Windows would break them ("set -eu\r: invalid option").
+*.sh text eol=lf
+charts/**/files/* text eol=lf
