@@ -102,6 +102,18 @@ type PostgresConfig struct {
 	// RestrictMaintenanceAccess revokes PUBLIC connect on the maintenance databases; always
 	// on for a bundled server, opt-in for an external one.
 	RestrictMaintenanceAccess bool
+
+	// BackupClaim, if its Name is set, is a PersistentVolumeClaim core creates (if absent) for
+	// the bundled server's backup CronJob to write to (ADR 0054). See dbprov.EnsureBackupClaim
+	// for why it isn't a Helm-managed resource.
+	BackupClaim BackupClaimConfig
+}
+
+// BackupClaimConfig describes the backup PersistentVolumeClaim.
+type BackupClaimConfig struct {
+	Name         string
+	Size         string
+	StorageClass string
 }
 
 // StartupWarnings returns conditions an operator should know about at boot, as one-line
@@ -179,6 +191,11 @@ func Load() (Config, error) {
 	}
 	if pg.Bundled {
 		pg.RestrictMaintenanceAccess = true
+	}
+	pg.BackupClaim = BackupClaimConfig{
+		Name:         os.Getenv("BOOTH_POSTGRES_BACKUP_PVC_NAME"),
+		Size:         getEnv("BOOTH_POSTGRES_BACKUP_PVC_SIZE", "8Gi"),
+		StorageClass: os.Getenv("BOOTH_POSTGRES_BACKUP_PVC_STORAGE_CLASS"),
 	}
 	pg.ModuleHost = getEnv("BOOTH_POSTGRES_MODULE_HOST", qualifyHost(pg.Host, cfg.KubeNamespace))
 	cfg.Postgres = pg

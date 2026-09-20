@@ -22,9 +22,20 @@ choices made in building them.
   CLI, which works against MinIO/Ceph/R2 via `endpoint`. Retention on a PVC is the script's
   (newest N); on a bucket it's the bucket's lifecycle policy — the chart can't tell a bucket to
   expire objects portably, and pretending to would be worse than saying so.
-- **The PVC is `helm.sh/resource-policy: keep`.** `helm uninstall` shouldn't delete your backups.
-  Cost: a later install under the same release name trips over the surviving PVC. Chosen because
-  silently deleting backups is the worse failure.
+- **The backup PVC is created by booth-core, not by Helm.** The first version rendered it as a
+  chart resource, and the kind CI job caught that it breaks `helm install --wait`: Helm waits for
+  every PVC to be `Bound`, and a claim only the CronJob mounts stays `Pending` on a
+  `WaitForFirstConsumer` storage class (k3s's default `local-path`) until the first scheduled run
+  — so any `--wait` install, or Argo CD health check, would hang or fail. Core already bootstraps
+  objects that must exist before their consumers (the admin-password Secret, the NATS keys), so
+  it creates the claim if absent (`dbprov.EnsureBackupClaim`), driven by
+  `BOOTH_POSTGRES_BACKUP_PVC_*` on its Deployment, and never modifies or deletes it. Side
+  benefits: `helm uninstall` can't delete your backups, reinstalling adopts the claim, and
+  switching the destination to a bucket and back needs no StatefulSet surgery. Cost: a PVC that
+  isn't visible in the chart's manifest, and core needs `create` on PVCs (it already has broad
+  RBAC). Rejected alternatives: a hook (deletes/recreates the claim on upgrade), and putting the
+  claim on the PostgreSQL StatefulSet (immutable `volumeClaimTemplates` make any later change of
+  destination fail on `helm upgrade`).
 - **`concurrencyPolicy: Forbid`**, one retry, a one-hour deadline, and three jobs of history kept
   for both outcomes so a failure is visible with `kubectl get jobs`.
 - **The PostgreSQL NetworkPolicy admits the backup pods** (by label). Without that the backup

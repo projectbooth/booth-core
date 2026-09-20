@@ -112,6 +112,11 @@ func run() error {
 					return fmt.Errorf("bootstrapping the bundled PostgreSQL admin credential: %w", err)
 				}
 			}
+			if bc := cfg.Postgres.BackupClaim; cfg.Postgres.Bundled && bc.Name != "" {
+				if err := dbprov.EnsureBackupClaim(ctx, direct, cfg.KubeNamespace, bc.Name, bc.Size, bc.StorageClass); err != nil {
+					return fmt.Errorf("preparing the PostgreSQL backup volume: %w", err)
+				}
+			}
 			admin, err := dbprov.NewAdmin(ctx, dbprov.Config{
 				Host: cfg.Postgres.Host, Port: cfg.Postgres.Port, ModuleHost: cfg.Postgres.ModuleHost,
 				AdminUser: cfg.Postgres.AdminUser, AdminPassword: pw, AdminDatabase: cfg.Postgres.AdminDatabase,

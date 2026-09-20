@@ -9,6 +9,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -287,4 +288,52 @@ func EnsureAdminPassword(ctx context.Context, c client.Client, namespace string)
 		return "", fmt.Errorf("creating %s: %w", key, err)
 	}
 	return pw, nil
+}
+
+// EnsureBackupClaim creates the PersistentVolumeClaim the bundled server's backup CronJob
+// writes to, if it doesn't exist. It is deliberately not a Helm-managed resource: `helm install
+// --wait` waits for every PVC to be Bound, and a claim only the CronJob mounts stays Pending
+// on a WaitForFirstConsumer storage class (k3s's default) until the first scheduled run —
+// which would fail or hang the install. Created here it doesn't block anything, survives
+// `helm uninstall` (backups must not vanish with the release), and a reinstall simply adopts
+// it. An existing claim is never modified or deleted.
+func EnsureBackupClaim(ctx context.Context, c client.Client, namespace, name, size, storageClass string) error {
+	qty, err := resource.ParseQuantity(size)
+	if err != nil {
+		return fmt.Errorf("backup claim size %q: %w", size, err)
+	}
+
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+	var existing corev1.PersistentVolumeClaim
+	err = c.Get(ctx, key, &existing)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return fmt.Errorf("reading %s: %w", key, err)
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      name,
+			Labels:    map[string]string{"app.kubernetes.io/component": "postgresql-backup"},
+			Annotations: map[string]string{
+				"booth.projectbooth.io/managed-by": "booth-core (created if absent; never modified or deleted)",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: qty},
+			},
+		},
+	}
+	if storageClass != "" {
+		pvc.Spec.StorageClassName = &storageClass
+	}
+	if err := c.Create(ctx, pvc); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("creating backup claim %s: %w", key, err)
+	}
+	return nil
 }

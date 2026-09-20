@@ -577,3 +577,62 @@ func parsePort(s string) (int, error) {
 	}
 	return n, nil
 }
+
+func TestEnsureBackupClaim(t *testing.T) {
+	ctx := context.Background()
+	c := fake.NewClientBuilder().Build()
+	get := func() (*corev1.PersistentVolumeClaim, error) {
+		var p corev1.PersistentVolumeClaim
+		err := c.Get(ctx, types.NamespacedName{Namespace: "booth-system", Name: "booth-core-postgresql-backup"}, &p)
+		return &p, err
+	}
+
+	if err := EnsureBackupClaim(ctx, c, "booth-system", "booth-core-postgresql-backup", "10Gi", "fast"); err != nil {
+		t.Fatal(err)
+	}
+	pvc, err := get()
+	if err != nil {
+		t.Fatalf("claim not created: %v", err)
+	}
+	if got := pvc.Spec.Resources.Requests.Storage().String(); got != "10Gi" {
+		t.Errorf("size = %s, want 10Gi", got)
+	}
+	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != "fast" {
+		t.Errorf("storageClassName = %v, want fast", pvc.Spec.StorageClassName)
+	}
+	if len(pvc.Spec.AccessModes) != 1 || pvc.Spec.AccessModes[0] != corev1.ReadWriteOnce {
+		t.Errorf("accessModes = %v", pvc.Spec.AccessModes)
+	}
+
+	// An existing claim is never modified: the backups on it are the point.
+	if err := EnsureBackupClaim(ctx, c, "booth-system", "booth-core-postgresql-backup", "99Gi", "other"); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	again, _ := get()
+	if got := again.Spec.Resources.Requests.Storage().String(); got != "10Gi" {
+		t.Errorf("an existing claim was modified: size now %s", got)
+	}
+	if *again.Spec.StorageClassName != "fast" {
+		t.Errorf("an existing claim was modified: class now %s", *again.Spec.StorageClassName)
+	}
+}
+
+func TestEnsureBackupClaim_DefaultClassAndBadSize(t *testing.T) {
+	ctx := context.Background()
+	c := fake.NewClientBuilder().Build()
+
+	if err := EnsureBackupClaim(ctx, c, "ns", "b", "8Gi", ""); err != nil {
+		t.Fatal(err)
+	}
+	var p corev1.PersistentVolumeClaim
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "ns", Name: "b"}, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Spec.StorageClassName != nil {
+		t.Errorf("an empty class must leave storageClassName unset (cluster default), got %q", *p.Spec.StorageClassName)
+	}
+
+	if err := EnsureBackupClaim(ctx, c, "ns", "c", "lots", ""); err == nil {
+		t.Error("expected an error for an unparseable size")
+	}
+}

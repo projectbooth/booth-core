@@ -138,3 +138,23 @@ func TestLoad_ExternalDefaultsWarnBundledDoesNot(t *testing.T) {
 		t.Errorf("bundled server warned: %v", cfg.Postgres.StartupWarnings())
 	}
 }
+
+func TestLoad_BackupClaim(t *testing.T) {
+	t.Setenv("BOOTH_OIDC_ISSUER_URL", "https://idp")
+	t.Setenv("BOOTH_OIDC_CLIENT_ID", "c")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Postgres.BackupClaim.Name != "" {
+		t.Errorf("no claim should be requested by default, got %+v", cfg.Postgres.BackupClaim)
+	}
+
+	t.Setenv("BOOTH_POSTGRES_BACKUP_PVC_NAME", "rel-postgresql-backup")
+	t.Setenv("BOOTH_POSTGRES_BACKUP_PVC_SIZE", "20Gi")
+	t.Setenv("BOOTH_POSTGRES_BACKUP_PVC_STORAGE_CLASS", "fast")
+	cfg, _ = Load()
+	if got := cfg.Postgres.BackupClaim; got.Name != "rel-postgresql-backup" || got.Size != "20Gi" || got.StorageClass != "fast" {
+		t.Errorf("got %+v", got)
+	}
+}

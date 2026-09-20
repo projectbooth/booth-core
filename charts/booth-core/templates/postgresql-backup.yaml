@@ -19,27 +19,11 @@ metadata:
 data:
   pg-backup.sh: |
 {{ .Files.Get "files/pg-backup.sh" | indent 4 }}
-{{- if not $s3 }}
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: {{ .Release.Name }}-postgresql-backup
-  labels:
-    {{- include "booth-core.labels" . | nindent 4 }}
-    app.kubernetes.io/component: postgresql-backup
-  annotations:
-    # Never delete backups because someone ran `helm uninstall`.
-    helm.sh/resource-policy: keep
-spec:
-  accessModes: ["ReadWriteOnce"]
-  {{- if $b.persistence.storageClass }}
-  storageClassName: {{ $b.persistence.storageClass | quote }}
-  {{- end }}
-  resources:
-    requests:
-      storage: {{ $b.persistence.size }}
-{{- end }}
+# The backup PVC (PVC destination) is NOT created here. `helm install --wait` waits for every PVC
+# to be Bound, and a claim only this CronJob mounts stays Pending on a WaitForFirstConsumer
+# storage class (k3s's default) until the first scheduled run, which would fail the install.
+# booth-core creates it instead (if absent, never modified or deleted), driven by the
+# BOOTH_POSTGRES_BACKUP_PVC_* variables set on its Deployment.
 ---
 apiVersion: batch/v1
 kind: CronJob

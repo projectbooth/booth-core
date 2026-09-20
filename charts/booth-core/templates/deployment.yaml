@@ -61,6 +61,15 @@ spec:
               value: "{{ .Release.Name }}-postgresql"
             - name: BOOTH_POSTGRES_SSLMODE
               value: "disable"
+            {{- if and .Values.postgresql.backup.enabled (not .Values.postgresql.backup.s3.bucket) }}
+            # The backup CronJob's PVC is created by core, not Helm (see templates/postgresql-backup.yaml).
+            - name: BOOTH_POSTGRES_BACKUP_PVC_NAME
+              value: "{{ .Release.Name }}-postgresql-backup"
+            - name: BOOTH_POSTGRES_BACKUP_PVC_SIZE
+              value: {{ .Values.postgresql.backup.persistence.size | quote }}
+            - name: BOOTH_POSTGRES_BACKUP_PVC_STORAGE_CLASS
+              value: {{ .Values.postgresql.backup.persistence.storageClass | quote }}
+            {{- end }}
             {{- else if .Values.postgres.external.host }}
             - name: BOOTH_POSTGRES_HOST
               value: {{ .Values.postgres.external.host | quote }}

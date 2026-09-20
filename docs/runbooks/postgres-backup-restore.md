@@ -26,9 +26,10 @@ any timestamp-named directory is a whole backup.
 **Destination** — set in chart values:
 
 - **PVC** (default): `<release>-postgresql-backup`. The newest `postgresql.backup.retention`
-  (default 7) are kept. The PVC is annotated `helm.sh/resource-policy: keep`, so `helm uninstall`
-  doesn't delete your backups — which also means a later `helm install` under the same release
-  name will complain the PVC already exists; delete it deliberately or adopt it.
+  (default 7) are kept. The claim is created by **booth-core**, not by Helm (`docs/decisions/0009` says why), and is
+  never modified or deleted by it: `helm uninstall` leaves your backups in place, and a later
+  install under the same release name simply adopts the claim. Deleting it is a deliberate
+  `kubectl delete pvc`.
 - **S3-compatible bucket**: set `postgresql.backup.s3.bucket` (plus `endpoint` for MinIO/Ceph/R2,
   and `existingSecret` holding `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`). Objects land under
   `<prefix><timestamp>/`. **Retention is your bucket's lifecycle policy**, not the chart's.

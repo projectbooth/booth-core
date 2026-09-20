@@ -7,7 +7,7 @@ self-hosted and development installs and is NOT highly available.
 {{- if .Values.postgresql.backup.enabled }}
   Backups: a daily pg_dump runs at "{{ .Values.postgresql.backup.schedule }}" and writes to
   {{- if .Values.postgresql.backup.s3.bucket }} the S3 bucket "{{ .Values.postgresql.backup.s3.bucket }}".
-  {{- else }} the PVC "{{ .Release.Name }}-postgresql-backup" (kept on `helm uninstall`),
+  {{- else }} the PVC "{{ .Release.Name }}-postgresql-backup" (created by booth-core; kept on `helm uninstall`),
   keeping the newest {{ .Values.postgresql.backup.retention }}. That PVC does not survive losing this cluster —
   set postgresql.backup.s3.bucket, or copy it off-site, for real disaster recovery.
   {{- end }}
