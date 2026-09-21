@@ -195,6 +195,85 @@ jobs:
           echo "module without serviceRef.namespace never became Healthy"
           exit 1
 
+      # ADR 0056, on the deployed chart: core serves its JWKS, delivers a minting credential only
+      # to a module that declares workloadIdentity, and the credential really opens the minting
+      # endpoint (while nothing else does). The OIDC issuer in this install is a placeholder, so
+      # no human token can exist here: minting a real token — and the role rules — are covered by
+      # the unit tests against a real verifier. What only a deployment can show is the wiring.
+      - name: Verify workload identity
+        run: |
+          set -eu
+          kubectl create namespace ci-workload
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: booth.projectbooth.io/v1alpha1
+          kind: BoothModule
+          metadata:
+            name: runner
+            namespace: ci-workload
+          spec:
+            id: runner
+            displayName: Runner
+            version: 0.1.0
+            contractVersion: 0.1.0
+            hasOwnUi: false
+            healthCheckPath: /health
+            serviceRef: {name: runner, port: 8080}
+            workloadIdentity: {mint: true}
+          EOF
+
+          echo "Waiting for the minting credential..."
+          for i in $(seq 1 40); do
+            kubectl -n ci-workload get secret booth-workload-minting-credentials >/dev/null 2>&1 && break
+            [ "$i" = 40 ] && { echo "minting credential Secret never appeared"; exit 1; }
+            sleep 3
+          done
+
+          # ci-default-ns/echo (from the earlier step) never declared the field: nothing for it.
+          if kubectl -n ci-default-ns get secret booth-workload-minting-credentials >/dev/null 2>&1; then
+            echo "a module that never declared workloadIdentity received a minting credential"; exit 1
+          fi
+
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: mint-check, namespace: ci-workload}
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: curl
+                    image: curlimages/curl:8.11.1
+                    env:
+                      - {name: CRED, valueFrom: {secretKeyRef: {name: booth-workload-minting-credentials, key: credential}}}
+                      - {name: URL, valueFrom: {secretKeyRef: {name: booth-workload-minting-credentials, key: url}}}
+                      - {name: ISSUER, valueFrom: {secretKeyRef: {name: booth-workload-minting-credentials, key: issuer}}}
+                    command: ["sh", "-ec"]
+                    args:
+                      - |
+                        code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+                        BODY='{"workspace":"ci","subject":"job:1","roleCeiling":"viewer","owner":"nobody"}'
+
+                        # Public: the keys and discovery document other modules trust.
+                        curl -fsS "$ISSUER/.well-known/jwks.json" | grep -q '"RS256"'
+                        curl -fsS "$ISSUER/.well-known/openid-configuration" | grep -q "\"issuer\":\"$ISSUER\""
+
+                        # No credential, and a made-up one: refused.
+                        [ "$(code -X POST "$URL" -d "$BODY")" = 401 ]
+                        [ "$(code -X POST "$URL" -H 'Authorization: Bearer bwmc.runner.AAAA' -d "$BODY")" = 401 ]
+
+                        # The provisioned credential is accepted as far as authentication goes:
+                        # core has never seen an owner called "nobody", so it declines to mint (403)
+                        # rather than refusing the caller (401).
+                        got=$(code -X POST "$URL" -H "Authorization: Bearer $CRED" -H 'Content-Type: application/json' -d "$BODY")
+                        [ "$got" = 403 ] || { echo "expected 403 for an unknown owner, got $got"; exit 1; }
+                        echo "workload identity wiring verified"
+          EOF
+          kubectl -n ci-workload wait --for=condition=complete job/mint-check --timeout=180s || {
+            kubectl -n ci-workload logs job/mint-check || true; exit 1; }
+          kubectl -n ci-workload logs job/mint-check
+
       - name: Verify database provisioning
         run: |
           set -eu

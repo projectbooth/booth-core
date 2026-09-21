@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS booth_users (
     first_seen_at      TIMESTAMPTZ NOT NULL,
     last_seen_at       TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE booth_users ADD COLUMN IF NOT EXISTS roles JSONB NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS booth_users_workspaces_idx ON booth_users USING GIN (workspaces);
 `
 
@@ -72,29 +73,34 @@ func (s *PostgresStore) Upsert(ctx context.Context, u User) error {
 	if workspaces == nil {
 		workspaces = []string{}
 	}
+	roles := u.Roles
+	if roles == nil {
+		roles = map[string]string{}
+	}
 	now := time.Now().UTC()
 	// An empty incoming display claim never erases a stored one (see Store.Upsert).
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO booth_users (sub, preferred_username, name, email, workspaces, first_seen_at, last_seen_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $6)
+		INSERT INTO booth_users (sub, preferred_username, name, email, workspaces, roles, first_seen_at, last_seen_at)
+		VALUES ($1, $2, $3, $4, $5, $7, $6, $6)
 		ON CONFLICT (sub) DO UPDATE SET
 			preferred_username = COALESCE(NULLIF(EXCLUDED.preferred_username, ''), booth_users.preferred_username),
 			name               = COALESCE(NULLIF(EXCLUDED.name, ''),               booth_users.name),
 			email              = COALESCE(NULLIF(EXCLUDED.email, ''),              booth_users.email),
 			workspaces         = EXCLUDED.workspaces,
+			roles              = EXCLUDED.roles,
 			last_seen_at       = EXCLUDED.last_seen_at`,
-		u.Sub, u.PreferredUsername, u.Name, u.Email, workspaces, now)
+		u.Sub, u.PreferredUsername, u.Name, u.Email, workspaces, now, roles)
 	if err != nil {
 		return fmt.Errorf("upserting user: %w", err)
 	}
 	return nil
 }
 
-const userColumns = `sub, preferred_username, name, email, workspaces, first_seen_at, last_seen_at`
+const userColumns = `sub, preferred_username, name, email, workspaces, roles, first_seen_at, last_seen_at`
 
 func scanUser(row pgx.Row) (User, error) {
 	var u User
-	err := row.Scan(&u.Sub, &u.PreferredUsername, &u.Name, &u.Email, &u.Workspaces, &u.FirstSeenAt, &u.LastSeenAt)
+	err := row.Scan(&u.Sub, &u.PreferredUsername, &u.Name, &u.Email, &u.Workspaces, &u.Roles, &u.FirstSeenAt, &u.LastSeenAt)
 	return u, err
 }
 

@@ -45,6 +45,16 @@ type Controller struct {
 	// Database, if set, provisions each module's PostgreSQL database and credentials from
 	// its manifest on every reconcile (ADR 0053). Nil means database provisioning is off.
 	Database DatabaseProvisioner
+
+	// Workload, if set, provisions the minting credential of each module that declares
+	// workloadIdentity (ADR 0056). Nil means workload identity is off.
+	Workload WorkloadProvisioner
+}
+
+// WorkloadProvisioner makes a module's workload-identity minting credential match its manifest.
+// Implemented by workload.ModuleProvisioner.
+type WorkloadProvisioner interface {
+	Ensure(ctx context.Context, mod *boothv1alpha1.BoothModule) error
 }
 
 // DatabaseProvisioner makes a module's database and credential Secret match its manifest.
@@ -128,6 +138,11 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if c.Database != nil {
 		if err := c.Database.Ensure(ctx, &mod); err != nil {
 			provisionErrs = append(provisionErrs, fmt.Errorf("database: %w", err))
+		}
+	}
+	if c.Workload != nil {
+		if err := c.Workload.Ensure(ctx, &mod); err != nil {
+			provisionErrs = append(provisionErrs, fmt.Errorf("workload identity: %w", err))
 		}
 	}
 	if err := errors.Join(provisionErrs...); err != nil {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config is booth-core's full runtime configuration.
@@ -49,6 +50,9 @@ type Config struct {
 	// (ADR 0053) and its own. Provisioning is on only when Postgres.Host is set.
 	Postgres PostgresConfig
 
+	// Workload configures workload identity (ADR 0056): core as a second token issuer.
+	Workload WorkloadConfig
+
 	// KubeNamespace is the namespace booth-core itself runs in, used as the default
 	// namespace for module BoothModule watches and Secret/ConfigMap provisioning.
 	KubeNamespace string
@@ -75,6 +79,19 @@ type OIDCConfig struct {
 	// (ARCHITECTURE.md §6, ADR 0004, ADR 0008). Configurable because not every OIDC
 	// provider names this claim "groups".
 	GroupsClaim string
+}
+
+// WorkloadConfig is the workload-identity configuration (ADR 0056).
+type WorkloadConfig struct {
+	// IssuerURL is core's own issuer URL for workload tokens: the `iss` it mints, the base of
+	// its JWKS and minting endpoint, and what other modules are configured to trust. It must be
+	// resolvable from every module's namespace (an in-cluster Service URL), and distinct from
+	// the OIDC provider's. Setting it turns workload identity on; empty leaves it off.
+	IssuerURL string
+
+	// OwnerMaxAge bounds how long since a run owner's role was last seen (in a token core
+	// verified) before that role stops counting. Zero means the default (7 days).
+	OwnerMaxAge time.Duration
 }
 
 // PostgresConfig is the shared-PostgreSQL configuration (ADR 0053). The bundled Helm chart
@@ -159,6 +176,14 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("BOOTH_EVENTBUS_AUTH: %w", err)
 		}
 		cfg.EventBusAuth = b
+	}
+	cfg.Workload.IssuerURL = strings.TrimRight(os.Getenv("BOOTH_WORKLOAD_ISSUER_URL"), "/")
+	if v := os.Getenv("BOOTH_WORKLOAD_OWNER_MAX_AGE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return Config{}, fmt.Errorf("BOOTH_WORKLOAD_OWNER_MAX_AGE: %q is not a positive duration (e.g. 168h)", v)
+		}
+		cfg.Workload.OwnerMaxAge = d
 	}
 	cfg.NATSModuleURL = getEnv("BOOTH_NATS_MODULE_URL", qualifyNATSURL(cfg.NATSURL, cfg.KubeNamespace))
 

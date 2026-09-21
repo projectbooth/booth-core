@@ -24,6 +24,28 @@ oidc:
   requireAudience: true
   groupsClaim: groups
 
+# Workload identity (ADR 0056): booth-core acts as a second trusted token issuer, for exactly
+# one purpose — short-lived (10 minute), workspace-scoped tokens that represent a job/run rather
+# than a person, so unattended work (a scheduled pipeline run) can call other modules. A module
+# gets a minting credential (the Secret `booth-workload-minting-credentials` in its namespace)
+# only if its BoothModule declares `workloadIdentity: {mint: true}`.
+#
+# Every module that should accept these tokens must be configured to trust this issuer's keys
+# (published at <issuer>/.well-known/jwks.json, plus OIDC discovery at the standard path).
+# Don't expose /api/internal/* through an ingress: it's for in-cluster callers.
+workloadIdentity:
+  enabled: true
+  # The URL modules use to reach booth-core, and the `iss` of minted tokens. Empty = this
+  # release's in-cluster Service. Must be resolvable from every module's namespace, and must
+  # not change once modules are configured to trust it.
+  issuerUrl: ""
+  # A run's role is capped at its owner's role in the workspace, which core learns from the
+  # owner's own tokens (ADR 0025 makes tokens the only source). If core hasn't seen the owner
+  # for longer than this, it stops minting for their runs — the bound on how long a user
+  # removed from the IdP, who never signs in again, keeps unattended jobs privileged. Raise it
+  # if runs are owned by people who rarely open the UI.
+  ownerMaxAge: 168h
+
 # Iframe-proxy session signing key (ui-integration.md). Required for more than one
 # replica — see docs/decisions and internal/gateway/iframetoken.go's doc comment for why
 # a shared key (not a per-pod ephemeral one) matters once replicaCount > 1. Populate via

@@ -26,7 +26,13 @@ type User struct {
 	Email             string
 	// Workspaces are the workspace slugs the user belonged to the last time a token was
 	// seen for them. Used only to scope who may see the entry; never returned to callers.
-	Workspaces  []string
+	Workspaces []string
+	// Roles is the user's role in each workspace in Workspaces, as of the same token
+	// (workspace slug -> "owner"|"editor"|"viewer"). Replaced wholesale on every upsert, like
+	// Workspaces. It exists for workload identity (ADR 0056), which caps a run's role at its
+	// owner's: see docs/decisions/0010-workload-identity.md for why this is the role source and
+	// what its staleness bound is. Never returned to API callers.
+	Roles       map[string]string
 	FirstSeenAt time.Time
 	LastSeenAt  time.Time
 }

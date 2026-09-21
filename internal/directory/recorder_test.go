@@ -159,3 +159,45 @@ func TestSwitchable_SwapAndResetRepopulateImmediately(t *testing.T) {
 		t.Fatal("user not re-recorded into the swapped-in store after Reset")
 	}
 }
+
+// ADR 0056 caps a run's role at its owner's, read from the directory. So the directory has to
+// learn of a demotion at once — not after the debounce interval, during which a scheduled job
+// could still mint at the old, higher role.
+func TestRecorder_RecordsRolesAndAPromptDemotion(t *testing.T) {
+	mem := NewMemoryStore()
+	r, _ := newTestRecorder(mem) // the clock never advances: only a *change* can cause a write
+	c := claimsFor("u1", "alice", "a@example.com")
+
+	r.Observe(context.Background(), c, []auth.Membership{{Workspace: "acme", Role: auth.RoleOwner}})
+	got, _, _ := mem.Get(context.Background(), "u1", "acme")
+	if got.Roles["acme"] != "owner" {
+		t.Fatalf("role = %q, want owner", got.Roles["acme"])
+	}
+
+	r.Observe(context.Background(), c, []auth.Membership{{Workspace: "acme", Role: auth.RoleViewer}})
+	got, _, _ = mem.Get(context.Background(), "u1", "acme")
+	if got.Roles["acme"] != "viewer" {
+		t.Errorf("role = %q right after a demotion, want viewer (debounce must not hide a role change)", got.Roles["acme"])
+	}
+}
+
+// When one token lists two roles for a workspace, ADR 0025 doesn't say which wins. The recorded
+// role caps what a run may do, so it must be the lesser one.
+func TestRecorder_AmbiguousRolesRecordTheLeastPrivileged(t *testing.T) {
+	for _, order := range [][]auth.Role{
+		{auth.RoleOwner, auth.RoleViewer},
+		{auth.RoleViewer, auth.RoleOwner},
+	} {
+		mem := NewMemoryStore()
+		r, _ := newTestRecorder(mem)
+		var ms []auth.Membership
+		for _, role := range order {
+			ms = append(ms, auth.Membership{Workspace: "acme", Role: role})
+		}
+		r.Observe(context.Background(), claimsFor("u1", "alice", ""), ms)
+		got, _, _ := mem.Get(context.Background(), "u1", "acme")
+		if got.Roles["acme"] != "viewer" {
+			t.Errorf("order %v: role = %q, want viewer", order, got.Roles["acme"])
+		}
+	}
+}

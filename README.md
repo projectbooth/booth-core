@@ -29,6 +29,7 @@ internal/eventbus/      NATS/JetStream pub-sub (ADR 0007, 0021)
 internal/natsauth/      Event-bus authentication: credentials + per-subject permissions (ADR 0049)
 internal/directory/     Minimal user directory: sub -> display claims (ADR 0047)
 internal/dbprov/        Shared PostgreSQL: per-module database + role provisioning (ADR 0053)
+internal/workload/      Workload identity: core as a second token issuer for unattended runs (ADR 0056)
 internal/testpg/        Real PostgreSQL for tests (embedded, no Docker)
 internal/secrets/       Secret/ConfigMap provisioning (ADR 0020)
 internal/lifecycle/     Module install/uninstall via the Helm SDK (ADR 0003)
@@ -179,6 +180,21 @@ Restore and major-version upgrade are manual: `docs/runbooks/postgres-backup-res
 `helm install`): PostgreSQL lets any role connect to the maintenance databases by default, so a
 module's credentials can list other databases' and roles' names.
 
+## Workload identity for unattended runs (2026-09-21)
+
+**ADR 0056.** A scheduled run has no human token, so core is a second trusted issuer for one narrow
+purpose: a module whose `BoothModule` declares `workloadIdentity: {mint: true}` gets the Secret
+`booth-workload-minting-credentials` (`credential`, `url`, `issuer`) in its namespace, and calls
+`POST /api/internal/workload-tokens` with `{workspace, subject, roleCeiling, owner}` to get a
+10-minute RS256 JWT. Its `groups` claim is `["/workspaces/<workspace>/<role>"]` (ADR 0025's grammar),
+so a module's existing role derivation reads it unchanged; the only thing a module adds is trusting
+`<issuer>/.well-known/jwks.json` (or OIDC discovery at the issuer URL) as a second issuer. The role is
+the lesser of `roleCeiling` and the owner's role **as of that mint** - nothing is cached.
+
+Two things to know, both flagged back in `docs/decisions/0010`: the request needs an `owner` field
+ADR 0056 doesn't list, and "live" means *the owner's most recent verified token*, bounded by
+`workloadIdentity.ownerMaxAge` (7 days), because core has no other source for a role.
+
 ## What's built vs. what's left, against the v0 definition of done
 
 Built and tested (unit/contract tests in-repo; the CRD reconcile loop additionally
@@ -194,6 +210,7 @@ verified against a real API server via `test/integration/`):
   authenticated, with per-module scoped credentials (ADR 0049).
 - User directory (ADR 0047), persistent on a default install via the bundled PostgreSQL.
 - Shared PostgreSQL provisioning (ADR 0053): bundled default, per-module databases and roles.
+- Workload identity (ADR 0056): minting endpoint, signing key + JWKS, per-module minting credentials.
 - Secrets/ConfigMap provisioning primitive (ADR 0020).
 - Module install/uninstall via the Helm SDK, admin-role-gated (scoped per decision 0005).
 - Helm chart: bundles NATS (subchart), the CRD, RBAC, the core Deployment/Service.

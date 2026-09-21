@@ -16,6 +16,32 @@ const (
 	RoleViewer Role = "viewer"
 )
 
+// RoleRank orders roles by privilege (higher is more privileged); an unknown role ranks 0, below
+// every real one. It exists so "the lesser of two roles" (ADR 0056) is written once.
+func RoleRank(r Role) int {
+	switch r {
+	case RoleOwner:
+		return 3
+	case RoleEditor:
+		return 2
+	case RoleViewer:
+		return 1
+	}
+	return 0
+}
+
+// LesserRole returns whichever of a and b is less privileged. If either is not a real role the
+// result is "" — callers must treat that as no access, never as a default.
+func LesserRole(a, b Role) Role {
+	if RoleRank(a) == 0 || RoleRank(b) == 0 {
+		return ""
+	}
+	if RoleRank(a) <= RoleRank(b) {
+		return a
+	}
+	return b
+}
+
 // IsAdmin reports whether this role is the one ADR 0023's adminNavPath gating checks
 // for.
 func (r Role) IsAdmin() bool {

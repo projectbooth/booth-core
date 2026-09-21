@@ -125,6 +125,22 @@ type BoothModuleSpec struct {
 	// docs/decisions/0008-shared-postgres.md).
 	// +optional
 	Database *DatabaseRequirement `json:"database,omitempty"`
+
+	// WorkloadIdentity signals that this module runs unattended work (a scheduled job, no
+	// human present) that must call other modules on a workspace's behalf (ADR 0056). Core
+	// then provisions a minting credential as the Secret `booth-workload-minting-credentials`
+	// in the module's namespace, which the module presents to
+	// POST /api/internal/workload-tokens. Omit it and the module never receives a credential
+	// and cannot mint anything.
+	// +optional
+	WorkloadIdentity *WorkloadIdentityRequirement `json:"workloadIdentity,omitempty"`
+}
+
+// WorkloadIdentityRequirement is the manifest-level signal that a module may mint workload
+// tokens. A struct rather than a bare boolean so it can grow without another manifest field.
+type WorkloadIdentityRequirement struct {
+	// Mint requests a minting credential for this module.
+	Mint bool `json:"mint"`
 }
 
 // DatabaseRequirement is the manifest-level signal that a module needs a database. It's a

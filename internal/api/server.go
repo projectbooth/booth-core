@@ -16,6 +16,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/gateway"
 	"github.com/projectbooth/booth-core/internal/lifecycle"
 	"github.com/projectbooth/booth-core/internal/registry"
+	"github.com/projectbooth/booth-core/internal/workload"
 )
 
 // Deps is everything the HTTP layer needs, assembled by cmd/core/main.go.
@@ -30,6 +31,10 @@ type Deps struct {
 	// (ADR 0047). Both optional: nil disables the routes / the recording respectively.
 	Directory         directory.Store
 	DirectoryRecorder *directory.Recorder
+
+	// Workload serves ADR 0056's minting endpoint and JWKS. Optional: nil leaves the routes
+	// unregistered, so a deployment (or dev mode) without workload identity exposes nothing.
+	Workload *workload.Service
 }
 
 // NewRouter builds booth-core's full HTTP router.
@@ -50,6 +55,12 @@ func NewRouter(deps Deps) http.Handler {
 		authOpts = append(authOpts, auth.WithClaimsObserver(deps.DirectoryRecorder.Observe))
 	}
 	authed := auth.Middleware(deps.Verifier, authOpts...)
+
+	// ADR 0056: core's second-issuer surface. Outside the human-token middleware on purpose
+	// (see registerWorkload) and registered before the catch-all below.
+	if deps.Workload != nil {
+		registerWorkload(r, deps.Workload)
+	}
 
 	// ADR 0034: GET /api/me is the one route where X-Workspace is optional — it's how a
 	// client learns its memberships, so it can't already know a slug. Kept in its own

@@ -64,6 +64,7 @@ func (r *Recorder) Observe(ctx context.Context, claims *auth.Claims, memberships
 		Name:              claims.Name,
 		Email:             claims.Email,
 		Workspaces:        workspacesOf(memberships),
+		Roles:             rolesOf(memberships),
 	}
 
 	fp := fingerprint(u)
@@ -105,6 +106,28 @@ func workspacesOf(ms []auth.Membership) []string {
 	return out
 }
 
+// rolesOf maps each workspace to the caller's role in it. If a token lists several roles for
+// one workspace (ambiguous under ADR 0025, which doesn't say which wins), the least
+// privileged is recorded: this feeds a cap on what a run may do (ADR 0056), and the cap must
+// never round up.
+func rolesOf(ms []auth.Membership) map[string]string {
+	out := make(map[string]string, len(ms))
+	for _, m := range ms {
+		if prev, ok := out[m.Workspace]; ok && auth.RoleRank(auth.Role(prev)) <= auth.RoleRank(m.Role) {
+			continue
+		}
+		out[m.Workspace] = string(m.Role)
+	}
+	return out
+}
+
+// fingerprint includes roles, so a demotion is written immediately rather than waiting out
+// the debounce interval — a stale higher role is the one thing workload identity must not see.
 func fingerprint(u User) string {
-	return strings.Join([]string{u.PreferredUsername, u.Name, u.Email, strings.Join(u.Workspaces, ",")}, "\x00")
+	roles := make([]string, 0, len(u.Roles))
+	for w, r := range u.Roles {
+		roles = append(roles, w+"="+r)
+	}
+	sort.Strings(roles)
+	return strings.Join([]string{u.PreferredUsername, u.Name, u.Email, strings.Join(u.Workspaces, ","), strings.Join(roles, ",")}, "\x00")
 }

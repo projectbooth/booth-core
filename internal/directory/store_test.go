@@ -115,6 +115,41 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 		}
 	})
 
+	t.Run("roles are stored per workspace and replaced on every upsert", func(t *testing.T) {
+		s := newStore(t)
+		u := alice()
+		u.Roles = map[string]string{"acme": "owner", "labs": "viewer"}
+		if err := s.Upsert(ctx, u); err != nil {
+			t.Fatal(err)
+		}
+		got, _, _ := s.Get(ctx, "sub-alice", "acme")
+		if got.Roles["acme"] != "owner" || got.Roles["labs"] != "viewer" {
+			t.Fatalf("roles = %v", got.Roles)
+		}
+
+		// Demoted in acme: the stored role must follow, not keep the higher one.
+		u.Roles = map[string]string{"acme": "viewer", "labs": "viewer"}
+		if err := s.Upsert(ctx, u); err != nil {
+			t.Fatal(err)
+		}
+		got, _, _ = s.Get(ctx, "sub-alice", "acme")
+		if got.Roles["acme"] != "viewer" {
+			t.Errorf("acme role = %q after demotion, want viewer", got.Roles["acme"])
+		}
+
+		// A user stored without roles (as every entry was before ADR 0056) reads back empty,
+		// not as some default role.
+		bare := alice()
+		bare.Roles = nil
+		if err := s.Upsert(ctx, bare); err != nil {
+			t.Fatal(err)
+		}
+		got, _, _ = s.Get(ctx, "sub-alice", "acme")
+		if r := got.Roles["acme"]; r != "" {
+			t.Errorf("role = %q for a user recorded without roles, want none", r)
+		}
+	})
+
 	t.Run("first-seen is preserved and last-seen advances", func(t *testing.T) {
 		s := newStore(t)
 		_ = s.Upsert(ctx, alice())
@@ -250,4 +285,44 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 			t.Errorf("table lost rows after hostile input: %d", len(got))
 		}
 	})
+}
+
+// booth_users existed before roles did. An upgraded core must adopt the old table (with rows in
+// it) rather than fail, and treat those users as having no recorded role — never a default one —
+// until their next token repopulates it.
+func TestPostgresStore_UpgradesATablePredatingRoles(t *testing.T) {
+	ctx := context.Background()
+	dsn := testpg.Start(t).DSN("postgres")
+	s, err := NewPostgresStore(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.Close)
+
+	for _, stmt := range []string{
+		"DROP TABLE IF EXISTS booth_users",
+		`CREATE TABLE booth_users (
+			sub TEXT PRIMARY KEY, preferred_username TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '',
+			email TEXT NOT NULL DEFAULT '', workspaces TEXT[] NOT NULL DEFAULT '{}',
+			first_seen_at TIMESTAMPTZ NOT NULL, last_seen_at TIMESTAMPTZ NOT NULL)`,
+		`INSERT INTO booth_users (sub, workspaces, first_seen_at, last_seen_at) VALUES ('old', '{acme}', now(), now())`,
+	} {
+		if _, err := s.pool.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, ok, err := s.Get(ctx, "old", "acme") // first use runs the schema step
+	if err != nil || !ok {
+		t.Fatalf("Get on a pre-roles table = %v, %v", ok, err)
+	}
+	if got.Roles["acme"] != "" {
+		t.Errorf("pre-roles user has role %q, want none", got.Roles["acme"])
+	}
+	if err := s.Upsert(ctx, User{Sub: "old", Workspaces: []string{"acme"}, Roles: map[string]string{"acme": "editor"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ = s.Get(ctx, "old", "acme"); got.Roles["acme"] != "editor" {
+		t.Errorf("role after upsert = %q, want editor", got.Roles["acme"])
+	}
 }

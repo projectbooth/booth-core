@@ -307,3 +307,27 @@ func TestReconcile_ExplicitServiceNamespaceIsRespected(t *testing.T) {
 		t.Fatalf("dialed %q, want %q", dialed, want)
 	}
 }
+
+// ADR 0056: the workload-identity provisioner runs on every reconcile alongside the others, and
+// a failure in it neither skips them nor hides the module's health.
+func TestReconcile_ProvisionsWorkloadIdentityIndependentlyOfTheOthers(t *testing.T) {
+	rc, reg := newControllerWithModule(t)
+	bus, db, wl := &recordingProvisioner{err: errors.New("bus down")}, &recordingProvisioner{}, &recordingProvisioner{}
+	rc.EventBus, rc.Database, rc.Workload = bus, db, wl
+
+	if _, err := rc.Reconcile(context.Background(), reqFor("superset", "booth-system")); err == nil {
+		t.Fatal("expected the event-bus failure to be returned")
+	}
+	if len(wl.calls) != 1 || wl.calls[0] != "superset" {
+		t.Fatalf("workload provisioner calls = %v; an earlier failure must not skip it", wl.calls)
+	}
+
+	rc.Workload = &recordingProvisioner{err: errors.New("keys unavailable")}
+	rc.EventBus = nil
+	if _, err := rc.Reconcile(context.Background(), reqFor("superset", "booth-system")); err == nil {
+		t.Fatal("expected the workload-identity error to be returned so the reconcile is retried")
+	}
+	if _, ok := reg.Get("superset"); !ok {
+		t.Fatal("module must stay in the registry when workload provisioning fails")
+	}
+}

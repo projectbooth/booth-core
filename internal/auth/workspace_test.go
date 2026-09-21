@@ -75,3 +75,25 @@ func TestRoleIsAdmin(t *testing.T) {
 		}
 	}
 }
+
+// LesserRole is what caps a workload token's role at its owner's (ADR 0056). An unknown role on
+// either side must yield no role at all, never a default.
+func TestLesserRole(t *testing.T) {
+	roles := []Role{RoleViewer, RoleEditor, RoleOwner}
+	for i, a := range roles {
+		for j, b := range roles {
+			want := roles[min(i, j)]
+			if got := LesserRole(a, b); got != want {
+				t.Errorf("LesserRole(%s, %s) = %q, want %q", a, b, got, want)
+			}
+		}
+		for _, bad := range []Role{"", "admin", "OWNER"} {
+			if got := LesserRole(a, bad); got != "" {
+				t.Errorf("LesserRole(%s, %q) = %q, want no role", a, bad, got)
+			}
+			if got := LesserRole(bad, a); got != "" {
+				t.Errorf("LesserRole(%q, %s) = %q, want no role", bad, a, got)
+			}
+		}
+	}
+}

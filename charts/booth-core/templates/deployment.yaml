@@ -35,6 +35,14 @@ spec:
               value: {{ .Values.oidc.requireAudience | quote }}
             - name: BOOTH_OIDC_GROUPS_CLAIM
               value: {{ .Values.oidc.groupsClaim | quote }}
+            {{- if .Values.workloadIdentity.enabled }}
+            # ADR 0056: core as a second token issuer. The URL is where modules reach core (it
+            # serves the JWKS and the minting endpoint); it becomes the `iss` of minted tokens.
+            - name: BOOTH_WORKLOAD_ISSUER_URL
+              value: {{ .Values.workloadIdentity.issuerUrl | default (printf "http://%s.%s.svc.cluster.local:%v" (include "booth-core.fullname" .) .Release.Namespace .Values.service.port) | quote }}
+            - name: BOOTH_WORKLOAD_OWNER_MAX_AGE
+              value: {{ .Values.workloadIdentity.ownerMaxAge | quote }}
+            {{- end }}
             {{- if .Values.nats.enabled }}
             - name: BOOTH_NATS_URL
               value: "nats://{{ .Release.Name }}-nats:4222"

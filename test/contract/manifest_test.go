@@ -115,3 +115,35 @@ func TestManifestContract_RequiredFieldsMatchDocumentedContract(t *testing.T) {
 		t.Fatal("minimal spec unexpectedly missing a documented-required field")
 	}
 }
+
+// The workloadIdentity field as documented in contracts/module-manifest.md (ADR 0056):
+// `{mint: true}`, optional, and absent means the module cannot mint.
+func TestModuleManifest_WorkloadIdentityField(t *testing.T) {
+	declared := `
+id: pipeline
+displayName: Pipeline
+version: 0.1.0
+contractVersion: 0.1.0
+hasOwnUi: false
+healthCheckPath: /health
+serviceRef: {name: pipeline, namespace: booth-pipeline, port: 8080}
+workloadIdentity:
+  mint: true
+`
+	var spec boothv1alpha1.BoothModuleSpec
+	if err := yaml.Unmarshal([]byte(declared), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if spec.WorkloadIdentity == nil || !spec.WorkloadIdentity.Mint {
+		t.Fatalf("workloadIdentity: {mint: true} not parsed: %+v", spec.WorkloadIdentity)
+	}
+
+	// Every existing example omits it, and must stay valid and non-minting.
+	var storage boothv1alpha1.BoothModuleSpec
+	if err := yaml.Unmarshal([]byte(storageManifestExample), &storage); err != nil {
+		t.Fatal(err)
+	}
+	if storage.WorkloadIdentity != nil {
+		t.Errorf("a manifest that omits workloadIdentity parsed as declaring it: %+v", storage.WorkloadIdentity)
+	}
+}

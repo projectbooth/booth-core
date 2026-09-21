@@ -158,3 +158,36 @@ func TestLoad_BackupClaim(t *testing.T) {
 		t.Errorf("got %+v", got)
 	}
 }
+
+func TestLoad_WorkloadIdentity(t *testing.T) {
+	t.Setenv("BOOTH_OIDC_ISSUER_URL", "https://idp")
+	t.Setenv("BOOTH_OIDC_CLIENT_ID", "c")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Workload.IssuerURL != "" {
+		t.Errorf("workload identity should be off unless configured, got issuer %q", cfg.Workload.IssuerURL)
+	}
+
+	t.Setenv("BOOTH_WORKLOAD_ISSUER_URL", "http://booth-core.booth-system.svc.cluster.local:8080/")
+	t.Setenv("BOOTH_WORKLOAD_OWNER_MAX_AGE", "48h")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Workload.IssuerURL != "http://booth-core.booth-system.svc.cluster.local:8080" {
+		t.Errorf("issuer = %q (a trailing slash would make `iss` not match the discovery document)", cfg.Workload.IssuerURL)
+	}
+	if cfg.Workload.OwnerMaxAge.Hours() != 48 {
+		t.Errorf("owner max age = %v, want 48h", cfg.Workload.OwnerMaxAge)
+	}
+
+	for _, bad := range []string{"soon", "-1h", "0"} {
+		t.Setenv("BOOTH_WORKLOAD_OWNER_MAX_AGE", bad)
+		if _, err := Load(); err == nil {
+			t.Errorf("BOOTH_WORKLOAD_OWNER_MAX_AGE=%q accepted", bad)
+		}
+	}
+}

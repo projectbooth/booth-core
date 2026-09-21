@@ -31,6 +31,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/gateway"
 	"github.com/projectbooth/booth-core/internal/natsauth"
 	"github.com/projectbooth/booth-core/internal/registry"
+	"github.com/projectbooth/booth-core/internal/workload"
 )
 
 func main() {
@@ -59,6 +60,11 @@ func run() error {
 	// core uses it for its own database too.
 	var dbProv *dbprov.Provisioner
 
+	// workloadKeys / workloadProvisioner are non-nil only when workload identity is on in a real
+	// cluster (ADR 0056).
+	var workloadKeys *workload.Keys
+	var workloadProvisioner registry.WorkloadProvisioner
+
 	// Module discovery: real BoothModule CRD watch in a real cluster (ADR 0019), or a
 	// static file for local development without one (ADR 0019's noted convenience,
 	// agent-briefs/core.md's third open question).
@@ -80,7 +86,7 @@ func run() error {
 		// A direct (uncached) client for provisioning: the manager's cache would otherwise
 		// hold every Secret in the cluster in memory just to read a few of ours.
 		var direct client.Client
-		if cfg.EventBusAuth || cfg.Postgres.Host != "" {
+		if cfg.EventBusAuth || cfg.Postgres.Host != "" || cfg.Workload.IssuerURL != "" {
 			direct, err = client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
 			if err != nil {
 				return fmt.Errorf("creating Kubernetes client for provisioning: %w", err)
@@ -136,7 +142,19 @@ func run() error {
 			log.Print("BOOTH_POSTGRES_HOST is not set; module databases will not be provisioned (ADR 0053)")
 		}
 
-		mgr, err := startRegistryController(scheme, reg, busProvisioner, dbProvisioner)
+		// Workload identity (ADR 0056): core's own signing key, and per-module minting credentials.
+		if cfg.Workload.IssuerURL != "" {
+			workloadKeys, err = workload.LoadOrCreateKeys(ctx, direct, cfg.KubeNamespace)
+			if err != nil {
+				return fmt.Errorf("preparing workload identity keys: %w", err)
+			}
+			workloadProvisioner = workload.NewModuleProvisioner(direct, workloadKeys, cfg.Workload.IssuerURL)
+			log.Printf("workload identity enabled (issuer %s, key %s)", cfg.Workload.IssuerURL, workloadKeys.KeyID())
+		} else {
+			log.Print("BOOTH_WORKLOAD_ISSUER_URL is not set; workload identity is off and no module will receive a minting credential (ADR 0056)")
+		}
+
+		mgr, err := startRegistryController(scheme, reg, busProvisioner, dbProvisioner, workloadProvisioner)
 		if err != nil {
 			return fmt.Errorf("starting registry controller: %w", err)
 		}
@@ -199,6 +217,20 @@ func run() error {
 	}
 	go maintainBus(ctx, cfg.NATSURL, busOpts)
 
+	var workloadSvc *workload.Service
+	if workloadKeys != nil {
+		workloadSvc = workload.NewService(workloadKeys, reg, users, workload.Options{
+			Issuer:      cfg.Workload.IssuerURL,
+			Audience:    cfg.OIDC.ClientID,
+			GroupsClaim: cfg.OIDC.GroupsClaim,
+			MaxOwnerAge: cfg.Workload.OwnerMaxAge,
+		})
+		if cfg.PostgresDSN == "" && dbProv == nil {
+			log.Print("WARNING: workload identity is on but the user directory is in-memory: after a core restart, " +
+				"no run can be minted a token until its owner has made an authenticated request again (ADR 0056)")
+		}
+	}
+
 	router := api.NewRouter(api.Deps{
 		Verifier:     verifierHolder,
 		Registry:     reg,
@@ -208,6 +240,7 @@ func run() error {
 
 		Directory:         users,
 		DirectoryRecorder: recorder,
+		Workload:          workloadSvc,
 	})
 
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: router}
@@ -330,7 +363,7 @@ func persistDirectory(ctx context.Context, p *dbprov.Provisioner, namespace stri
 	}
 }
 
-func startRegistryController(scheme *runtime.Scheme, reg *registry.Registry, eventBus registry.EventBusProvisioner, database registry.DatabaseProvisioner) (ctrl.Manager, error) {
+func startRegistryController(scheme *runtime.Scheme, reg *registry.Registry, eventBus registry.EventBusProvisioner, database registry.DatabaseProvisioner, workloadIdentity registry.WorkloadProvisioner) (ctrl.Manager, error) {
 	// Metrics and health-probe servers are both disabled: controller-runtime's
 	// manager defaults its metrics server to :8080, which collides with booth-core's
 	// own HTTP server in this same process — this bit us for real (see git history),
@@ -348,6 +381,7 @@ func startRegistryController(scheme *runtime.Scheme, reg *registry.Registry, eve
 	controller := registry.NewController(mgr.GetClient(), reg)
 	controller.EventBus = eventBus
 	controller.Database = database
+	controller.Workload = workloadIdentity
 	if err := controller.SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setting up registry controller: %w", err)
 	}
