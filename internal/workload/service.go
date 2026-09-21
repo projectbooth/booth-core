@@ -286,3 +286,53 @@ func randomID() string {
 	}
 	return hex.EncodeToString(b)
 }
+
+// verifyLeeway tolerates clock skew between the replica that minted a token and the one
+// checking it.
+const verifyLeeway = 5 * time.Second
+
+// Verify checks a workload token against core's own signing key and returns the same auth.Claims
+// a human's token yields from auth.Verifier, so the gateway (ADR 0059) derives workspace and role
+// from it with exactly the code it uses for a person. It is what makes core the second trusted
+// issuer on its own gateway route, mirroring what every module does via OIDC discovery.
+//
+// It checks, and rejects on any failure: RS256 only (nothing else parses), a signature by this
+// deployment's key, `iss` equal to core's issuer, `aud` including the configured audience (when one
+// is set), expiry and not-before, a non-empty `sub`, and the requesting-module claim that only
+// Mint ever writes. A token any other issuer signed — including the deployment's IdP — fails the
+// signature check no matter what it claims about itself.
+func (s *Service) Verify(_ context.Context, rawToken string) (*auth.Claims, error) {
+	parsed, err := jwt.ParseSigned(rawToken, []jose.SignatureAlgorithm{signingAlg})
+	if err != nil {
+		return nil, fmt.Errorf("parsing workload token: %w", err)
+	}
+	var std jwt.Claims
+	var extra map[string]any
+	if err := parsed.Claims(&s.keys.signing.PublicKey, &std, &extra); err != nil {
+		return nil, fmt.Errorf("workload token signature: %w", err)
+	}
+
+	expected := jwt.Expected{Issuer: s.opts.Issuer, Time: s.opts.Now()}
+	if s.opts.Audience != "" {
+		expected.AnyAudience = jwt.Audience{s.opts.Audience}
+	}
+	if err := std.ValidateWithLeeway(expected, verifyLeeway); err != nil {
+		return nil, fmt.Errorf("workload token claims: %w", err)
+	}
+	if std.Subject == "" {
+		return nil, errors.New("workload token has no subject")
+	}
+	if m, _ := extra[ModuleClaim].(string); m == "" {
+		return nil, errors.New("workload token was not minted for a module")
+	}
+
+	claims := &auth.Claims{Subject: std.Subject}
+	if list, ok := extra[s.opts.GroupsClaim].([]any); ok {
+		for _, item := range list {
+			if g, ok := item.(string); ok {
+				claims.Groups = append(claims.Groups, g)
+			}
+		}
+	}
+	return claims, nil
+}

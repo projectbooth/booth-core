@@ -81,6 +81,19 @@ func NewRouter(deps Deps) http.Handler {
 		r.Get("/api/modules/{id}/iframe-url", handleIframeURL(deps.IframeURLs))
 		r.Post("/api/modules/{id}/install", requireAdmin(handleInstallModule))
 		r.Delete("/api/modules/{id}", requireAdmin(handleUninstallModule))
+	})
+
+	// The gateway route (module-to-module traffic, ADR 0007) is the one place core also trusts
+	// its own workload tokens (ADR 0059), so a job's call to another module is routed and
+	// identity-stamped exactly like a person's. It gets its own group on purpose: every other
+	// authenticated route above — install/uninstall in particular — keeps the single-issuer
+	// middleware and rejects them.
+	r.Group(func(r chi.Router) {
+		gatewayOpts := authOpts
+		if deps.Workload != nil {
+			gatewayOpts = append(append([]auth.Option{}, authOpts...), auth.WithWorkloadVerifier(deps.Workload))
+		}
+		r.Use(auth.Middleware(deps.Verifier, gatewayOpts...))
 
 		r.Handle("/modules/{id}/*", deps.Gateway.Handler(
 			func(r *http.Request) string { return chi.URLParam(r, "id") },

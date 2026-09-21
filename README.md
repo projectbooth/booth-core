@@ -195,6 +195,11 @@ Two things to know, both flagged back in `docs/decisions/0010`: the request need
 ADR 0056 doesn't list, and "live" means *the owner's most recent verified token*, bounded by
 `workloadIdentity.ownerMaxAge` (7 days), because core has no other source for a role.
 
+**Gateway (ADR 0059).** The `/modules/{id}/*` route also accepts these workload tokens, verified against
+core's own key and dispatched by `iss`, so a job's call to another module is routed and identity-stamped
+like a person's. Only that route: core's own `/api/*` routes (install/uninstall, ...) still reject them.
+See `docs/decisions/0011`.
+
 ## What's built vs. what's left, against the v0 definition of done
 
 Built and tested (unit/contract tests in-repo; the CRD reconcile loop additionally

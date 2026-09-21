@@ -2,8 +2,12 @@ package workload
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -634,3 +638,130 @@ func TestProvisioner_UsesServiceNamespaceWithTheDocumentedDefault(t *testing.T) 
 		t.Errorf("cross-namespace Secret has an owner reference: %+v", s.OwnerReferences)
 	}
 }
+
+// --- Verify (the gateway's second issuer, ADR 0059). ------------------------------------------
+
+func TestVerify_AcceptsWhatMintProducesAndYieldsAHumanShapedClaims(t *testing.T) {
+	f := newFixture(t)
+	f.seen(t, "u-alice", "acme", auth.RoleEditor)
+	tok, err := f.mint("pipeline", req("u-alice", "owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := f.svc.Verify(context.Background(), tok.JWT)
+	if err != nil {
+		t.Fatalf("Verify rejected a freshly minted token: %v", err)
+	}
+	if claims.Subject != "job:42" {
+		t.Errorf("Subject = %q", claims.Subject)
+	}
+	if got, want := auth.DeriveMemberships(claims.Groups), []auth.Membership{{Workspace: "acme", Role: auth.RoleEditor}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("memberships = %v, want %v", got, want)
+	}
+	if claims.Email != "" || claims.Name != "" || claims.PreferredUsername != "" {
+		t.Errorf("a run carries person claims: %+v", claims)
+	}
+}
+
+// forge signs claims with an arbitrary RSA key, the way any other issuer would.
+func forge(t *testing.T, key *rsa.PrivateKey, claims map[string]any) string {
+	t.Helper()
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: key}, (&jose.SignerOptions{}).WithType("JWT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := jwt.Signed(signer).Claims(claims).Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestVerify_RejectsEverythingCoreDidNotMintAsAValidRun(t *testing.T) {
+	f := newFixture(t)
+	f.seen(t, "u-alice", "acme", auth.RoleOwner)
+	minted, _ := f.mint("pipeline", req("u-alice", "viewer"))
+
+	valid := func() map[string]any {
+		return map[string]any{
+			"iss": issuer, "sub": "job:1", "aud": "booth-ui", ModuleClaim: "pipeline",
+			"exp": f.now.Add(time.Minute).Unix(), "iat": f.now.Unix(),
+			"groups": []string{"/workspaces/acme/owner"},
+		}
+	}
+	otherKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+
+	// The reverse-direction confusion: a token core's OWN key signed, but which claims another
+	// issuer (the IdP) — the workload verifier must refuse it on the issuer alone.
+	relabelled := f.keys.signRaw(t, mut(valid(), "iss", "https://idp.example/realms/booth"))
+	// A token from the IdP (any other key) that claims to be core's.
+	idpClaimingCore := forge(t, otherKey, valid())
+
+	hs256, _ := jose.NewSigner(jose.SigningKey{Algorithm: jose.HS256, Key: []byte("0123456789abcdef0123456789abcdef")}, nil)
+	hsTok, _ := jwt.Signed(hs256).Claims(valid()).Serialize()
+
+	parts := strings.Split(minted.JWT, ".")
+	tampered := parts[0] + "." + b64(`{"iss":"`+issuer+`","sub":"job:42","aud":"booth-ui","booth_module":"pipeline","exp":`+itoa(f.now.Add(time.Hour).Unix())+`,"groups":["/workspaces/acme/owner"]}`) + "." + parts[2]
+
+	for name, tok := range map[string]string{
+		"signed by another key, claiming core's issuer":    idpClaimingCore,
+		"signed by core's key but claiming another issuer": relabelled,
+		"core's key, wrong audience":                       f.keys.signRaw(t, mut(valid(), "aud", "someone-else")),
+		"core's key, no audience":                          f.keys.signRaw(t, without(valid(), "aud")),
+		"expired":                                          f.keys.signRaw(t, mut(valid(), "exp", f.now.Add(-time.Hour).Unix())),
+		"not yet valid":                                    f.keys.signRaw(t, mut(valid(), "nbf", f.now.Add(time.Hour).Unix())),
+		"no subject":                                       f.keys.signRaw(t, without(valid(), "sub")),
+		"no requesting module (not something Mint made)":   f.keys.signRaw(t, without(valid(), ModuleClaim)),
+		"HS256":                        hsTok,
+		"payload edited after signing": tampered,
+		"not a jwt":                    "nope",
+		"empty":                        "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := f.svc.Verify(context.Background(), tok); err == nil {
+				t.Fatal("token was accepted")
+			}
+		})
+	}
+
+	// The control: the same hand-built claims, signed by core's key with all the right values, pass —
+	// so the failures above are each down to the one thing that was wrong.
+	if _, err := f.svc.Verify(context.Background(), f.keys.signRaw(t, valid())); err != nil {
+		t.Fatalf("control token rejected: %v", err)
+	}
+}
+
+func TestVerify_ExpiryFollowsTheClock(t *testing.T) {
+	f := newFixture(t)
+	f.seen(t, "u-alice", "acme", auth.RoleOwner)
+	tok, _ := f.mint("pipeline", req("u-alice", "viewer"))
+
+	f.now = f.now.Add(DefaultTokenTTL - time.Minute)
+	if _, err := f.svc.Verify(context.Background(), tok.JWT); err != nil {
+		t.Fatalf("still-valid token rejected: %v", err)
+	}
+	f.now = f.now.Add(2 * time.Minute)
+	if _, err := f.svc.Verify(context.Background(), tok.JWT); err == nil {
+		t.Fatal("expired token accepted")
+	}
+}
+
+// signRaw signs arbitrary claims with core's own key — the position of an attacker who somehow
+// held it, or of a bug in Mint — so Verify is tested independent of what Mint happens to emit.
+func (k *Keys) signRaw(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	s, err := k.signer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := jwt.Signed(s).Claims(claims).Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func mut(m map[string]any, k string, v any) map[string]any { m[k] = v; return m }
+func without(m map[string]any, k string) map[string]any    { delete(m, k); return m }
+func b64(s string) string                                  { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
+func itoa(n int64) string                                  { return strconv.FormatInt(n, 10) }

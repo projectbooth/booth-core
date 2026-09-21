@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	boothv1alpha1 "github.com/projectbooth/booth-core/api/v1alpha1"
 	"github.com/projectbooth/booth-core/internal/auth"
@@ -29,6 +30,10 @@ type coreIssuer struct {
 	users *directory.MemoryStore
 	reg   *registry.Registry
 	http  *httptest.Server
+	svc   *workload.Service
+
+	// now is the clock the workload service reads; tests move it to mint an already-old token.
+	now func() time.Time
 }
 
 func newCoreIssuer(t *testing.T) *coreIssuer {
@@ -42,12 +47,15 @@ func newCoreIssuer(t *testing.T) *coreIssuer {
 	srv := httptest.NewUnstartedServer(nil)
 	c := &coreIssuer{
 		url: "http://" + srv.Listener.Addr().String(), idp: idp, keys: keys,
-		users: directory.NewMemoryStore(), reg: registry.New(), http: srv,
+		users: directory.NewMemoryStore(), reg: registry.New(), http: srv, now: time.Now,
 	}
 
 	// The same wiring cmd/core does: the recorder feeds the directory from verified tokens.
 	recorder := directory.NewRecorder(c.users)
-	svc := workload.NewService(keys, c.reg, c.users, workload.Options{Issuer: c.url, Audience: "c", GroupsClaim: "groups"})
+	svc := workload.NewService(keys, c.reg, c.users, workload.Options{
+		Issuer: c.url, Audience: "c", GroupsClaim: "groups", Now: func() time.Time { return c.now() },
+	})
+	c.svc = svc
 	tokens := gateway.NewIframeTokenIssuer([]byte("s"))
 	srv.Config.Handler = NewRouter(Deps{
 		Verifier: idp.holder, Registry: c.reg, Gateway: gateway.New(c.reg),
