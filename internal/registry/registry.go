@@ -15,20 +15,36 @@ import (
 // plus the last-observed health, decoupled from the Kubernetes API types so the gateway
 // and API layers don't need to import controller-runtime just to read the registry.
 type Module struct {
+	// Namespace is the BoothModule resource's own namespace. It's the default for
+	// Spec.ServiceRef.Namespace when that's unset (contracts/module-manifest.md); empty for
+	// modules that didn't come from a BoothModule (the dev registry).
+	Namespace string
+
 	Spec   boothv1alpha1.BoothModuleSpec
 	Status boothv1alpha1.BoothModuleStatus
 }
 
-// BaseURL is where the gateway routes requests for this module. A real, cluster-sourced
-// module has ServiceRef.Namespace and .Port set and resolves to the in-cluster Service
-// DNS name; a devregistry-loaded module has only ServiceRef.Name set, to a directly
-// dialable "host:port" for local development, and is used as-is.
+// BaseURL is where the gateway routes requests for this module.
+//
+//   - A cluster-sourced module resolves to its in-cluster Service DNS name, in
+//     serviceRef.namespace or — the documented default when that's unset — the BoothModule's
+//     own namespace.
+//   - A devregistry-loaded module has only ServiceRef.Name set, to a directly dialable
+//     "host:port" for local development, and is used as-is.
+//   - If a namespace genuinely can't be determined, the Service name alone is used (it
+//     resolves relative to core's own namespace) rather than a malformed `name..svc` address,
+//     which is what an unresolved default used to produce.
 func (m Module) BaseURL() string {
 	ref := m.Spec.ServiceRef
-	if ref.Namespace == "" && ref.Port == 0 {
+	ns := m.Spec.ServiceNamespace(m.Namespace)
+	switch {
+	case ns == "" && ref.Port == 0:
 		return "http://" + ref.Name
+	case ns == "":
+		return fmt.Sprintf("http://%s:%d", ref.Name, ref.Port)
+	default:
+		return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", ref.Name, ns, ref.Port)
 	}
-	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", ref.Name, ref.Namespace, ref.Port)
 }
 
 // Registry is a concurrency-safe, in-memory view of every installed module, keyed by

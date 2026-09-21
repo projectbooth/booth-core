@@ -161,6 +161,40 @@ jobs:
       # (so the user directory becomes persistent), and provisions a per-module database when a
       # BoothModule signals it needs one, delivered as a working DSN whose credentials cannot
       # cross into any other database.
+      # contracts/module-manifest.md: an unset serviceRef.namespace means the BoothModule's own
+      # namespace. Modules' charts leave it unset, so this is the shape that must work: core
+      # once built `name..svc.cluster.local`, marking every such module Unreachable.
+      - name: Verify serviceRef.namespace defaults to the BoothModule's namespace
+        run: |
+          set -eu
+          kubectl create namespace ci-default-ns
+          kubectl -n ci-default-ns create deployment echo --image=nginx:alpine --port=80
+          kubectl -n ci-default-ns expose deployment echo --port=80
+          kubectl -n ci-default-ns rollout status deployment/echo --timeout=120s
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: booth.projectbooth.io/v1alpha1
+          kind: BoothModule
+          metadata:
+            name: echo
+            namespace: ci-default-ns
+          spec:
+            id: echo
+            displayName: Echo
+            version: 0.1.0
+            contractVersion: 0.1.0
+            hasOwnUi: false
+            healthCheckPath: /
+            serviceRef: {name: echo, port: 80}
+          EOF
+          for i in $(seq 1 40); do
+            phase=$(kubectl -n ci-default-ns get boothmodule echo -o jsonpath='{.status.phase}')
+            [ "$phase" = Healthy ] && { echo "echo is Healthy"; exit 0; }
+            sleep 3
+          done
+          kubectl -n ci-default-ns get boothmodule echo -o yaml
+          echo "module without serviceRef.namespace never became Healthy"
+          exit 1
+
       - name: Verify database provisioning
         run: |
           set -eu

@@ -76,10 +76,7 @@ func (p *ModuleProvisioner) Ensure(ctx context.Context, mod *boothv1alpha1.Booth
 		return fmt.Errorf("module %q: %w", mod.Spec.ID, err)
 	}
 
-	ns := mod.Spec.ServiceRef.Namespace
-	if ns == "" {
-		ns = mod.Namespace
-	}
+	ns := mod.Spec.ServiceNamespace(mod.Namespace)
 	key := types.NamespacedName{Namespace: ns, Name: CredentialsSecretName}
 
 	var existing corev1.Secret

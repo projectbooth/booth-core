@@ -227,3 +227,83 @@ func TestReconcile_DatabaseProvisioningErrorIsReturned(t *testing.T) {
 		t.Fatal("module health must still be recorded while its database can't be provisioned")
 	}
 }
+
+// roundTripFunc lets a test observe exactly what the controller dials without DNS or a server.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func okResponse() *http.Response {
+	return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: http.Header{}}
+}
+
+// Reproduces booth-e2e's finding using the controller's REAL default health-check builder
+// (no HealthCheckURL override): a module with no serviceRef.namespace must be checked at, and
+// routed to, its resource's namespace — not at `name..svc.cluster.local`.
+func TestReconcile_AppliesDefaultServiceNamespace(t *testing.T) {
+	mod := &boothv1alpha1.BoothModule{
+		ObjectMeta: metav1.ObjectMeta{Name: "storage", Namespace: "booth-system"},
+		Spec: boothv1alpha1.BoothModuleSpec{
+			ID: "storage", HealthCheckPath: "/health",
+			ServiceRef: boothv1alpha1.ServiceReference{Name: "booth-storage", Port: 8080}, // no namespace
+		},
+	}
+	scheme := runtime.NewScheme()
+	_ = boothv1alpha1.AddToScheme(scheme)
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&boothv1alpha1.BoothModule{}).WithObjects(mod).Build()
+
+	reg := New()
+	rc := NewController(c, reg) // the real HealthCheckURL builder
+	var dialed string
+	rc.HTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		dialed = r.URL.String()
+		return okResponse(), nil
+	})}
+
+	if _, err := rc.Reconcile(context.Background(), reqFor("storage", "booth-system")); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if want := "http://booth-storage.booth-system.svc.cluster.local:8080/health"; dialed != want {
+		t.Fatalf("health check dialed %q, want %q", dialed, want)
+	}
+	got, ok := reg.Get("storage")
+	if !ok {
+		t.Fatal("module missing from the registry")
+	}
+	if got.Status.Phase != boothv1alpha1.ModulePhaseHealthy {
+		t.Errorf("Phase = %s, want Healthy (it was Unreachable before the fix)", got.Status.Phase)
+	}
+	// The gateway routes with the same registry entry, so it must resolve identically.
+	if want := "http://booth-storage.booth-system.svc.cluster.local:8080"; got.BaseURL() != want {
+		t.Errorf("gateway BaseURL() = %q, want %q", got.BaseURL(), want)
+	}
+}
+
+func TestReconcile_ExplicitServiceNamespaceIsRespected(t *testing.T) {
+	mod := &boothv1alpha1.BoothModule{
+		ObjectMeta: metav1.ObjectMeta{Name: "storage", Namespace: "crds-live-here"},
+		Spec: boothv1alpha1.BoothModuleSpec{
+			ID: "storage", HealthCheckPath: "/health",
+			ServiceRef: boothv1alpha1.ServiceReference{Name: "svc", Namespace: "pods-live-here", Port: 80},
+		},
+	}
+	scheme := runtime.NewScheme()
+	_ = boothv1alpha1.AddToScheme(scheme)
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&boothv1alpha1.BoothModule{}).WithObjects(mod).Build()
+
+	rc := NewController(c, New())
+	var dialed string
+	rc.HTTPClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		dialed = r.URL.Host
+		return okResponse(), nil
+	})}
+	if _, err := rc.Reconcile(context.Background(), reqFor("storage", "crds-live-here")); err != nil {
+		t.Fatal(err)
+	}
+	if want := "svc.pods-live-here.svc.cluster.local:80"; dialed != want {
+		t.Fatalf("dialed %q, want %q", dialed, want)
+	}
+}

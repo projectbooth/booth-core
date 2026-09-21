@@ -96,10 +96,14 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, fmt.Errorf("fetching BoothModule %s: %w", req.NamespacedName, err)
 	}
 
-	status := c.checkHealth(ctx, mod.Spec)
+	// Apply serviceRef.namespace's documented default (the BoothModule's own namespace) before
+	// building any address from the spec.
+	healthSpec := mod.Spec
+	healthSpec.ServiceRef.Namespace = mod.Spec.ServiceNamespace(mod.Namespace)
+	status := c.checkHealth(ctx, healthSpec)
 	status.ObservedGeneration = mod.Generation
 
-	c.Registry.Put(Module{Spec: mod.Spec, Status: status})
+	c.Registry.Put(Module{Namespace: mod.Namespace, Spec: mod.Spec, Status: status})
 
 	if statusChanged(mod.Status, status) {
 		mod.Status = status

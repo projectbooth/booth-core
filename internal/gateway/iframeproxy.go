@@ -157,6 +157,7 @@ func (g *Gateway) proxyIframeRequest(w http.ResponseWriter, r *http.Request, cla
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = g.Transport
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)

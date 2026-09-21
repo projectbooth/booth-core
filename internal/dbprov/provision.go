@@ -75,10 +75,7 @@ func NewProvisioner(c client.Client, a *Admin) *Provisioner {
 // a Secret this package wrote is removed — but the database and role are left in place, so
 // re-enabling or reinstalling reconnects to the same data.
 func (p *Provisioner) Ensure(ctx context.Context, mod *boothv1alpha1.BoothModule) error {
-	ns := mod.Spec.ServiceRef.Namespace
-	if ns == "" {
-		ns = mod.Namespace
-	}
+	ns := mod.Spec.ServiceNamespace(mod.Namespace)
 	key := types.NamespacedName{Namespace: ns, Name: CredentialsSecretName}
 
 	if mod.Spec.Database == nil || !mod.Spec.Database.Enabled {

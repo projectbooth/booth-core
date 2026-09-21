@@ -27,6 +27,11 @@ type ModuleLookup interface {
 // the forwarded JWT, per core-platform-api.md's defense-in-depth requirement).
 type Gateway struct {
 	Modules ModuleLookup
+
+	// Transport, if set, carries proxied requests instead of http.DefaultTransport. Nil in
+	// production; tests inject one to observe exactly what the gateway sends and where,
+	// without cluster DNS.
+	Transport http.RoundTripper
 }
 
 func New(modules ModuleLookup) *Gateway {
@@ -49,6 +54,7 @@ func (g *Gateway) proxyTo(moduleID string, forwardPath string, rawToken string) 
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = g.Transport
 	originalDirector := proxy.Director
 	proxy.Director = func(r *http.Request) {
 		originalDirector(r)
