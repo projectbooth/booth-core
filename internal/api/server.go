@@ -159,6 +159,7 @@ func handleListModules(reg *registry.Registry) http.HandlerFunc {
 				NavPath:           m.Spec.NavPath,
 				NavGroup:          string(m.Spec.NavGroup),
 				Phase:             string(m.Status.Phase),
+				Namespace:         m.Namespace,
 			}
 			// ADR 0023: adminNavPath is only surfaced to owners.
 			if m.Spec.AdminNavPath != "" && identity.Active.Role.IsAdmin() {
@@ -182,6 +183,10 @@ type moduleView struct {
 	NavGroup          string `json:"navGroup,omitempty"`
 	AdminNavPath      string `json:"adminNavPath,omitempty"`
 	Phase             string `json:"phase"`
+	// Namespace is the module's live namespace (ADR 0060), so a caller — booth-module-store on
+	// uninstall, in particular — can send it back rather than guessing/hardcoding one. Empty for
+	// a dev-registry-loaded module (see registry.Module.Namespace's own doc comment).
+	Namespace string `json:"namespace,omitempty"`
 }
 
 func handleIframeURL(issuer *gateway.IframeURLIssuer) http.HandlerFunc {

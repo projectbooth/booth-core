@@ -160,6 +160,60 @@ func TestHandleListModules_IncludesUIIntegrationMode(t *testing.T) {
 	}
 }
 
+// ADR 0060: a caller (booth-module-store, on uninstall) needs the module's live namespace back
+// from the listing rather than guessing or hardcoding one.
+func TestHandleListModules_IncludesNamespace(t *testing.T) {
+	reg := registry.New()
+	reg.Put(registry.Module{
+		Namespace: "booth-superset",
+		Spec:      boothv1alpha1.BoothModuleSpec{ID: "superset", DisplayName: "Superset"},
+	})
+	// A dev-registry-loaded module has no live namespace; it must come back empty, not guessed.
+	reg.Put(registry.Module{
+		Spec: boothv1alpha1.BoothModuleSpec{ID: "devmod", DisplayName: "Dev Module"},
+	})
+
+	handler := handleListModules(reg)
+	req := withTestIdentity(httptest.NewRequest(http.MethodGet, "/api/modules", nil), auth.RoleViewer)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	var result []moduleView
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decoding: %v", err)
+	}
+	byID := map[string]moduleView{}
+	for _, v := range result {
+		byID[v.ID] = v
+	}
+	if byID["superset"].Namespace != "booth-superset" {
+		t.Errorf("superset namespace = %q, want booth-superset", byID["superset"].Namespace)
+	}
+	if byID["devmod"].Namespace != "" {
+		t.Errorf("devmod namespace = %q, want empty", byID["devmod"].Namespace)
+	}
+
+	// omitempty: a module with no namespace must not even carry the key.
+	rec2 := httptest.NewRecorder()
+	handler(rec2, withTestIdentity(httptest.NewRequest(http.MethodGet, "/api/modules", nil), auth.RoleViewer))
+	var generic []map[string]any
+	if err := json.Unmarshal(rec2.Body.Bytes(), &generic); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range generic {
+		if m["id"] == "devmod" {
+			if _, present := m["namespace"]; present {
+				t.Errorf("devmod JSON carries a namespace key although empty: %v", m)
+			}
+		}
+		if m["id"] == "superset" {
+			if m["namespace"] != "booth-superset" {
+				t.Errorf("superset JSON namespace = %v", m["namespace"])
+			}
+		}
+	}
+}
+
 func TestHandleIframeURL(t *testing.T) {
 	tokens := gateway.NewIframeTokenIssuer([]byte("test-secret"))
 	issuer := gateway.NewIframeURLIssuer(tokens, "https://booth.example.com")
