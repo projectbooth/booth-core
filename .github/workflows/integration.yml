@@ -274,6 +274,61 @@ jobs:
             kubectl -n ci-workload logs job/mint-check || true; exit 1; }
           kubectl -n ci-workload logs job/mint-check
 
+      # ADR 0069: a third, distinct issuer for the iframe-proxy path, on by default
+      # (iframeIdentity.enabled, values.yaml) — no BoothModule/manifest opt-in needed, so this
+      # just needs to prove core is actually serving it on the deployed chart, at the address the
+      # chart's own default derives, and that it's genuinely a different issuer from the
+      # workload-token one already verified above.
+      - name: Verify iframe-proxy identity issuer
+        run: |
+          set -eu
+          echo "Waiting for the iframe-proxy identity issuer to come up..."
+          for i in $(seq 1 40); do
+            if kubectl -n booth-system logs deployment/booth-core | grep -q "iframe-proxy identity issuer enabled"; then
+              echo "iframe-proxy identity issuer is up"; break
+            fi
+            [ "$i" = 40 ] && { echo "iframe-proxy identity issuer never came up"; exit 1; }
+            sleep 3
+          done
+
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: iframe-identity-check, namespace: booth-system}
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: curl
+                    image: curlimages/curl:8.11.1
+                    env:
+                      - {name: ISSUER, value: "http://booth-core.booth-system.svc.cluster.local:8080/iframe-identity"}
+                      - {name: WORKLOAD_ISSUER, value: "http://booth-core.booth-system.svc.cluster.local:8080"}
+                    command: ["sh", "-ec"]
+                    args:
+                      - |
+                        # The chart's default issuer URL (the in-cluster Service, under /iframe-identity).
+                        jwks=$(curl -fsS "$ISSUER/.well-known/jwks.json")
+                        echo "$jwks" | grep -q '"RS256"'
+                        curl -fsS "$ISSUER/.well-known/openid-configuration" | grep -q "\"issuer\":\"$ISSUER\""
+
+                        # Distinct from the workload-token issuer already verified above: different
+                        # URL (checked implicitly by hitting a different path) and a different key.
+                        workload_jwks=$(curl -fsS "$WORKLOAD_ISSUER/.well-known/jwks.json")
+                        iframe_kid=$(echo "$jwks" | sed -n 's/.*"kid":"\([^"]*\)".*/\1/p')
+                        workload_kid=$(echo "$workload_jwks" | sed -n 's/.*"kid":"\([^"]*\)".*/\1/p')
+                        [ -n "$iframe_kid" ] && [ -n "$workload_kid" ] || { echo "could not extract a kid from one of the JWKS documents"; exit 1; }
+                        if [ "$iframe_kid" = "$workload_kid" ]; then
+                          echo "iframe-identity and workload issuers published the same key id"; exit 1
+                        fi
+                        echo "iframe-proxy identity issuer wiring verified (distinct from the workload issuer)"
+          EOF
+          kubectl -n booth-system wait --for=condition=complete job/iframe-identity-check --timeout=120s || {
+            kubectl -n booth-system logs job/iframe-identity-check || true; exit 1; }
+          kubectl -n booth-system logs job/iframe-identity-check
+
       - name: Verify database provisioning
         run: |
           set -eu

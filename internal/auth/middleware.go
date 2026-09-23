@@ -18,6 +18,13 @@ const (
 	HeaderWorkspace      = "X-Workspace"
 	HeaderBoothWorkspace = "X-Booth-Workspace"
 	HeaderBoothRole      = "X-Booth-Role"
+
+	// HeaderBoothIdentity carries the signed iframe-proxy identity assertion (ADR 0069): a
+	// dedicated header, not Authorization, because third-party UIs embedded via iframe-proxy
+	// (JupyterHub/jupyter-server, Superset, Metabase) each parse Authorization as their own API
+	// token. Set only on the iframe-proxy path (internal/gateway's IframeEntryHandler and
+	// IframeFallbackHandler); the ordinary gateway route never touches it.
+	HeaderBoothIdentity = "X-Booth-Identity"
 )
 
 type contextKey string

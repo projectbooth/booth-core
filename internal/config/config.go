@@ -53,6 +53,10 @@ type Config struct {
 	// Workload configures workload identity (ADR 0056): core as a second token issuer.
 	Workload WorkloadConfig
 
+	// IframeIdentity configures the iframe-proxy identity-assertion issuer (ADR 0069): core as a
+	// third, distinct token issuer, for the iframe-proxy path only.
+	IframeIdentity IframeIdentityConfig
+
 	// KubeNamespace is the namespace booth-core itself runs in, used as the default
 	// namespace for module BoothModule watches and Secret/ConfigMap provisioning.
 	KubeNamespace string
@@ -92,6 +96,18 @@ type WorkloadConfig struct {
 	// OwnerMaxAge bounds how long since a run owner's role was last seen (in a token core
 	// verified) before that role stops counting. Zero means the default (7 days).
 	OwnerMaxAge time.Duration
+}
+
+// IframeIdentityConfig is the iframe-proxy identity-assertion issuer configuration (ADR 0069).
+type IframeIdentityConfig struct {
+	// IssuerURL is core's own issuer URL for iframe-proxy identity assertions: the `iss` it
+	// mints, and the base of its JWKS. Distinct from both the OIDC provider's and
+	// Workload.IssuerURL's — a module trusting one issuer class must not implicitly accept
+	// another, since a workload token is never a person and this assertion always is. Must be
+	// resolvable from every iframe-proxy module's namespace. Setting it turns the issuer on
+	// (and starts attaching X-Booth-Identity on the iframe-proxy path); empty leaves it off,
+	// falling back to the pre-ADR-0069 workspace/role-only headers.
+	IssuerURL string
 }
 
 // PostgresConfig is the shared-PostgreSQL configuration (ADR 0053). The bundled Helm chart
@@ -185,6 +201,7 @@ func Load() (Config, error) {
 		}
 		cfg.Workload.OwnerMaxAge = d
 	}
+	cfg.IframeIdentity.IssuerURL = strings.TrimRight(os.Getenv("BOOTH_IFRAME_IDENTITY_ISSUER_URL"), "/")
 	cfg.NATSModuleURL = getEnv("BOOTH_NATS_MODULE_URL", qualifyNATSURL(cfg.NATSURL, cfg.KubeNamespace))
 
 	pg := PostgresConfig{

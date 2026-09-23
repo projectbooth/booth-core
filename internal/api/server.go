@@ -14,6 +14,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/auth"
 	"github.com/projectbooth/booth-core/internal/directory"
 	"github.com/projectbooth/booth-core/internal/gateway"
+	"github.com/projectbooth/booth-core/internal/iframeidentity"
 	"github.com/projectbooth/booth-core/internal/lifecycle"
 	"github.com/projectbooth/booth-core/internal/registry"
 	"github.com/projectbooth/booth-core/internal/workload"
@@ -35,6 +36,13 @@ type Deps struct {
 	// Workload serves ADR 0056's minting endpoint and JWKS. Optional: nil leaves the routes
 	// unregistered, so a deployment (or dev mode) without workload identity exposes nothing.
 	Workload *workload.Service
+
+	// IframeIdentity serves ADR 0069's well-known documents for the iframe-proxy identity
+	// assertion issuer, and (via Deps.Gateway) mints the assertion itself. Optional: nil leaves
+	// the routes unregistered and the gateway falls back to its pre-ADR-0069 workspace/role-only
+	// headers on the iframe-proxy path. Wiring the mint side into Gateway.IframeIdentity is the
+	// caller's job (cmd/core), same as Deps.Gateway's other configuration.
+	IframeIdentity *iframeidentity.Service
 }
 
 // NewRouter builds booth-core's full HTTP router.
@@ -60,6 +68,13 @@ func NewRouter(deps Deps) http.Handler {
 	// (see registerWorkload) and registered before the catch-all below.
 	if deps.Workload != nil {
 		registerWorkload(r, deps.Workload)
+	}
+
+	// ADR 0069: the iframe-proxy assertion issuer's well-known documents — also outside the
+	// human-token middleware (they're public, and are how a module learns to trust core as this
+	// issuer, mirroring registerWorkload above).
+	if deps.IframeIdentity != nil {
+		registerIframeIdentity(r, deps.IframeIdentity)
 	}
 
 	// ADR 0034: GET /api/me is the one route where X-Workspace is optional — it's how a

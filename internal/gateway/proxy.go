@@ -32,6 +32,20 @@ type Gateway struct {
 	// production; tests inject one to observe exactly what the gateway sends and where,
 	// without cluster DNS.
 	Transport http.RoundTripper
+
+	// IframeIdentity, if set, mints the signed X-Booth-Identity assertion attached to every
+	// iframe-proxied request (ADR 0069; see iframeproxy.go). Nil leaves the header unset — the
+	// pre-ADR-0069 workspace/role-only behavior — which is what every existing test in this
+	// package (constructed via New, with no iframe-identity issuer configured) still exercises.
+	// It's never consulted on the ordinary /modules/{id}/* gateway route.
+	IframeIdentity IframeIdentityMinter
+}
+
+// IframeIdentityMinter mints the assertion carried as X-Booth-Identity on the iframe-proxy path
+// (ADR 0069). Implemented by iframeidentity.Service; declared as an interface here so gateway
+// doesn't need to import the JOSE/JWT libraries directly.
+type IframeIdentityMinter interface {
+	Mint(moduleID, workspace, role, subject string) (string, error)
 }
 
 func New(modules ModuleLookup) *Gateway {

@@ -46,6 +46,24 @@ workloadIdentity:
   # if runs are owned by people who rarely open the UI.
   ownerMaxAge: 168h
 
+# Iframe-proxy identity assertion (ADR 0069): on every request proxied via
+# uiIntegrationMode: iframe-proxy (ADR 0005 — Superset, Metabase, booth-spark, booth-notebooks),
+# core attaches a signed X-Booth-Identity JWT, because that path has no bearer token to forward
+# at all (a plain iframe navigation can't carry one, and the browser's own token never leaves
+# memory, ADR 0032). A module trusts it exactly the way it trusts the deployment's OIDC provider
+# or the workload-token issuer: via the discovery document published at
+# <issuerUrl>/.well-known/openid-configuration.
+#
+# This is a separate issuer from workloadIdentity above, on purpose — a workload token never
+# represents a person, and this assertion always does. Don't point a module at the wrong one.
+iframeIdentity:
+  enabled: true
+  # The URL an iframe-proxy module uses to trust core as this issuer. Empty = this release's
+  # in-cluster Service, under /iframe-identity (kept distinct from workloadIdentity.issuerUrl even
+  # when both default to the same Service). Must be resolvable from every iframe-proxy module's
+  # namespace, and must not change once a module is configured to trust it.
+  issuerUrl: ""
+
 # Iframe-proxy session signing key (ui-integration.md). Required for more than one
 # replica — see docs/decisions and internal/gateway/iframetoken.go's doc comment for why
 # a shared key (not a per-pod ephemeral one) matters once replicaCount > 1. Populate via

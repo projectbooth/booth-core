@@ -29,6 +29,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/directory"
 	"github.com/projectbooth/booth-core/internal/eventbus"
 	"github.com/projectbooth/booth-core/internal/gateway"
+	"github.com/projectbooth/booth-core/internal/iframeidentity"
 	"github.com/projectbooth/booth-core/internal/natsauth"
 	"github.com/projectbooth/booth-core/internal/registry"
 	"github.com/projectbooth/booth-core/internal/workload"
@@ -65,6 +66,11 @@ func run() error {
 	var workloadKeys *workload.Keys
 	var workloadProvisioner registry.WorkloadProvisioner
 
+	// iframeIdentityKeys is non-nil only when the iframe-proxy identity-assertion issuer is
+	// configured (ADR 0069) — persisted via a Secret in a real cluster, ephemeral in dev mode
+	// (see the two bootstrap sites below), same trade-off as iframeSigningSecret's dev fallback.
+	var iframeIdentityKeys *iframeidentity.Keys
+
 	// Module discovery: real BoothModule CRD watch in a real cluster (ADR 0019), or a
 	// static file for local development without one (ADR 0019's noted convenience,
 	// agent-briefs/core.md's third open question).
@@ -77,6 +83,18 @@ func run() error {
 			reg.Put(m)
 		}
 		log.Printf("dev mode: loaded %d module(s) from %s (no CRD watch)", len(modules), cfg.DevRegistryPath)
+
+		if cfg.IframeIdentity.IssuerURL != "" {
+			// No Kubernetes Secret to persist to in dev mode; an ephemeral per-process key is
+			// fine here the same way iframeSigningSecret's dev fallback is — losing it on
+			// restart just means every existing iframe-proxy assertion stops verifying, and a
+			// fresh one is minted on the very next proxied request.
+			iframeIdentityKeys, err = iframeidentity.NewKeys()
+			if err != nil {
+				return fmt.Errorf("preparing iframe-identity keys: %w", err)
+			}
+			log.Printf("dev mode: iframe-proxy identity issuer enabled with an ephemeral key (issuer %s)", cfg.IframeIdentity.IssuerURL)
+		}
 	} else {
 		scheme, err := newScheme()
 		if err != nil {
@@ -86,7 +104,7 @@ func run() error {
 		// A direct (uncached) client for provisioning: the manager's cache would otherwise
 		// hold every Secret in the cluster in memory just to read a few of ours.
 		var direct client.Client
-		if cfg.EventBusAuth || cfg.Postgres.Host != "" || cfg.Workload.IssuerURL != "" {
+		if cfg.EventBusAuth || cfg.Postgres.Host != "" || cfg.Workload.IssuerURL != "" || cfg.IframeIdentity.IssuerURL != "" {
 			direct, err = client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
 			if err != nil {
 				return fmt.Errorf("creating Kubernetes client for provisioning: %w", err)
@@ -152,6 +170,19 @@ func run() error {
 			log.Printf("workload identity enabled (issuer %s, key %s)", cfg.Workload.IssuerURL, workloadKeys.KeyID())
 		} else {
 			log.Print("BOOTH_WORKLOAD_ISSUER_URL is not set; workload identity is off and no module will receive a minting credential (ADR 0056)")
+		}
+
+		// Iframe-proxy identity issuer (ADR 0069): its own signing key, no per-module Secret to
+		// provision — every iframe-proxy module trusts it purely via the public discovery
+		// document/JWKS, the same way it trusts the deployment's OIDC provider.
+		if cfg.IframeIdentity.IssuerURL != "" {
+			iframeIdentityKeys, err = iframeidentity.LoadOrCreateKeys(ctx, direct, cfg.KubeNamespace)
+			if err != nil {
+				return fmt.Errorf("preparing iframe-identity keys: %w", err)
+			}
+			log.Printf("iframe-proxy identity issuer enabled (issuer %s, key %s)", cfg.IframeIdentity.IssuerURL, iframeIdentityKeys.KeyID())
+		} else {
+			log.Print("BOOTH_IFRAME_IDENTITY_ISSUER_URL is not set; the iframe-proxy path will not carry a signed identity assertion (ADR 0069)")
 		}
 
 		mgr, err := startRegistryController(scheme, reg, busProvisioner, dbProvisioner, workloadProvisioner)
@@ -231,6 +262,20 @@ func run() error {
 		}
 	}
 
+	var iframeIdentitySvc *iframeidentity.Service
+	if iframeIdentityKeys != nil {
+		iframeIdentitySvc = iframeidentity.NewService(iframeIdentityKeys, iframeidentity.Options{
+			Issuer:      cfg.IframeIdentity.IssuerURL,
+			GroupsClaim: cfg.OIDC.GroupsClaim,
+		})
+		// Deliberately not `gw.IframeIdentity = iframeIdentitySvc` unconditionally: assigning a
+		// nil *iframeidentity.Service to the IframeIdentityMinter interface field produces a
+		// non-nil interface holding a nil pointer, which g.IframeIdentity != nil in
+		// proxyIframeRequest would then treat as configured and panic on Mint. Guarding on
+		// iframeIdentityKeys != nil here keeps the field genuinely nil when the issuer is off.
+		gw.IframeIdentity = iframeIdentitySvc
+	}
+
 	router := api.NewRouter(api.Deps{
 		Verifier:     verifierHolder,
 		Registry:     reg,
@@ -241,6 +286,7 @@ func run() error {
 		Directory:         users,
 		DirectoryRecorder: recorder,
 		Workload:          workloadSvc,
+		IframeIdentity:    iframeIdentitySvc,
 	})
 
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: router}

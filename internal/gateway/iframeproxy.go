@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -167,6 +168,23 @@ func (g *Gateway) proxyIframeRequest(w http.ResponseWriter, r *http.Request, cla
 		// regardless; these headers are a convenience, not the trust boundary).
 		req.Header.Set(auth.HeaderBoothWorkspace, claims.Workspace)
 		req.Header.Set(auth.HeaderBoothRole, claims.Role)
+
+		// ADR 0069: the iframe-proxy path has no bearer token to forward at all (a plain
+		// iframe navigation, or a third-party UI's own root-relative follow-up call, can't
+		// carry one), so this signed, per-request, module-audience-bound assertion is the
+		// only thing a module can independently re-verify on this path. Del first — never
+		// forward whatever the embedded page's own JS may have set on this header itself —
+		// then set a fresh one only if minting succeeds, so a minting failure degrades to no
+		// header rather than a stale or client-supplied one reaching the module.
+		req.Header.Del(auth.HeaderBoothIdentity)
+		if g.IframeIdentity != nil {
+			token, err := g.IframeIdentity.Mint(claims.ModuleID, claims.Workspace, claims.Role, claims.Subject)
+			if err != nil {
+				log.Printf("iframe-proxy identity: minting failed for module %q: %v", claims.ModuleID, err)
+			} else {
+				req.Header.Set(auth.HeaderBoothIdentity, token)
+			}
+		}
 	}
 
 	proxy.ServeHTTP(w, r)

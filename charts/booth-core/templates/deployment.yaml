@@ -43,6 +43,14 @@ spec:
             - name: BOOTH_WORKLOAD_OWNER_MAX_AGE
               value: {{ .Values.workloadIdentity.ownerMaxAge | quote }}
             {{- end }}
+            {{- if .Values.iframeIdentity.enabled }}
+            # ADR 0069: a third, distinct token issuer — the iframe-proxy path's signed identity
+            # assertion. Deliberately its own URL, not workloadIdentity's, even when both resolve
+            # to this same Service: a module trusting one issuer class must not implicitly trust
+            # the other, since a workload token is never a person and this assertion always is.
+            - name: BOOTH_IFRAME_IDENTITY_ISSUER_URL
+              value: {{ .Values.iframeIdentity.issuerUrl | default (printf "http://%s.%s.svc.cluster.local:%v/iframe-identity" (include "booth-core.fullname" .) .Release.Namespace .Values.service.port) | quote }}
+            {{- end }}
             {{- if .Values.nats.enabled }}
             - name: BOOTH_NATS_URL
               value: "nats://{{ .Release.Name }}-nats:4222"

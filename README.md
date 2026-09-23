@@ -30,6 +30,7 @@ internal/natsauth/      Event-bus authentication: credentials + per-subject perm
 internal/directory/     Minimal user directory: sub -> display claims (ADR 0047)
 internal/dbprov/        Shared PostgreSQL: per-module database + role provisioning (ADR 0053)
 internal/workload/      Workload identity: core as a second token issuer for unattended runs (ADR 0056)
+internal/iframeidentity/ Iframe-proxy identity assertion: core as a third token issuer, for the iframe-proxy path (ADR 0069)
 internal/testpg/        Real PostgreSQL for tests (embedded, no Docker)
 internal/secrets/       Secret/ConfigMap provisioning (ADR 0020)
 internal/lifecycle/     Module install/uninstall via the Helm SDK (ADR 0003)
@@ -200,6 +201,22 @@ core's own key and dispatched by `iss`, so a job's call to another module is rou
 like a person's. Only that route: core's own `/api/*` routes (install/uninstall, ...) still reject them.
 See `docs/decisions/0011`.
 
+## Iframe-proxy identity assertion (2026-09-23)
+
+**ADR 0069.** The iframe-proxy path (`uiIntegrationMode: iframe-proxy`) has no bearer token at
+all — a plain iframe navigation can't carry one, and the browser's own OIDC token never leaves
+memory (ADR 0032) — so core mints a third, distinct token class: on every proxied request, both
+`IframeEntryHandler` and `IframeFallbackHandler` attach a signed `X-Booth-Identity` JWT (`aud` the
+target module id, `sub` the person's own subject, `groups` in ADR 0025's grammar, `exp` ≤ 2
+minutes). A dedicated header, not `Authorization`, since JupyterHub/jupyter-server, Superset, and
+Metabase each parse `Authorization` as their own API token. Published via its own discovery
+document + JWKS at `<core's base URL>/iframe-identity`, deliberately a separate issuer (and key)
+from the workload-token issuer (ADR 0056/0058): a workload token is never a person, and a module
+trusting one issuer class must not implicitly accept the other. A client-supplied
+`X-Booth-Identity` is always stripped before core's own is attached (or omitted, if minting
+fails) — never forwarded. See `docs/decisions/0012` for implementation calls ADR 0069 left open
+(the route-prefix scheme, the dev-mode ephemeral key, minting-failure behavior).
+
 ## What's built vs. what's left, against the v0 definition of done
 
 Built and tested (unit/contract tests in-repo; the CRD reconcile loop additionally
@@ -216,6 +233,7 @@ verified against a real API server via `test/integration/`):
 - User directory (ADR 0047), persistent on a default install via the bundled PostgreSQL.
 - Shared PostgreSQL provisioning (ADR 0053): bundled default, per-module databases and roles.
 - Workload identity (ADR 0056): minting endpoint, signing key + JWKS, per-module minting credentials.
+- Iframe-proxy identity assertion (ADR 0069): a third issuer, signed `X-Booth-Identity` on every iframe-proxied request.
 - Secrets/ConfigMap provisioning primitive (ADR 0020).
 - Module install/uninstall via the Helm SDK, admin-role-gated (scoped per decision 0005).
 - Helm chart: bundles NATS (subchart), the CRD, RBAC, the core Deployment/Service.
