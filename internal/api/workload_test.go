@@ -59,7 +59,7 @@ func newCoreIssuer(t *testing.T) *coreIssuer {
 	tokens := gateway.NewIframeTokenIssuer([]byte("s"))
 	srv.Config.Handler = NewRouter(Deps{
 		Verifier: idp.holder, Registry: c.reg, Gateway: gateway.New(c.reg),
-		IframeTokens: tokens, IframeURLs: gateway.NewIframeURLIssuer(tokens, "http://x"),
+		IframeTokens: tokens, IframeURLs: gateway.NewIframeURLIssuer(tokens),
 		Directory: c.users, DirectoryRecorder: recorder, Workload: svc,
 	})
 	srv.Start()

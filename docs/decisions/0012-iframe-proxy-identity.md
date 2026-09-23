@@ -75,6 +75,33 @@ interface value wrapping a nil pointer — `g.IframeIdentity != nil` would then 
 `nil` (an untyped nil, which *does* produce a nil interface) and so never hit this, so it's called
 out here rather than left to be rediscovered by a future refactor.
 
+## Implementation notes (added 2026-09-23, follow-up to `cdd621e`)
+
+`booth-notebooks` verified this end to end against a real `booth-core`, real shell, and real
+Keycloak on `kind`, and found two real bugs in the shipped design — both confirmed directly in
+code, both corrected here as fixes to the design ADR 0069 already settled on, not new decisions
+(see ADR 0069's own "Implementation notes" for the full writeup, which covers `booth-design`'s
+matching half):
+
+1. **`IframeFallbackHandler` decided purely on cookie presence**, with no check for whether the
+   request was a top-level navigation or the embedded module's own follow-up call. Since the
+   session cookie is `Path=/` and (per item C) renewed for a session's whole duration, this meant
+   that once a person opened an iframe-proxied module, *any* later top-level navigation to core
+   directly — the exact case `IframeFallbackHandler` is guarding when there's no shell in front of
+   it — got silently proxied into that module instead of refused. Fixed by checking
+   `Sec-Fetch-Dest`: a value of `document` (a top-level navigation) is now refused exactly like
+   having no session cookie at all; `iframe`, `empty`, or a missing header (older browsers) still
+   proxy as before. Scoped to `IframeFallbackHandler` only — `IframeEntryHandler`'s
+   `/iframe/{id}/*` route doesn't have the same ambiguity, since reaching it at all is already an
+   explicit request for that specific module.
+2. **`IframeURLIssuer.URLFor` built an absolute URL from `publicBaseURL()`**, which defaulted to
+   `http://localhost:8080` with no chart value ever setting `BOOTH_PUBLIC_BASE_URL` — every real
+   deployment's iframe URL silently pointed at the wrong host. Fixed by minting a **relative**
+   `/iframe/<id>/...` URL instead: `NewIframeURLIssuer` no longer takes a base URL at all. This
+   works because the shell now routes `/iframe/` to core itself (ADR 0069 item B, `booth-design`
+   `f8b6804`), so a relative URL resolves against whatever origin the browser is already on — no
+   operator configuration needed, and the failure mode is removed rather than made configurable.
+
 ## Honest residual limits
 
 1. **No revocation, same as every short-lived-token design in this repo.** A 2-minute lifetime

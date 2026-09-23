@@ -307,7 +307,7 @@ func TestGateway_WorkloadTokensWorkWhenTheIdPIsDownAndNeverEnterTheDirectory(t *
 	tokens := gateway.NewIframeTokenIssuer([]byte("s"))
 	router := NewRouter(Deps{
 		Verifier: &auth.VerifierHolder{}, Registry: c.reg, Gateway: gateway.New(c.reg),
-		IframeTokens: tokens, IframeURLs: gateway.NewIframeURLIssuer(tokens, "http://x"),
+		IframeTokens: tokens, IframeURLs: gateway.NewIframeURLIssuer(tokens),
 		Directory: c.users, Workload: c.svc,
 	})
 	call := func(bearer string) int {

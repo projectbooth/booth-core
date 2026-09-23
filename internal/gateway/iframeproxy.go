@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/projectbooth/booth-core/internal/auth"
@@ -37,17 +36,21 @@ const (
 // auth.Middleware / X-Workspace flow) and the iframe traffic handlers below (which run
 // under the iframe token instead) don't share request-auth assumptions.
 type IframeURLIssuer struct {
-	tokens  *IframeTokenIssuer
-	baseURL string // core's own external base URL, e.g. https://booth.example.com
+	tokens *IframeTokenIssuer
 }
 
-func NewIframeURLIssuer(tokens *IframeTokenIssuer, baseURL string) *IframeURLIssuer {
-	return &IframeURLIssuer{tokens: tokens, baseURL: strings.TrimSuffix(baseURL, "/")}
+func NewIframeURLIssuer(tokens *IframeTokenIssuer) *IframeURLIssuer {
+	return &IframeURLIssuer{tokens: tokens}
 }
 
-// URLFor mints a fresh navigation token for identity's active workspace/role and returns
-// the full iframe src URL. Called from an authenticated core API endpoint (the shell
-// requests this before setting an <iframe src>).
+// URLFor mints a fresh navigation token for identity's active workspace/role and returns the
+// iframe src URL, as a path relative to whatever origin the browser is already on (ADR 0069's
+// "Implementation notes", bug 2). It used to be built from a configured public base URL
+// (BOOTH_PUBLIC_BASE_URL), which no chart value ever set — every real deployment's iframe URL
+// silently pointed at the fallback's http://localhost:8080 instead of the deployment's real
+// address. A relative URL removes the failure mode entirely rather than making it configurable:
+// the shell routes /iframe/ to core itself (ADR 0069 item B), so this resolves correctly against
+// whatever origin the browser is already on with no operator configuration at all.
 func (i *IframeURLIssuer) URLFor(moduleID string, identity auth.Identity) (string, error) {
 	token, err := i.tokens.Issue(IframeClaims{
 		ModuleID:  moduleID,
@@ -58,7 +61,7 @@ func (i *IframeURLIssuer) URLFor(moduleID string, identity auth.Identity) (strin
 	if err != nil {
 		return "", fmt.Errorf("issuing iframe token: %w", err)
 	}
-	return fmt.Sprintf("%s/iframe/%s/?%s=%s", i.baseURL, moduleID, iframeQueryParam, token), nil
+	return fmt.Sprintf("/iframe/%s/?%s=%s", moduleID, iframeQueryParam, token), nil
 }
 
 // IframeEntryHandler serves /iframe/{id}/*. First hit (query param present): verify,
@@ -128,9 +131,32 @@ func (g *Gateway) IframeFallbackHandler(tokens *IframeTokenIssuer) http.Handler 
 			http.NotFound(w, r)
 			return
 		}
+		// ADR 0069's "Implementation notes", bug 1: the session cookie alone can't distinguish
+		// the embedded module's own follow-up call from the person having left the module and
+		// asked for something else — a plain page refresh, a shell link opened in a new tab,
+		// core hit directly — because the cookie (Path=/) is attached to all of them while the
+		// session is live, which item C's renewal now keeps alive for a session's whole
+		// duration. Sec-Fetch-Dest tells them apart: "document" is a top-level browser
+		// navigation, never something an embedded page's own JS issues (that's "empty", or
+		// "iframe" for a nested navigation within the module itself). booth-core doesn't serve
+		// the shell — that's booth-design's job, proxied separately — so for a "document"
+		// request this handler has no page of its own to hand back; refuse it exactly like
+		// having no session cookie at all, rather than silently proxying a top-level navigation
+		// into whatever module happens to be running. A browser that omits the header (some
+		// older browsers still do) falls through to proxying as before — this is a real
+		// hardening, not the sole boundary the cookie's Path=/ scoping already accepts.
+		if r.Header.Get(secFetchDestHeader) == secFetchDestDocument {
+			http.NotFound(w, r)
+			return
+		}
 		g.proxyIframeRequest(w, r, claims, r.URL.Path)
 	})
 }
+
+const (
+	secFetchDestHeader   = "Sec-Fetch-Dest"
+	secFetchDestDocument = "document"
+)
 
 func (g *Gateway) verifyIframeCookie(r *http.Request, tokens *IframeTokenIssuer) (IframeClaims, bool) {
 	cookie, err := r.Cookie(IframeCookieName)

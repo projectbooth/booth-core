@@ -217,6 +217,13 @@ trusting one issuer class must not implicitly accept the other. A client-supplie
 fails) — never forwarded. See `docs/decisions/0012` for implementation calls ADR 0069 left open
 (the route-prefix scheme, the dev-mode ephemeral key, minting-failure behavior).
 
+**Two real bugs found by `booth-notebooks`' end-to-end verification, fixed as corrections to this
+same design**: `IframeFallbackHandler` now refuses a top-level document navigation
+(`Sec-Fetch-Dest: document`) rather than silently proxying it into whatever module has a live
+session cookie; and `IframeURLIssuer.URLFor` mints a relative `/iframe/<id>/...` URL instead of one
+built from `BOOTH_PUBLIC_BASE_URL`, which no chart value ever set (every real deployment's iframe
+URL pointed at `localhost:8080`). See `docs/decisions/0012`'s "Implementation notes".
+
 ## What's built vs. what's left, against the v0 definition of done
 
 Built and tested (unit/contract tests in-repo; the CRD reconcile loop additionally

@@ -216,7 +216,7 @@ func TestHandleListModules_IncludesNamespace(t *testing.T) {
 
 func TestHandleIframeURL(t *testing.T) {
 	tokens := gateway.NewIframeTokenIssuer([]byte("test-secret"))
-	issuer := gateway.NewIframeURLIssuer(tokens, "https://booth.example.com")
+	issuer := gateway.NewIframeURLIssuer(tokens)
 	handler := handleIframeURL(issuer)
 
 	req := withTestIdentity(httptest.NewRequest(http.MethodGet, "/api/modules/superset/iframe-url", nil), auth.RoleEditor)

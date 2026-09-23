@@ -209,7 +209,7 @@ func run() error {
 		return fmt.Errorf("preparing iframe token secret: %w", err)
 	}
 	iframeTokens := gateway.NewIframeTokenIssuer(iframeSecret)
-	iframeURLs := gateway.NewIframeURLIssuer(iframeTokens, publicBaseURL())
+	iframeURLs := gateway.NewIframeURLIssuer(iframeTokens)
 
 	gw := gateway.New(reg)
 
@@ -449,13 +449,6 @@ func iframeSigningSecret() ([]byte, error) {
 	}
 	log.Print("BOOTH_IFRAME_SIGNING_KEY not set; using an ephemeral key (fine for local dev, not for a real deployment with more than one replica)")
 	return key, nil
-}
-
-func publicBaseURL() string {
-	if v := os.Getenv("BOOTH_PUBLIC_BASE_URL"); v != "" {
-		return v
-	}
-	return "http://localhost:8080"
 }
 
 const shutdownTimeout = 10 * time.Second

@@ -17,7 +17,7 @@ func routerWith(t *testing.T, idp *testIDP, mod func(*Deps)) http.Handler {
 	reg := registry.New()
 	deps := Deps{
 		Verifier: idp.holder, Registry: reg, Gateway: gateway.New(reg),
-		IframeTokens: tokens, IframeURLs: gateway.NewIframeURLIssuer(tokens, "http://x"),
+		IframeTokens: tokens, IframeURLs: gateway.NewIframeURLIssuer(tokens),
 	}
 	if mod != nil {
 		mod(&deps)
