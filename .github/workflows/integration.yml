@@ -329,6 +329,24 @@ jobs:
             kubectl -n booth-system logs job/iframe-identity-check || true; exit 1; }
           kubectl -n booth-system logs job/iframe-identity-check
 
+      # ADR 0083: the bundled Postgres StatefulSet gets pinned to the node its pod actually
+      # landed on, so a later reschedule can't strand it away from its local-path volume. This
+      # kind cluster is single-node, so it can't exercise the cross-node failure this protects
+      # against (that's booth-e2e's node_count=2 job), but it does prove the real wiring: core
+      # actually patches the live StatefulSet, on the real chart, against a real API server.
+      - name: Verify bundled Postgres is pinned to its node
+        run: |
+          set -eu
+          node=$(kubectl -n booth-system get pod booth-core-postgresql-0 -o jsonpath='{.spec.nodeName}')
+          [ -n "$node" ] || { echo "postgresql-0 has no node assigned"; exit 1; }
+          echo "Waiting for core to pin the StatefulSet to $node..."
+          for i in $(seq 1 40); do
+            got=$(kubectl -n booth-system get statefulset booth-core-postgresql -o jsonpath='{.spec.template.spec.nodeSelector.kubernetes\.io/hostname}')
+            [ "$got" = "$node" ] && { echo "pinned to $got"; break; }
+            [ "$i" = 40 ] && { echo "StatefulSet never got pinned (nodeSelector = '$got', want '$node')"; exit 1; }
+            sleep 3
+          done
+
       - name: Verify database provisioning
         run: |
           set -eu

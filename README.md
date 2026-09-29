@@ -181,6 +181,13 @@ Restore and major-version upgrade are manual: `docs/runbooks/postgres-backup-res
 `helm install`): PostgreSQL lets any role connect to the maintenance databases by default, so a
 module's credentials can list other databases' and roles' names.
 
+**Node pinning (ADR 0083).** The bundled server's `local-path-provisioner` volume is bound to
+whichever node first created it; core now pins the StatefulSet to that same node
+(`nodeSelector: kubernetes.io/hostname`) once it's known, so a reschedule on a multi-node cluster
+(a rollout restart, a `helm upgrade`, a node drain) can't strand the pod away from its data. Applied
+after the fact by a backgrounded, self-healing bootstrap step — it can't be static in the chart,
+since the node isn't known until the pod has been scheduled once. See `docs/decisions/0013`.
+
 ## Workload identity for unattended runs (2026-09-21)
 
 **ADR 0056.** A scheduled run has no human token, so core is a second trusted issuer for one narrow
@@ -239,6 +246,7 @@ verified against a real API server via `test/integration/`):
   authenticated, with per-module scoped credentials (ADR 0049).
 - User directory (ADR 0047), persistent on a default install via the bundled PostgreSQL.
 - Shared PostgreSQL provisioning (ADR 0053): bundled default, per-module databases and roles.
+- Bundled Postgres node pinning (ADR 0083): survives a reschedule on a multi-node cluster.
 - Workload identity (ADR 0056): minting endpoint, signing key + JWKS, per-module minting credentials.
 - Iframe-proxy identity assertion (ADR 0069): a third issuer, signed `X-Booth-Identity` on every iframe-proxied request.
 - Secrets/ConfigMap provisioning primitive (ADR 0020).

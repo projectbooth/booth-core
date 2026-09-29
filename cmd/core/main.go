@@ -156,6 +156,15 @@ func run() error {
 			dbProv = dbprov.NewProvisioner(direct, admin)
 			dbProvisioner = dbProv
 			log.Printf("database provisioning enabled (server %s:%d, bundled=%v)", cfg.Postgres.Host, cfg.Postgres.Port, cfg.Postgres.Bundled)
+
+			if cfg.Postgres.Bundled {
+				// ADR 0083: pin the bundled StatefulSet to the node its local-path volume lives
+				// on. The chart names the Service and StatefulSet identically, so Postgres.Host
+				// (already the Service DNS name) also names the StatefulSet. Backgrounded and
+				// retried: the pod may not be scheduled yet at core's own boot, especially on a
+				// fresh install where both come up from the same `helm install` together.
+				go pinBundledPostgresNode(ctx, direct, cfg.KubeNamespace, cfg.Postgres.Host)
+			}
 		} else {
 			log.Print("BOOTH_POSTGRES_HOST is not set; module databases will not be provisioned (ADR 0053)")
 		}
@@ -364,6 +373,48 @@ func maintainBus(ctx context.Context, url string, opts []nats.Option) {
 		}
 		if backoff *= 2; backoff > maxBackoff {
 			backoff = maxBackoff
+		}
+	}
+}
+
+// pinBundledPostgresNode implements ADR 0083, backgrounded: retries dbprov.EnsureNodeAffinity
+// with backoff until it succeeds (the StatefulSet's pod may not exist, or have no node assigned,
+// for a while on a fresh install), then keeps re-checking on a slow, steady interval for the rest
+// of the process's life — cheap self-healing against the pin ever being removed or falling out of
+// date, e.g. if a volume were ever manually migrated to a different node.
+func pinBundledPostgresNode(ctx context.Context, c client.Client, namespace, statefulSetName string) {
+	const maxBackoff = 30 * time.Second
+	const steadyStateInterval = 5 * time.Minute
+	backoff := time.Second
+	wasPinned := false
+	for {
+		pinned, err := dbprov.EnsureNodeAffinity(ctx, c, namespace, statefulSetName)
+		var wait time.Duration
+		switch {
+		case err != nil:
+			log.Printf("pinning bundled PostgreSQL to its node failed (%v); retrying in %s", err, backoff)
+			wait = backoff
+			if backoff *= 2; backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		case !pinned:
+			// The pod doesn't exist yet, or hasn't been assigned a node yet; nothing to pin to.
+			wait = backoff
+			if backoff *= 2; backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		default:
+			if !wasPinned {
+				log.Print("bundled PostgreSQL pinned to its node (ADR 0083)")
+				wasPinned = true
+			}
+			backoff = time.Second // reset, so a future transient failure retries quickly again
+			wait = steadyStateInterval
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
 		}
 	}
 }
