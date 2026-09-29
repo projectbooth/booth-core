@@ -57,6 +57,9 @@ type Config struct {
 	// third, distinct token issuer, for the iframe-proxy path only.
 	IframeIdentity IframeIdentityConfig
 
+	// CredentialBroker configures the native-protocol credential broker (ADR 0080).
+	CredentialBroker CredentialBrokerConfig
+
 	// KubeNamespace is the namespace booth-core itself runs in, used as the default
 	// namespace for module BoothModule watches and Secret/ConfigMap provisioning.
 	KubeNamespace string
@@ -108,6 +111,14 @@ type IframeIdentityConfig struct {
 	// (and starts attaching X-Booth-Identity on the iframe-proxy path); empty leaves it off,
 	// falling back to the pre-ADR-0069 workspace/role-only headers.
 	IssuerURL string
+}
+
+// CredentialBrokerConfig is the credential-broker configuration (ADR 0080).
+type CredentialBrokerConfig struct {
+	// MaxTTL bounds the ttlSeconds a caller may request from POST /api/credentials (ADR 0080's
+	// "a stricter default ceiling than an HTTP grant() token's"). Zero means the default
+	// (credentialbroker.DefaultMaxTTL, 5 minutes).
+	MaxTTL time.Duration
 }
 
 // PostgresConfig is the shared-PostgreSQL configuration (ADR 0053). The bundled Helm chart
@@ -202,6 +213,13 @@ func Load() (Config, error) {
 		cfg.Workload.OwnerMaxAge = d
 	}
 	cfg.IframeIdentity.IssuerURL = strings.TrimRight(os.Getenv("BOOTH_IFRAME_IDENTITY_ISSUER_URL"), "/")
+	if v := os.Getenv("BOOTH_CREDENTIAL_BROKER_MAX_TTL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return Config{}, fmt.Errorf("BOOTH_CREDENTIAL_BROKER_MAX_TTL: %q is not a positive duration (e.g. 5m)", v)
+		}
+		cfg.CredentialBroker.MaxTTL = d
+	}
 	cfg.NATSModuleURL = getEnv("BOOTH_NATS_MODULE_URL", qualifyNATSURL(cfg.NATSURL, cfg.KubeNamespace))
 
 	pg := PostgresConfig{

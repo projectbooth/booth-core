@@ -24,6 +24,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/api"
 	"github.com/projectbooth/booth-core/internal/auth"
 	"github.com/projectbooth/booth-core/internal/config"
+	"github.com/projectbooth/booth-core/internal/credentialbroker"
 	"github.com/projectbooth/booth-core/internal/dbprov"
 	"github.com/projectbooth/booth-core/internal/devregistry"
 	"github.com/projectbooth/booth-core/internal/directory"
@@ -71,6 +72,12 @@ func run() error {
 	// (see the two bootstrap sites below), same trade-off as iframeSigningSecret's dev fallback.
 	var iframeIdentityKeys *iframeidentity.Keys
 
+	// credentialBrokerKeys is always non-nil (ADR 0080's broker has no separate on/off toggle —
+	// unlike workload/iframe identity it publishes no issuer/JWKS, so there's nothing to gate
+	// behind a configured URL): persisted via a Secret in a real cluster, ephemeral in dev mode.
+	var credentialBrokerKeys *credentialbroker.Keys
+	var credentialBrokerProvisioner registry.CredentialBrokerProvisioner
+
 	// Module discovery: real BoothModule CRD watch in a real cluster (ADR 0019), or a
 	// static file for local development without one (ADR 0019's noted convenience,
 	// agent-briefs/core.md's third open question).
@@ -95,6 +102,14 @@ func run() error {
 			}
 			log.Printf("dev mode: iframe-proxy identity issuer enabled with an ephemeral key (issuer %s)", cfg.IframeIdentity.IssuerURL)
 		}
+
+		// Credential broker (ADR 0080): same ephemeral-key trade-off as above. Dev mode's static
+		// registry has no BoothModule to provision a provider credential into anyway, so only the
+		// Keys (needed to authenticate core's own outbound provider calls) are built here.
+		credentialBrokerKeys, err = credentialbroker.NewKeys()
+		if err != nil {
+			return fmt.Errorf("preparing credential-broker keys: %w", err)
+		}
 	} else {
 		scheme, err := newScheme()
 		if err != nil {
@@ -102,13 +117,11 @@ func run() error {
 		}
 
 		// A direct (uncached) client for provisioning: the manager's cache would otherwise
-		// hold every Secret in the cluster in memory just to read a few of ours.
-		var direct client.Client
-		if cfg.EventBusAuth || cfg.Postgres.Host != "" || cfg.Workload.IssuerURL != "" || cfg.IframeIdentity.IssuerURL != "" {
-			direct, err = client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
-			if err != nil {
-				return fmt.Errorf("creating Kubernetes client for provisioning: %w", err)
-			}
+		// hold every Secret in the cluster in memory just to read a few of ours. Unconditional
+		// now that the credential broker (ADR 0080) always needs one to bootstrap its own keys.
+		direct, err := client.New(ctrl.GetConfigOrDie(), client.Options{Scheme: scheme})
+		if err != nil {
+			return fmt.Errorf("creating Kubernetes client for provisioning: %w", err)
 		}
 
 		var busProvisioner registry.EventBusProvisioner
@@ -194,7 +207,16 @@ func run() error {
 			log.Print("BOOTH_IFRAME_IDENTITY_ISSUER_URL is not set; the iframe-proxy path will not carry a signed identity assertion (ADR 0069)")
 		}
 
-		mgr, err := startRegistryController(scheme, reg, busProvisioner, dbProvisioner, workloadProvisioner)
+		// Credential broker (ADR 0080): its own signing key, and a provider-calling credential
+		// for any module that declares providesCredentials. Always on — see the field comment.
+		credentialBrokerKeys, err = credentialbroker.LoadOrCreateKeys(ctx, direct, cfg.KubeNamespace)
+		if err != nil {
+			return fmt.Errorf("preparing credential-broker keys: %w", err)
+		}
+		credentialBrokerProvisioner = credentialbroker.NewModuleProvisioner(direct, credentialBrokerKeys)
+		log.Print("credential broker enabled")
+
+		mgr, err := startRegistryController(scheme, reg, busProvisioner, dbProvisioner, workloadProvisioner, credentialBrokerProvisioner)
 		if err != nil {
 			return fmt.Errorf("starting registry controller: %w", err)
 		}
@@ -229,6 +251,14 @@ func run() error {
 	// users make authenticated requests, so it degrades rather than breaks.
 	users := directory.NewSwitchable(directory.NewMemoryStore())
 	recorder := directory.NewRecorder(users)
+
+	// Credential-broker audit trail (ADR 0080): same store-lifecycle shape as the user directory
+	// just above — starts in-memory, upgrades to core's own Postgres database when one becomes
+	// available. An entry recorded before the upgrade is not retroactively persisted; see
+	// docs/decisions/0014's residual limits (the same honest limit directory.Switchable already
+	// has for the user directory).
+	audit := credentialbroker.NewSwitchable(credentialbroker.NewMemoryStore())
+
 	switch {
 	case cfg.PostgresDSN != "":
 		pg, err := directory.NewPostgresStore(ctx, cfg.PostgresDSN)
@@ -237,12 +267,18 @@ func run() error {
 		}
 		defer pg.Close()
 		users.Swap(pg)
-		log.Print("user directory: using the database from BOOTH_POSTGRES_DSN")
+		auditPg, err := credentialbroker.NewPostgresStore(ctx, cfg.PostgresDSN)
+		if err != nil {
+			return fmt.Errorf("configuring credential-broker audit trail: %w", err)
+		}
+		defer auditPg.Close()
+		audit.Swap(auditPg)
+		log.Print("user directory and credential-broker audit trail: using the database from BOOTH_POSTGRES_DSN")
 	case dbProv != nil:
-		go persistDirectory(ctx, dbProv, cfg.KubeNamespace, users, recorder)
+		go persistCoreDatabase(ctx, dbProv, cfg.KubeNamespace, users, recorder, audit)
 	default:
-		log.Print("no database is configured (BOOTH_POSTGRES_DSN / BOOTH_POSTGRES_HOST); the user directory is " +
-			"in-memory and will be empty after a restart until users make authenticated requests again (ADR 0047)")
+		log.Print("no database is configured (BOOTH_POSTGRES_DSN / BOOTH_POSTGRES_HOST); the user directory and the " +
+			"credential-broker audit trail are in-memory and will be empty after a restart (ADR 0047, ADR 0080)")
 	}
 
 	// Event bus: NATS/JetStream (ADR 0021). Connected in the background: NATS may not be
@@ -285,6 +321,12 @@ func run() error {
 		gw.IframeIdentity = iframeIdentitySvc
 	}
 
+	// Credential broker (ADR 0080): always built, same as its keys — see credentialBrokerKeys'
+	// own comment on why there's no separate on/off toggle.
+	credentialBrokerSvc := credentialbroker.NewService(credentialBrokerKeys, reg, audit, credentialbroker.Options{
+		MaxTTL: cfg.CredentialBroker.MaxTTL,
+	})
+
 	router := api.NewRouter(api.Deps{
 		Verifier:     verifierHolder,
 		Registry:     reg,
@@ -296,6 +338,7 @@ func run() error {
 		DirectoryRecorder: recorder,
 		Workload:          workloadSvc,
 		IframeIdentity:    iframeIdentitySvc,
+		CredentialBroker:  credentialBrokerSvc,
 	})
 
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: router}
@@ -430,22 +473,29 @@ func newScheme() (*runtime.Scheme, error) {
 	return scheme, nil
 }
 
-// persistDirectory provisions core's own database and switches the user directory onto it,
-// retrying with backoff until the server is reachable (the bundled one may still be starting).
-func persistDirectory(ctx context.Context, p *dbprov.Provisioner, namespace string, users *directory.Switchable, recorder *directory.Recorder) {
+// persistCoreDatabase provisions core's own database and switches both the user directory and
+// the credential-broker audit trail onto it, retrying with backoff until the server is reachable
+// (the bundled one may still be starting).
+func persistCoreDatabase(ctx context.Context, p *dbprov.Provisioner, namespace string, users *directory.Switchable, recorder *directory.Recorder, audit *credentialbroker.Switchable) {
 	const maxBackoff = 30 * time.Second
 	backoff := time.Second
 	for {
 		dsn, err := p.EnsureCore(ctx, namespace)
 		if err == nil {
 			var pg *directory.PostgresStore
+			var auditPg *credentialbroker.PostgresStore
 			if pg, err = directory.NewPostgresStore(ctx, dsn); err == nil {
-				users.Swap(pg)
-				recorder.Reset() // the new store is empty; re-record users on their next request
-				log.Print("user directory is now persistent (core database provisioned)")
-				<-ctx.Done()
+				if auditPg, err = credentialbroker.NewPostgresStore(ctx, dsn); err == nil {
+					users.Swap(pg)
+					recorder.Reset() // the new store is empty; re-record users on their next request
+					audit.Swap(auditPg)
+					log.Print("user directory and credential-broker audit trail are now persistent (core database provisioned)")
+					<-ctx.Done()
+					pg.Close()
+					auditPg.Close()
+					return
+				}
 				pg.Close()
-				return
 			}
 		}
 		log.Printf("core database not ready yet (%v); retrying in %s", err, backoff)
@@ -460,7 +510,7 @@ func persistDirectory(ctx context.Context, p *dbprov.Provisioner, namespace stri
 	}
 }
 
-func startRegistryController(scheme *runtime.Scheme, reg *registry.Registry, eventBus registry.EventBusProvisioner, database registry.DatabaseProvisioner, workloadIdentity registry.WorkloadProvisioner) (ctrl.Manager, error) {
+func startRegistryController(scheme *runtime.Scheme, reg *registry.Registry, eventBus registry.EventBusProvisioner, database registry.DatabaseProvisioner, workloadIdentity registry.WorkloadProvisioner, credentialBroker registry.CredentialBrokerProvisioner) (ctrl.Manager, error) {
 	// Metrics and health-probe servers are both disabled: controller-runtime's
 	// manager defaults its metrics server to :8080, which collides with booth-core's
 	// own HTTP server in this same process — this bit us for real (see git history),
@@ -479,6 +529,7 @@ func startRegistryController(scheme *runtime.Scheme, reg *registry.Registry, eve
 	controller.EventBus = eventBus
 	controller.Database = database
 	controller.Workload = workloadIdentity
+	controller.CredentialBroker = credentialBroker
 	if err := controller.SetupWithManager(mgr); err != nil {
 		return nil, fmt.Errorf("setting up registry controller: %w", err)
 	}

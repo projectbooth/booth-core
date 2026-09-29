@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/projectbooth/booth-core/internal/auth"
+	"github.com/projectbooth/booth-core/internal/credentialbroker"
 	"github.com/projectbooth/booth-core/internal/directory"
 	"github.com/projectbooth/booth-core/internal/gateway"
 	"github.com/projectbooth/booth-core/internal/iframeidentity"
@@ -43,6 +44,11 @@ type Deps struct {
 	// headers on the iframe-proxy path. Wiring the mint side into Gateway.IframeIdentity is the
 	// caller's job (cmd/core), same as Deps.Gateway's other configuration.
 	IframeIdentity *iframeidentity.Service
+
+	// CredentialBroker serves POST /api/credentials (ADR 0080). Optional: nil leaves the route
+	// unregistered. Its router group trusts workload tokens the same way the gateway route does
+	// (see workloadTrustingOpts) — its callers are tasks/modules, not only people.
+	CredentialBroker *credentialbroker.Service
 }
 
 // NewRouter builds booth-core's full HTTP router.
@@ -104,17 +110,26 @@ func NewRouter(deps Deps) http.Handler {
 	// authenticated route above — install/uninstall in particular — keeps the single-issuer
 	// middleware and rejects them.
 	r.Group(func(r chi.Router) {
-		gatewayOpts := authOpts
-		if deps.Workload != nil {
-			gatewayOpts = append(append([]auth.Option{}, authOpts...), auth.WithWorkloadVerifier(deps.Workload))
-		}
-		r.Use(auth.Middleware(deps.Verifier, gatewayOpts...))
+		r.Use(auth.Middleware(deps.Verifier, workloadTrustingOpts(deps, authOpts)...))
 
 		r.Handle("/modules/{id}/*", deps.Gateway.Handler(
 			func(r *http.Request) string { return chi.URLParam(r, "id") },
 			func(r *http.Request) string { return "/" + chi.URLParam(r, "*") },
 		))
 	})
+
+	// The credential broker (ADR 0080) is the second place core trusts workload tokens, for the
+	// identical reason as the gateway route: its callers are "a task or module," per
+	// contracts/credential-broker.md, the same population that already carries workload tokens
+	// on the gateway path (ADR 0084's asked-for exception). Its own group, not folded into the
+	// gateway's: a different handler, but the same trust posture, so it shares the helper rather
+	// than the group.
+	if deps.CredentialBroker != nil {
+		r.Group(func(r chi.Router) {
+			r.Use(auth.Middleware(deps.Verifier, workloadTrustingOpts(deps, authOpts)...))
+			r.Post("/api/credentials", handleIssueCredential(deps.CredentialBroker))
+		})
+	}
 
 	// Iframe-proxy routes authenticate via the short-lived token / scoped cookie
 	// (ui-integration.md), not the main auth.Middleware — a plain iframe navigation
@@ -132,6 +147,17 @@ func NewRouter(deps Deps) http.Handler {
 	r.NotFound(deps.Gateway.IframeFallbackHandler(deps.IframeTokens).ServeHTTP)
 
 	return r
+}
+
+// workloadTrustingOpts extends authOpts with auth.WithWorkloadVerifier when workload identity is
+// configured — the option that lets a route accept core's own workload tokens (ADR 0059)
+// alongside the deployment's OIDC provider. Shared by every router group whose callers include
+// tasks/modules, not only people: today the gateway route and the credential broker (ADR 0084).
+func workloadTrustingOpts(deps Deps, authOpts []auth.Option) []auth.Option {
+	if deps.Workload == nil {
+		return authOpts
+	}
+	return append(append([]auth.Option{}, authOpts...), auth.WithWorkloadVerifier(deps.Workload))
 }
 
 func handleMe(w http.ResponseWriter, r *http.Request) {

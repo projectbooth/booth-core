@@ -347,6 +347,77 @@ jobs:
             sleep 3
           done
 
+      # ADR 0080: the credential broker's manifest-driven provisioning and auth rejection, on the
+      # real deployed chart. Like the workload-identity check above, this CI cluster's OIDC issuer
+      # is a placeholder — there's no real login flow to mint a real token against, so (exactly as
+      # for that check) a full successful 201 issuance isn't exercised here; that's covered by
+      # internal/api's own tests against a real verifier and a real httptest provider. What only a
+      # deployment can prove is the wiring: the provider-credential Secret is delivered solely to
+      # the module that declared providesCredentials, and the route genuinely rejects an
+      # unauthenticated/garbage caller rather than 404ing (which would mean the route never
+      # registered at all).
+      - name: Verify credential broker
+        run: |
+          set -eu
+          kubectl create namespace ci-lakestore
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: booth.projectbooth.io/v1alpha1
+          kind: BoothModule
+          metadata:
+            name: lakestore
+            namespace: ci-lakestore
+          spec:
+            id: lakestore
+            displayName: Lakestore
+            version: 0.1.0
+            contractVersion: 0.1.0
+            hasOwnUi: false
+            healthCheckPath: /health
+            serviceRef: {name: lakestore, port: 8080}
+            providesCredentials: {kinds: ["s3"]}
+          EOF
+
+          echo "Waiting for the provider credential..."
+          for i in $(seq 1 40); do
+            kubectl -n ci-lakestore get secret booth-credential-broker-provider-credentials >/dev/null 2>&1 && break
+            [ "$i" = 40 ] && { echo "provider credential Secret never appeared"; exit 1; }
+            sleep 3
+          done
+
+          # ci-default-ns/echo (from the earlier step) never declared the field: nothing for it.
+          if kubectl -n ci-default-ns get secret booth-credential-broker-provider-credentials >/dev/null 2>&1; then
+            echo "a module that never declared providesCredentials received a provider credential"; exit 1
+          fi
+
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: credential-broker-check, namespace: booth-system}
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: curl
+                    image: curlimages/curl:8.11.1
+                    command: ["sh", "-ec"]
+                    args:
+                      - |
+                        URL=http://booth-core.booth-system.svc.cluster.local:8080/api/credentials
+                        BODY='{"kind":"s3","access":"read","scope":{"backendId":"lake","path":"t1"}}'
+                        code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
+
+                        got=$(code -X POST "$URL" -H 'X-Workspace: acme' -d "$BODY")
+                        [ "$got" = 401 ] || { echo "no token: status $got, want 401"; exit 1; }
+                        got=$(code -X POST "$URL" -H 'Authorization: Bearer garbage' -H 'X-Workspace: acme' -d "$BODY")
+                        [ "$got" = 401 ] || { echo "garbage token: status $got, want 401"; exit 1; }
+                        echo "credential broker wiring verified"
+          EOF
+          kubectl -n booth-system wait --for=condition=complete job/credential-broker-check --timeout=120s || {
+            kubectl -n booth-system logs job/credential-broker-check || true; exit 1; }
+          kubectl -n booth-system logs job/credential-broker-check
+
       - name: Verify database provisioning
         run: |
           set -eu

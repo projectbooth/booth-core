@@ -64,6 +64,19 @@ iframeIdentity:
   # namespace, and must not change once a module is configured to trust it.
   issuerUrl: ""
 
+# Credential broker (ADR 0080): hands a task or module a short-lived native-protocol credential
+# (a scoped S3/Postgres credential) that can't go through the ordinary HTTP gateway path.
+# Deliberately separate from workloadIdentity above — see contracts/credential-broker.md. Always
+# on (POST /api/credentials, plus provisioning `booth-credential-broker-provider-credentials` for
+# any module declaring `providesCredentials`); nothing to toggle here.
+credentialBroker:
+  # Ceiling on ttlSeconds a caller may request, deliberately stricter than workloadIdentity's
+  # 10-minute token default — a raw native credential can't be revoked mid-flight the way a
+  # gateway-checked token can. A provider's own floor (e.g. MinIO's 15-minute minimum for an
+  # expiring service account) may still clamp a grant back up past this; that's the provider's
+  # documented capability limit, not a violation of this ceiling.
+  maxTTL: 5m
+
 # Iframe-proxy session signing key (ui-integration.md). Required for more than one
 # replica — see docs/decisions and internal/gateway/iframetoken.go's doc comment for why
 # a shared key (not a per-pod ephemeral one) matters once replicaCount > 1. Populate via

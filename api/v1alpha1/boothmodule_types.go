@@ -134,6 +134,18 @@ type BoothModuleSpec struct {
 	// and cannot mint anything.
 	// +optional
 	WorkloadIdentity *WorkloadIdentityRequirement `json:"workloadIdentity,omitempty"`
+
+	// ProvidesCredentials declares which native-protocol credential kind(s) (e.g. "s3",
+	// "postgres") this module provides through the credential broker (ADR 0080). Core provisions
+	// a broker-calling credential as the Secret `booth-credential-broker-provider-credentials`
+	// in the module's namespace, and routes an authorized `POST /api/credentials` request for a
+	// declared kind to this module. Omit it and the module never receives that Secret and is
+	// never routed to. A module that only ever *consumes* a credential (calls the broker as
+	// itself, or on behalf of a task holding a workload token) needs no manifest declaration at
+	// all — the broker's authorization is ordinary identity/workspace/role, the same as any
+	// other authenticated route.
+	// +optional
+	ProvidesCredentials *CredentialProviderSpec `json:"providesCredentials,omitempty"`
 }
 
 // WorkloadIdentityRequirement is the manifest-level signal that a module may mint workload
@@ -141,6 +153,18 @@ type BoothModuleSpec struct {
 type WorkloadIdentityRequirement struct {
 	// Mint requests a minting credential for this module.
 	Mint bool `json:"mint"`
+}
+
+// CredentialProviderSpec is the manifest-level signal that a module provides one or more
+// native-protocol credential kinds through the broker (ADR 0080).
+type CredentialProviderSpec struct {
+	// Kinds lists the credential kind(s) this module provides (e.g. "s3", "postgres"). At most
+	// one module may declare a given kind fleet-wide — core refuses to route a kind with more
+	// than one registered provider rather than guessing.
+	// +kubebuilder:validation:MinItems=1
+	// +listType=set
+	// +kubebuilder:validation:items:Pattern=`^[a-z][a-z0-9-]*$`
+	Kinds []string `json:"kinds"`
 }
 
 // DatabaseRequirement is the manifest-level signal that a module needs a database. It's a

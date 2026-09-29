@@ -14,6 +14,7 @@ import (
 	boothv1alpha1 "github.com/projectbooth/booth-core/api/v1alpha1"
 	"github.com/projectbooth/booth-core/internal/auth"
 	"github.com/projectbooth/booth-core/internal/config"
+	"github.com/projectbooth/booth-core/internal/credentialbroker"
 	"github.com/projectbooth/booth-core/internal/directory"
 	"github.com/projectbooth/booth-core/internal/gateway"
 	"github.com/projectbooth/booth-core/internal/registry"
@@ -34,6 +35,9 @@ type coreIssuer struct {
 
 	// now is the clock the workload service reads; tests move it to mint an already-old token.
 	now func() time.Time
+
+	credKeys  *credentialbroker.Keys
+	credAudit *credentialbroker.MemoryStore
 }
 
 func newCoreIssuer(t *testing.T) *coreIssuer {
@@ -56,11 +60,20 @@ func newCoreIssuer(t *testing.T) *coreIssuer {
 		Issuer: c.url, Audience: "c", GroupsClaim: "groups", Now: func() time.Time { return c.now() },
 	})
 	c.svc = svc
+
+	credKeys, err := credentialbroker.NewKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.credKeys = credKeys
+	c.credAudit = credentialbroker.NewMemoryStore()
+	credSvc := credentialbroker.NewService(credKeys, c.reg, c.credAudit, credentialbroker.Options{})
+
 	tokens := gateway.NewIframeTokenIssuer([]byte("s"))
 	srv.Config.Handler = NewRouter(Deps{
 		Verifier: idp.holder, Registry: c.reg, Gateway: gateway.New(c.reg),
 		IframeTokens: tokens, IframeURLs: gateway.NewIframeURLIssuer(tokens),
-		Directory: c.users, DirectoryRecorder: recorder, Workload: svc,
+		Directory: c.users, DirectoryRecorder: recorder, Workload: svc, CredentialBroker: credSvc,
 	})
 	srv.Start()
 	t.Cleanup(srv.Close)

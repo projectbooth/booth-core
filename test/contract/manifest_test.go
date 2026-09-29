@@ -147,3 +147,35 @@ workloadIdentity:
 		t.Errorf("a manifest that omits workloadIdentity parsed as declaring it: %+v", storage.WorkloadIdentity)
 	}
 }
+
+// The workloadIdentity field as documented in contracts/module-manifest.md (ADR 0080):
+// `{kinds: [...]}`, optional, and absent means the module provides nothing.
+func TestModuleManifest_ProvidesCredentialsField(t *testing.T) {
+	declared := `
+id: storage
+displayName: Storage
+version: 0.1.0
+contractVersion: 0.1.0
+hasOwnUi: false
+healthCheckPath: /health
+serviceRef: {name: storage, namespace: booth-storage, port: 8080}
+providesCredentials:
+  kinds: [s3]
+`
+	var spec boothv1alpha1.BoothModuleSpec
+	if err := yaml.Unmarshal([]byte(declared), &spec); err != nil {
+		t.Fatal(err)
+	}
+	if spec.ProvidesCredentials == nil || len(spec.ProvidesCredentials.Kinds) != 1 || spec.ProvidesCredentials.Kinds[0] != "s3" {
+		t.Fatalf("providesCredentials: {kinds: [s3]} not parsed: %+v", spec.ProvidesCredentials)
+	}
+
+	// Every existing example omits it, and must stay valid and non-providing.
+	var superset boothv1alpha1.BoothModuleSpec
+	if err := yaml.Unmarshal([]byte(supersetManifestExample), &superset); err != nil {
+		t.Fatal(err)
+	}
+	if superset.ProvidesCredentials != nil {
+		t.Errorf("a manifest that omits providesCredentials parsed as declaring it: %+v", superset.ProvidesCredentials)
+	}
+}

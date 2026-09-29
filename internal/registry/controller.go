@@ -49,11 +49,22 @@ type Controller struct {
 	// Workload, if set, provisions the minting credential of each module that declares
 	// workloadIdentity (ADR 0056). Nil means workload identity is off.
 	Workload WorkloadProvisioner
+
+	// CredentialBroker, if set, provisions the broker-calling credential of each module that
+	// declares providesCredentials (ADR 0080). Nil means the credential broker never delivers
+	// that Secret to any module — the broker route itself, on core's own side, is unaffected.
+	CredentialBroker CredentialBrokerProvisioner
 }
 
 // WorkloadProvisioner makes a module's workload-identity minting credential match its manifest.
 // Implemented by workload.ModuleProvisioner.
 type WorkloadProvisioner interface {
+	Ensure(ctx context.Context, mod *boothv1alpha1.BoothModule) error
+}
+
+// CredentialBrokerProvisioner makes a module's broker-calling credential match its manifest.
+// Implemented by credentialbroker.ModuleProvisioner.
+type CredentialBrokerProvisioner interface {
 	Ensure(ctx context.Context, mod *boothv1alpha1.BoothModule) error
 }
 
@@ -143,6 +154,11 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if c.Workload != nil {
 		if err := c.Workload.Ensure(ctx, &mod); err != nil {
 			provisionErrs = append(provisionErrs, fmt.Errorf("workload identity: %w", err))
+		}
+	}
+	if c.CredentialBroker != nil {
+		if err := c.CredentialBroker.Ensure(ctx, &mod); err != nil {
+			provisionErrs = append(provisionErrs, fmt.Errorf("credential broker: %w", err))
 		}
 	}
 	if err := errors.Join(provisionErrs...); err != nil {

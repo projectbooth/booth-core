@@ -31,6 +31,7 @@ internal/directory/     Minimal user directory: sub -> display claims (ADR 0047)
 internal/dbprov/        Shared PostgreSQL: per-module database + role provisioning (ADR 0053)
 internal/workload/      Workload identity: core as a second token issuer for unattended runs (ADR 0056)
 internal/iframeidentity/ Iframe-proxy identity assertion: core as a third token issuer, for the iframe-proxy path (ADR 0069)
+internal/credentialbroker/ Credential broker: routes an authorized request for a native-protocol credential (ADR 0080)
 internal/testpg/        Real PostgreSQL for tests (embedded, no Docker)
 internal/secrets/       Secret/ConfigMap provisioning (ADR 0020)
 internal/lifecycle/     Module install/uninstall via the Helm SDK (ADR 0003)
@@ -231,6 +232,26 @@ session cookie; and `IframeURLIssuer.URLFor` mints a relative `/iframe/<id>/...`
 built from `BOOTH_PUBLIC_BASE_URL`, which no chart value ever set (every real deployment's iframe
 URL pointed at `localhost:8080`). See `docs/decisions/0012`'s "Implementation notes".
 
+## Credential broker (2026-09-29)
+
+**ADR 0080.** For a raw native-protocol credential (a scoped S3 credential, a Postgres
+connection) that can't go through the gateway's HTTP path — deliberately kept apart from
+`platform_access`/`grant()`, since a checked gateway token can be revoked mid-flight and a raw
+credential handed to a process can't be. `POST /api/credentials` (always on) authorizes an
+already-resolved caller (human or workload token — the same `WithWorkloadVerifier` exception the
+gateway route already has, ADR 0059/ADR 0084) against `{kind, ttlSeconds, access, scope,
+options}`, routes to whichever module declares `providesCredentials: {kinds: [...]}` for that
+`kind`, and relays exactly what it mints — never inspecting the credential itself. `access`
+(`read`/`readwrite`) gates on role (editor/owner for write, ADR 0048's precedent); `ttlSeconds` is
+clamped to a 5-minute ceiling, deliberately stricter than a workload token's 10 minutes. Every
+issuance is recorded in a genuinely append-only, Postgres-backed audit trail
+(`booth_credential_issuances`) that structurally cannot hold a credential value. A provider is
+authenticated the same derived-credential way workload minting already works
+(`booth-credential-broker-provider-credentials`), calling a fixed `POST /internal/credentials` on
+its own `BaseURL()`. See `docs/decisions/0014` for the full design, including the ADR 0084 ruling
+on non-person identity for unattended renewal (not needed — the existing `owner` field already
+supports naming any current workspace owner).
+
 ## What's built vs. what's left, against the v0 definition of done
 
 Built and tested (unit/contract tests in-repo; the CRD reconcile loop additionally
@@ -249,6 +270,7 @@ verified against a real API server via `test/integration/`):
 - Bundled Postgres node pinning (ADR 0083): survives a reschedule on a multi-node cluster.
 - Workload identity (ADR 0056): minting endpoint, signing key + JWKS, per-module minting credentials.
 - Iframe-proxy identity assertion (ADR 0069): a third issuer, signed `X-Booth-Identity` on every iframe-proxied request.
+- Credential broker (ADR 0080): authorized routing to a native-protocol credential provider, append-only audit trail.
 - Secrets/ConfigMap provisioning primitive (ADR 0020).
 - Module install/uninstall via the Helm SDK, admin-role-gated (scoped per decision 0005).
 - Helm chart: bundles NATS (subchart), the CRD, RBAC, the core Deployment/Service.

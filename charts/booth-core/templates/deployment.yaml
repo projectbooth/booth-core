@@ -51,6 +51,10 @@ spec:
             - name: BOOTH_IFRAME_IDENTITY_ISSUER_URL
               value: {{ .Values.iframeIdentity.issuerUrl | default (printf "http://%s.%s.svc.cluster.local:%v/iframe-identity" (include "booth-core.fullname" .) .Release.Namespace .Values.service.port) | quote }}
             {{- end }}
+            # ADR 0080: the credential broker itself is always on (POST /api/credentials); this
+            # only sets its one policy knob.
+            - name: BOOTH_CREDENTIAL_BROKER_MAX_TTL
+              value: {{ .Values.credentialBroker.maxTTL | quote }}
             {{- if .Values.nats.enabled }}
             - name: BOOTH_NATS_URL
               value: "nats://{{ .Release.Name }}-nats:4222"
