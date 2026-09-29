@@ -431,7 +431,7 @@ jobs:
 
           echo "Waiting for core to provision its own database..."
           for i in $(seq 1 80); do
-            if kubectl -n booth-system logs deployment/booth-core | grep -q "user directory is now persistent"; then
+            if kubectl -n booth-system logs deployment/booth-core | grep -q "are now persistent"; then
               echo "core database provisioned; the user directory is persistent"; break
             fi
             [ "$i" = 80 ] && { echo "core never provisioned its database"; exit 1; }
