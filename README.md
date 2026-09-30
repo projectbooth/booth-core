@@ -252,6 +252,24 @@ its own `BaseURL()`. See `docs/decisions/0014` for the full design, including th
 on non-person identity for unattended renewal (not needed — the existing `owner` field already
 supports naming any current workspace owner).
 
+## Platform-operator claim (2026-09-30)
+
+**ADR 0094, amending ADR 0025.** A second, workspace-independent claim shape: the literal string
+`/platform/operator` in a token's `groups` claim marks the caller as a platform operator —
+cross-tenant admin views (`booth-logging`'s log viewer, `booth-lakehouse`'s and `booth-database`'s
+admin views) aren't a per-workspace concern, and this replaces the per-module operator-allowlist
+stopgap (ADR 0067) three modules had independently reinvented. **No code changed here** — every
+module already re-verifies its own token and reads `groups` directly (ADR 0041); checking for this
+one extra literal string is the same mechanism, not a new one, and doesn't go through
+`X-Booth-Role` (workspace-scoped by construction) or any new endpoint. Documented in
+`contracts/core-platform-api.md`. The local-dev Keycloak realm
+(`booth-architecture/local-dev/keycloak/realm-export.json`) gained a `platform` → `operator` group,
+granted to `alice` (this realm's bootstrap admin — there's no separate literal "admin" user in the
+`booth-local` realm; Keycloak's own `admin`/`admin` is the master-realm console login, a different
+realm entirely) so a fresh install can exercise an operator-gated view with no extra IdP setup —
+verified against a real running Keycloak container that an issued token for `alice` genuinely
+carries `/platform/operator` alongside her workspace role, and that `bob` (never granted it) doesn't.
+
 ## What's built vs. what's left, against the v0 definition of done
 
 Built and tested (unit/contract tests in-repo; the CRD reconcile loop additionally
