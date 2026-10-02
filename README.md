@@ -32,6 +32,9 @@ internal/dbprov/        Shared PostgreSQL: per-module database + role provisioni
 internal/workload/      Workload identity: core as a second token issuer for unattended runs (ADR 0056)
 internal/iframeidentity/ Iframe-proxy identity assertion: core as a third token issuer, for the iframe-proxy path (ADR 0069)
 internal/credentialbroker/ Credential broker: routes an authorized request for a native-protocol credential (ADR 0080)
+internal/sidecar/       Credential sidecar's shared core: broker client, renewal loop, postgres proxy, s3 file writer (ADR 0095)
+internal/sidecar/pgwire/ Just enough Postgres wire protocol (incl. a real SCRAM-SHA-256 client) for the sidecar's proxy mode
+cmd/credential-sidecar/ The credential sidecar binary + its own Dockerfile (ghcr.io/projectbooth/credential-sidecar, ADR 0095)
 internal/testpg/        Real PostgreSQL for tests (embedded, no Docker)
 internal/secrets/       Secret/ConfigMap provisioning (ADR 0020)
 internal/lifecycle/     Module install/uninstall via the Helm SDK (ADR 0003)
@@ -270,6 +273,30 @@ realm entirely) so a fresh install can exercise an operator-gated view with no e
 verified against a real running Keycloak container that an issued token for `alice` genuinely
 carries `/platform/operator` alongside her workspace role, and that `bob` (never granted it) doesn't.
 
+## Credential sidecar (2026-10-01)
+
+**ADR 0095, `contracts/credential-sidecar.md`.** A new build target, `cmd/credential-sidecar`,
+published as `ghcr.io/projectbooth/credential-sidecar` — a small, statically-built binary a
+consuming module's own chart (`booth-notebooks`, `booth-pipeline`) adds as a sidecar container so
+native database/lakehouse access needs no credential-broker-aware code in the main container at
+all. Two modes off one shared renewal core (`internal/sidecar`), selected by `--kind`:
+
+- **`postgres`**: a stateful TCP proxy that terminates a client's connection by trust (the pod's own
+  network namespace is the boundary) and separately authenticates upstream with the broker-issued
+  credential — including real SCRAM-SHA-256 (`internal/sidecar/pgwire`), since core's own bundled
+  Postgres already requires it. `DATABASE_URL=postgresql://localhost:5432/<db>`, no password, just
+  works. Verified against a real embedded PostgreSQL server (`internal/testpg`), not a stand-in.
+- **`s3`**: refreshes a standard AWS shared-credentials file via atomic temp-file-then-rename —
+  every mainstream S3 SDK already knows how to read one.
+
+Both renew before the lease's real `expiresAt` (never the requested `ttlSeconds` — a provider's own
+floor, e.g. MinIO's, may clamp the actual grant longer). A renewal failure — of any kind, including
+an outright refusal — is logged and retried next interval, never drops an already-open connection or
+exits the process; only a config error (bad scope/kind/role) at the very first lease attempt is
+fatal. See `docs/decisions/0015` for the full reasoning, including the two provider response shapes
+(`postgres`/`s3`-kind credentials) this binary documents and needs `booth-storage`/`booth-database`
+to actually return.
+
 ## What's built vs. what's left, against the v0 definition of done
 
 Built and tested (unit/contract tests in-repo; the CRD reconcile loop additionally
@@ -289,6 +316,7 @@ verified against a real API server via `test/integration/`):
 - Workload identity (ADR 0056): minting endpoint, signing key + JWKS, per-module minting credentials.
 - Iframe-proxy identity assertion (ADR 0069): a third issuer, signed `X-Booth-Identity` on every iframe-proxied request.
 - Credential broker (ADR 0080): authorized routing to a native-protocol credential provider, append-only audit trail.
+- Credential sidecar (ADR 0095): `ghcr.io/projectbooth/credential-sidecar`, postgres/s3 renewal-and-proxy modes.
 - Secrets/ConfigMap provisioning primitive (ADR 0020).
 - Module install/uninstall via the Helm SDK, admin-role-gated (scoped per decision 0005).
 - Helm chart: bundles NATS (subchart), the CRD, RBAC, the core Deployment/Service.
