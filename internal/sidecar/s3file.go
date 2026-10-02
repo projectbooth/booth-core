@@ -1,7 +1,6 @@
 package sidecar
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -55,7 +54,7 @@ func NewS3FileWriter(path, profile string) *S3FileWriter {
 // until one succeeds or the lease expires."
 func (w *S3FileWriter) OnRenew(resp credentialbroker.Response) {
 	var cred S3Credential
-	if err := json.Unmarshal(resp.Credential, &cred); err != nil {
+	if err := decodeStrict(resp.Credential, &cred); err != nil {
 		log.Printf("sidecar: s3 credential from lease %s is unparseable, keeping the previous file: %v", resp.LeaseID, err)
 		return
 	}

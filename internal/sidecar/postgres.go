@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -18,16 +17,15 @@ import (
 	"github.com/projectbooth/booth-core/internal/sidecar/pgwire"
 )
 
-// PostgresCredential is the expected shape of a postgres-kind broker response's Credential field
-// — not fixed by contracts/credential-broker.md (kind-specific, opaque to the broker itself), so
-// this is this sidecar's own documented expectation of what a postgres-kind provider (booth-
-// database) returns. See docs/decisions/0015 for the reasoning and the flag-back to
-// booth-database's own brief.
+// PostgresCredential is the shape of a postgres-kind broker response's Credential field — not
+// fixed by contracts/credential-broker.md (kind-specific, opaque to the broker itself), but
+// matching booth-database's actual provider exactly, field for field
+// (booth-database/internal/credentialbroker/provider.go's pgCredential — see docs/decisions/0015).
 type PostgresCredential struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
 	Database string `json:"database"`
-	User     string `json:"user"`
+	User     string `json:"username"`
 	Password string `json:"password"`
 	// SSLMode is advisory only in v0 — the proxy always speaks plaintext to upstream (matching
 	// core's own bundled-Postgres connections, which run sslmode=disable); see docs/decisions/
@@ -64,7 +62,7 @@ func NewPostgresProxy(renewer *Renewer) *PostgresProxy {
 
 func (p *PostgresProxy) setCredential(resp credentialbroker.Response) {
 	var cred PostgresCredential
-	if err := json.Unmarshal(resp.Credential, &cred); err != nil {
+	if err := decodeStrict(resp.Credential, &cred); err != nil {
 		log.Printf("sidecar: postgres credential from lease %s is unparseable, keeping the previous one: %v", resp.LeaseID, err)
 		return
 	}

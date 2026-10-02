@@ -31,10 +31,9 @@ no exception for a refusal specifically. Those two framings only agree if the re
 
 ## 2. Provider response shapes this binary needs but the broker contract doesn't fix
 
-`contracts/credential-broker.md` deliberately leaves `scope`/`credential` opaque per kind. Since
-neither `booth-storage` nor `booth-database` exist yet in this fleet to define their real response
-shapes, this binary documents (`PostgresCredential`, `S3Credential` — `internal/sidecar/postgres.go`,
-`s3file.go`) the shape it expects and needs those two modules to actually return:
+`contracts/credential-broker.md` deliberately leaves `scope`/`credential` opaque per kind. This
+binary documents (`PostgresCredential`, `S3Credential` — `internal/sidecar/postgres.go`,
+`s3file.go`) the shape it expects, matching each provider module's own real response exactly:
 
 - **`s3`**: `{accessKeyId, secretAccessKey, sessionToken?}` — not invented here; this matches
   exactly what `booth-storage`'s own provider-side design already settled on (cross-referenced via
@@ -42,10 +41,17 @@ shapes, this binary documents (`PostgresCredential`, `S3Credential` — `interna
   must be omitted entirely, not sent empty, for the bare-2-tuple shape Lakekeeper's static-key
   credential needs — the credentials file writer already reflects that (no empty
   `aws_session_token` line).
-- **`postgres`**: `{host, port, database, user, password, sslMode?}` — genuinely new, since no
-  provider-side design for `postgres`-kind credentials exists anywhere yet. This is this binary's
-  own proposal, flagged back for `booth-database`'s brief to confirm or amend before its own first
-  build pass.
+- **`postgres`**: `{host, port, database, username, password, sslMode?}` — also not invented here.
+  `booth-database` already shipped a real `postgres`-kind provider in its first pass
+  (`booth-database@b84fc3b`, `internal/credentialbroker/provider.go`'s `pgCredential`), well before
+  this ADR — it's that module's only access path (`credentialBroker.enabled: true` by default, not
+  optional), and it has its own tests (`internal/credentialbroker/provider_test.go`). An earlier
+  draft of this document wrongly claimed no such design existed yet and used a `user` field instead
+  of `pgCredential`'s actual `username`; `PostgresCredential.User`'s tag was briefly `json:"user"` as
+  a result, which decoded silently as an empty string against the real provider (caught before this
+  shipped to any consumer, fixed by matching `pgCredential` field-for-field and switching to a
+  strict decoder — `decodeStrict` in `internal/sidecar/broker.go` — so an unknown or renamed field
+  errors instead of silently zeroing).
 
 ## 3. The `postgres` proxy speaks real wire protocol on both sides, including real SCRAM-SHA-256
 
@@ -107,9 +113,6 @@ ever needs to be re-injected mid-stream.
 
 ## Flagged back to booth-architecture / booth-database
 
-- `booth-database`'s brief: confirm or amend the `postgres`-kind credential response shape this
-  binary expects (§2 above) before its own first build pass, the same way `booth-storage`'s
-  provider-side design was settled ahead of the broker landing.
 - `contracts/credential-sidecar.md` could usefully name the exact renewal-failure timing rule (§1)
   explicitly, since its own wording and the task's framing only agree once read together — worth
   stating outright rather than leaving it to be re-derived.

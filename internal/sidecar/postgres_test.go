@@ -263,3 +263,61 @@ func TestPostgresProxy_HealthzOnTheSameListener(t *testing.T) {
 		t.Errorf("after a lease: status = %d, want 200", got)
 	}
 }
+
+// --- Regression: decodes booth-database's real provider response, not this package's own guess. --
+//
+// booth-database shipped a real postgres-kind provider before ADR 0095 existed
+// (booth-database@b84fc3b, internal/credentialbroker/provider.go's pgCredential) — it's that
+// module's only access path (credentialBroker.enabled: true by default), not a hypothetical.
+// This test's JSON is hand-copied from that struct's own field list and tags
+// (host/port/database/username/password/sslMode) rather than re-derived from this package's own
+// PostgresCredential, specifically so a future rename on either side shows up here instead of
+// passing because both sides happened to agree with the same wrong assumption — which is exactly
+// how `user` vs. `username` got through undetected the first time: every test's fixture was shaped
+// to match this package's own (wrong) guess, never booth-database's actual response.
+func TestPostgresCredential_DecodesBoothDatabasesRealResponseShape(t *testing.T) {
+	// Field-for-field from booth-database/internal/credentialbroker/provider.go's pgCredential,
+	// with the example host from that repo's own provider_test.go.
+	raw := []byte(`{
+		"host": "booth-database-postgres.booth-database.svc",
+		"port": 5432,
+		"database": "bdb_ws_0123456789abcdef01234567",
+		"username": "bdb_role_0123456789abcdef01234567",
+		"password": "s3cr3t-lease-password",
+		"sslMode": "disable"
+	}`)
+
+	var cred PostgresCredential
+	if err := decodeStrict(raw, &cred); err != nil {
+		t.Fatalf("decoding booth-database's real response shape: %v", err)
+	}
+	if cred.Host != "booth-database-postgres.booth-database.svc" {
+		t.Errorf("Host = %q", cred.Host)
+	}
+	if cred.Port != 5432 {
+		t.Errorf("Port = %d", cred.Port)
+	}
+	if cred.Database != "bdb_ws_0123456789abcdef01234567" {
+		t.Errorf("Database = %q", cred.Database)
+	}
+	if cred.User != "bdb_role_0123456789abcdef01234567" {
+		t.Errorf("User = %q, want the decoded \"username\" field (this is exactly the field that silently came back empty before)", cred.User)
+	}
+	if cred.Password != "s3cr3t-lease-password" {
+		t.Errorf("Password = %q", cred.Password)
+	}
+	if cred.SSLMode != "disable" {
+		t.Errorf("SSLMode = %q", cred.SSLMode)
+	}
+}
+
+// A response carrying a field this package's PostgresCredential doesn't recognize (e.g. a renamed
+// or added field on booth-database's side) must fail loudly, not silently decode with a zeroed
+// field — the whole reason setCredential now uses decodeStrict instead of json.Unmarshal.
+func TestPostgresCredential_UnknownFieldErrorsRatherThanSilentlyZeroing(t *testing.T) {
+	raw := []byte(`{"host":"h","port":1,"database":"d","user":"u-not-username","password":"p","sslMode":"disable"}`)
+	var cred PostgresCredential
+	if err := decodeStrict(raw, &cred); err == nil {
+		t.Fatalf("decoded %+v from a field name (\"user\") this struct doesn't have — want a decode error, not a silently empty User", cred)
+	}
+}

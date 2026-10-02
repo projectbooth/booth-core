@@ -21,6 +21,22 @@ import (
 	"github.com/projectbooth/booth-core/internal/credentialbroker"
 )
 
+// decodeStrict decodes raw into v, refusing any field raw has that v doesn't. A provider's
+// Credential response has no shared schema with the broker itself (contracts/credential-
+// broker.md's scope/credential are opaque per kind) — this package's own PostgresCredential/
+// S3Credential are this sidecar's documented, hand-matched expectation of what a real provider
+// actually returns. A plain json.Unmarshal would silently leave a renamed or missing field at its
+// zero value rather than erroring — exactly the failure mode that let a one-field mismatch
+// (`username` vs. this package's earlier, wrong `user`) pass every test here undetected, because
+// every test's own fixture was shaped to match the wrong assumption instead of the real provider's
+// actual response. Decoding strictly turns the next such drift into a loud, immediate error
+// instead of a silently empty credential field.
+func decodeStrict(raw json.RawMessage, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
+
 // TokenSource returns the bearer token to present to the broker, read fresh on every call so an
 // externally-rotated token (e.g. a human session token refreshed by the browser) is always
 // picked up — the sidecar never caches or owns the pod's identity itself (contracts/
