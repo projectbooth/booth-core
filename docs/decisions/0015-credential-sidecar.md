@@ -47,9 +47,15 @@ binary documents (`PostgresCredential`, `S3Credential` — `internal/sidecar/pos
   provider's response (which always sends all of these) would have failed to decode at all in
   production. Fixed by extending `S3Credential` to declare the full field set and having
   `S3FileWriter` also write a second, standard AWS shared *config* file (`<--credentials-file>
-  .config`: `endpoint_url`/`region` in a profile section) alongside the existing credentials file,
-  atomically, on the same renewal loop — present only when the lease carries a non-empty `endpoint`
-  (a self-hosted backend; omitted entirely for real AWS S3, which has none). `bucket`/`keyPrefix`/
+  .config`: `endpoint_url`/`region`/`addressing_style` in a profile section) alongside the existing
+  credentials file, atomically, on the same renewal loop — present only when the lease carries a
+  non-empty `endpoint` (a self-hosted backend; omitted entirely for real AWS S3, which has none).
+  `addressing_style` was added by ADR 0095's fourth amendment (2026-10-05, after `booth-notebooks`
+  measured the re-published sidecar against a real MinIO and found DuckDB needs path-style
+  addressing that it doesn't read from anywhere else): written unconditionally as `path` for every
+  self-hosted lease, gated on the same `endpoint` presence as `endpoint_url`/`region` — not on the
+  response's own `pathStyle` field, which reflects `booth-storage`'s separate internal
+  bucket-addressing choice, not what a consuming engine's config file needs. `bucket`/`keyPrefix`/
   `pathStyle` are decoded but not written anywhere by this mode; a consuming engine's own
   bucket/path is resolved separately via `booth-lakehouse`'s `GET /api/warehouse`.
 - **`postgres`**: `{host, port, database, username, password, sslMode?}` — also not invented here.

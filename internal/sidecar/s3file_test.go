@@ -192,7 +192,7 @@ func TestS3FileWriter_WritesACompanionConfigFileWhenTheLeaseHasAnEndpoint(t *tes
 		t.Fatalf("reading companion config file: %v", err)
 	}
 	s := string(got)
-	for _, want := range []string{"[default]", "endpoint_url = https://booth-storage-minio.booth-storage.svc:9000", "region = us-east-1"} {
+	for _, want := range []string{"[default]", "endpoint_url = https://booth-storage-minio.booth-storage.svc:9000", "region = us-east-1", "addressing_style = path"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("config file missing %q; got:\n%s", want, s)
 		}
@@ -214,6 +214,28 @@ func TestS3FileWriter_ConfigFileUsesProfilePrefixForANonDefaultProfile(t *testin
 	}
 	if !strings.Contains(string(got), "[profile lakehouse]") {
 		t.Errorf("config file section missing AWS's required \"profile \" prefix for a non-default profile: %s", got)
+	}
+}
+
+// ADR 0095's fourth amendment (2026-10-05): booth-notebooks measured the sidecar against a real
+// MinIO and found DuckDB needs path-style addressing, which botocore's own addressing_style key
+// communicates — not conditioned on cred.PathStyle (see writeConfig's doc comment), gated on the
+// same cred.Endpoint presence as endpoint_url/region.
+func TestS3FileWriter_ConfigFileSetsAddressingStylePathForASelfHostedBackend(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "aws-credentials")
+	w := NewS3FileWriter(path, "")
+	w.OnRenew(credentialbroker.Response{
+		LeaseID: "lease-1", ExpiresAt: time.Now().Add(time.Minute),
+		Credential: mustJSON(t, S3Credential{AccessKeyID: "a", SecretAccessKey: "b", Endpoint: "https://minio:9000", PathStyle: false}),
+	})
+
+	got, err := os.ReadFile(path + ".config")
+	if err != nil {
+		t.Fatalf("reading companion config file: %v", err)
+	}
+	if !strings.Contains(string(got), "addressing_style = path") {
+		t.Errorf("config file missing addressing_style = path; got:\n%s", got)
 	}
 }
 

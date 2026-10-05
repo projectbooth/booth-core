@@ -120,6 +120,14 @@ func (w *S3FileWriter) writeConfig(cred S3Credential) error {
 	if cred.Region != "" {
 		body += fmt.Sprintf("region = %s\n", cred.Region)
 	}
+	// addressing_style is botocore's own existing key (ADR 0095's fourth amendment,
+	// 2026-10-05): DuckDB's S3 client needs path-style addressing against a self-hosted
+	// backend (measured against a real MinIO by booth-notebooks) and doesn't read it from
+	// anywhere else. Written unconditionally to "path" for every self-hosted lease — gated on
+	// the same cred.Endpoint presence as endpoint_url/region above, not on cred.PathStyle
+	// (which reflects booth-storage's own bucket-addressing choice, a separate question from
+	// what this config file needs to hand a consuming engine).
+	body += "addressing_style = path\n"
 	return atomicWriteFile(path, []byte(body), 0o600)
 }
 
