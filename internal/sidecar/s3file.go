@@ -11,22 +11,30 @@ import (
 
 // S3Credential is the expected shape of an s3-kind broker response's Credential field — not fixed
 // by contracts/credential-broker.md (kind-specific, opaque to the broker), but matching exactly
-// what booth-storage's own provider-side design already settled on (booth-storage's docs/
-// decisions/0006, cross-referenced from booth-core's docs/decisions/0014): `accessKeyId`,
-// `secretAccessKey`, and an optional `sessionToken` — omitted entirely, not sent empty, when the
-// request asked for the bare-2-tuple shape Lakekeeper's static-key credential needs.
-//
-// Endpoint/bucket/keyPrefix/region/pathStyle (also part of that same provider response, for a
-// caller that needs to construct its own client against a non-AWS-default endpoint) are NOT
-// written anywhere by this mode — the credentials file format has no field for them, and ADR 0095
-// only asks this binary to make the credential/connection-string layer invisible, not to configure
-// an engine's endpoint. A consuming chart that needs those sets them itself (e.g. as ordinary env
-// vars the chart already knows, since it's the one that declared the broker scope in the first
-// place).
+// what booth-storage's own provider actually returns (`internal/credentialbroker/provider.go`'s
+// `s3CredentialBody`, booth-storage's docs/decisions/0006, cross-referenced from booth-core's
+// docs/decisions/0014/0015): `accessKeyId`, `secretAccessKey`, an optional `sessionToken` —
+// omitted entirely, not sent empty, when the request asked for the bare-2-tuple shape Lakekeeper's
+// static-key credential needs — plus the resolved real-world location fields (ADR 0095's third
+// amendment, 2026-10-05) this struct must also declare even though not every field is written to
+// disk: decodeStrict (internal/sidecar/broker.go) refuses any field the real provider sends that
+// this struct doesn't know about, so Bucket/KeyPrefix/PathStyle are declared here for that reason
+// alone, not because S3FileWriter writes them anywhere.
 type S3Credential struct {
 	AccessKeyID     string `json:"accessKeyId"`
 	SecretAccessKey string `json:"secretAccessKey"`
 	SessionToken    string `json:"sessionToken,omitempty"`
+
+	// Endpoint and Region are written to the shared config file (write, below) when Endpoint is
+	// non-empty (a self-hosted backend, e.g. MinIO) — omitted entirely for real AWS S3, which has
+	// no endpoint to set. Bucket/KeyPrefix/PathStyle are decoded but not written anywhere by this
+	// mode: a consuming engine's own bucket/path (PyIceberg's warehouse location) is resolved
+	// separately, via booth-lakehouse's GET /api/warehouse, not from this file.
+	Endpoint  string `json:"endpoint"`
+	Region    string `json:"region,omitempty"`
+	Bucket    string `json:"bucket"`
+	KeyPrefix string `json:"keyPrefix,omitempty"`
+	PathStyle bool   `json:"pathStyle"`
 }
 
 // S3FileWriter is the `--kind=s3` mode: on every lease (the first one, and every renewal), writes
@@ -71,7 +79,48 @@ func (w *S3FileWriter) write(cred S3Credential) error {
 	if cred.SessionToken != "" {
 		body += fmt.Sprintf("aws_session_token = %s\n", cred.SessionToken)
 	}
-	return atomicWriteFile(w.Path, []byte(body), 0o600)
+	if err := atomicWriteFile(w.Path, []byte(body), 0o600); err != nil {
+		return err
+	}
+	return w.writeConfig(cred)
+}
+
+// configPath is the base --credentials-file path's companion AWS shared-config file (ADR 0095's
+// third amendment, 2026-10-05, contracts/credential-sidecar.md's `--credentials-file` row): a
+// standard AWS shared-credentials-file and a standard AWS shared-config-file are deliberately kept
+// as two separate files, matching AWS's own convention (endpoint/region never live in the
+// credentials file) — not a booth-core invention.
+func (w *S3FileWriter) configPath() string {
+	return w.Path + ".config"
+}
+
+// writeConfig writes (or, for a lease with no endpoint, removes) the companion config file. Real
+// AWS S3 has no endpoint to set, so that case omits the file entirely rather than writing one with
+// an empty endpoint_url — including removing a previous self-hosted backend's leftover config if
+// this writer's backend ever changes kind across a renewal.
+func (w *S3FileWriter) writeConfig(cred S3Credential) error {
+	path := w.configPath()
+	if cred.Endpoint == "" {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing stale config file %s: %w", path, err)
+		}
+		return nil
+	}
+
+	// AWS's shared config file (unlike the credentials file) names a non-default profile's
+	// section "[profile <name>]", not "[<name>]" — botocore and every mainstream SDK require this
+	// exact distinction to actually find the section.
+	section := w.Profile
+	if section != "default" {
+		section = "profile " + section
+	}
+	var body string
+	body += fmt.Sprintf("[%s]\n", section)
+	body += fmt.Sprintf("endpoint_url = %s\n", cred.Endpoint)
+	if cred.Region != "" {
+		body += fmt.Sprintf("region = %s\n", cred.Region)
+	}
+	return atomicWriteFile(path, []byte(body), 0o600)
 }
 
 // atomicWriteFile writes data to a temp file in the same directory as path, then renames it over

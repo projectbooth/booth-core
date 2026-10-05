@@ -35,12 +35,23 @@ no exception for a refusal specifically. Those two framings only agree if the re
 binary documents (`PostgresCredential`, `S3Credential` — `internal/sidecar/postgres.go`,
 `s3file.go`) the shape it expects, matching each provider module's own real response exactly:
 
-- **`s3`**: `{accessKeyId, secretAccessKey, sessionToken?}` — not invented here; this matches
-  exactly what `booth-storage`'s own provider-side design already settled on (cross-referenced via
-  `docs/decisions/0014`, itself citing `booth-storage`'s `docs/decisions/0006`). `sessionToken`
+- **`s3`**: `{accessKeyId, secretAccessKey, sessionToken?, endpoint, region?, bucket, keyPrefix?,
+  pathStyle}` — not invented here; this matches exactly what `booth-storage`'s own provider
+  actually returns (`internal/credentialbroker/provider.go`'s `s3CredentialBody`, cross-referenced
+  via `docs/decisions/0014`, itself citing `booth-storage`'s `docs/decisions/0006`). `sessionToken`
   must be omitted entirely, not sent empty, for the bare-2-tuple shape Lakekeeper's static-key
   credential needs — the credentials file writer already reflects that (no empty
-  `aws_session_token` line).
+  `aws_session_token` line). ADR 0095's third amendment (2026-10-05) caught that `S3Credential`
+  declared only the three key fields, dropping `endpoint`/`region`/`bucket`/`keyPrefix`/`pathStyle`
+  before anything was written to disk — and, since `OnRenew` already used `decodeStrict`, the real
+  provider's response (which always sends all of these) would have failed to decode at all in
+  production. Fixed by extending `S3Credential` to declare the full field set and having
+  `S3FileWriter` also write a second, standard AWS shared *config* file (`<--credentials-file>
+  .config`: `endpoint_url`/`region` in a profile section) alongside the existing credentials file,
+  atomically, on the same renewal loop — present only when the lease carries a non-empty `endpoint`
+  (a self-hosted backend; omitted entirely for real AWS S3, which has none). `bucket`/`keyPrefix`/
+  `pathStyle` are decoded but not written anywhere by this mode; a consuming engine's own
+  bucket/path is resolved separately via `booth-lakehouse`'s `GET /api/warehouse`.
 - **`postgres`**: `{host, port, database, username, password, sslMode?}` — also not invented here.
   `booth-database` already shipped a real `postgres`-kind provider in its first pass
   (`booth-database@b84fc3b`, `internal/credentialbroker/provider.go`'s `pgCredential`), well before
