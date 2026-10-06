@@ -595,7 +595,15 @@ jobs:
               spec:
                 containers:
                   - name: minio
-                    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+                    # ghcr.io/projectbooth/minio-test (ADR 0087/0091, built from source, digest-pinned):
+                    # quay.io/minio/minio now refuses every anonymous pull (401, zero grants on the
+                    # anonymous token, not a rate limit) — confirmed against the registry directly, and
+                    # the cause of every "Verify backup to object storage (S3)" failure since 2026-09-25.
+                    # Same image booth-e2e/booth-lakehouse/booth-storage already use for exactly this
+                    # reason (ADR 0087's "not two independently-chosen mirrors" — this step had silently
+                    # become the third).
+                    image: ghcr.io/projectbooth/minio-test@sha256:04c918e8877a410f40ccab0842f724177af453f236a5fda96df219867aefe3c3
+                    imagePullPolicy: IfNotPresent
                     args: ["server", "/data"]
                     env:
                       - {name: MINIO_ROOT_USER, value: ci-access-key}
@@ -683,6 +691,13 @@ jobs:
           kubectl -n ci-superset logs job/db-check --tail=50 || true
           kubectl -n booth-system logs job/backup-now --tail=40 || true
           kubectl -n booth-system logs job/backup-verify --tail=60 || true
+          kubectl -n booth-system logs job/make-bucket --tail=40 || true
           kubectl -n booth-system logs job/s3-backup-now --all-containers --tail=40 || true
           kubectl -n booth-system logs job/list-bucket --tail=40 || true
           kubectl -n booth-system get pods,jobs
+          # ci-minio was never dumped here before (a real gap: the "Verify backup to object storage
+          # (S3)" step's very first wait is on this namespace's own minio rollout, and a failure there
+          # left no diagnostic trail at all — found while root-causing the 2026-09-25 quay.io outage).
+          kubectl -n ci-minio get all || true
+          kubectl -n ci-minio describe pods || true
+          kubectl -n ci-minio logs deployment/minio --tail=100 || true
