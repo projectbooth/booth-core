@@ -52,12 +52,19 @@ binary documents (`PostgresCredential`, `S3Credential` — `internal/sidecar/pos
   non-empty `endpoint` (a self-hosted backend; omitted entirely for real AWS S3, which has none).
   `addressing_style` was added by ADR 0095's fourth amendment (2026-10-05, after `booth-notebooks`
   measured the re-published sidecar against a real MinIO and found DuckDB needs path-style
-  addressing that it doesn't read from anywhere else): written unconditionally as `path` for every
-  self-hosted lease, gated on the same `endpoint` presence as `endpoint_url`/`region` — not on the
-  response's own `pathStyle` field, which reflects `booth-storage`'s separate internal
-  bucket-addressing choice, not what a consuming engine's config file needs. `bucket`/`keyPrefix`/
-  `pathStyle` are decoded but not written anywhere by this mode; a consuming engine's own
-  bucket/path is resolved separately via `booth-lakehouse`'s `GET /api/warehouse`.
+  addressing that it doesn't read from anywhere else) and **corrected twice since, by the sixth
+  amendment (2026-10-06)**: the fourth amendment's spec was wrong in two ways, both found by
+  `booth-pipeline`'s integration test and verified against real botocore 1.43 (confirmed again here
+  directly against `botocore.configloader.raw_config_parse`/`load_config`, not just taken on
+  report) rather than this repo's own guess. First, a top-level `addressing_style` key in the
+  profile section is silently ignored by botocore — it must be nested under an `s3 =` key, with the
+  value on its own indented line. Second, the value must be derived from the response's own
+  `pathStyle` field (`path` when true, `virtual` when false), not hardcoded to `path` for every
+  self-hosted lease: `pathStyle` is `booth-storage`'s own declaration of how that specific backend
+  must be addressed (`internal/backend/s3/s3.go`'s "forces path-style addressing"), not a separate,
+  ignorable question as the fourth amendment assumed. `bucket`/`keyPrefix` are decoded but not
+  written anywhere by this mode; a consuming engine's own bucket/path is resolved separately via
+  `booth-lakehouse`'s `GET /api/warehouse`.
 - **`postgres`**: `{host, port, database, username, password, sslMode?}` — also not invented here.
   `booth-database` already shipped a real `postgres`-kind provider in its first pass
   (`booth-database@b84fc3b`, `internal/credentialbroker/provider.go`'s `pgCredential`), well before
@@ -101,6 +108,46 @@ ever needs to be re-injected mid-stream.
   and the renewal-failure test both run against it, end to end. The SCRAM math itself has its own
   independent unit-level verification too (`pgwire/scram_test.go`'s `fakeScramServer`, written
   separately from the client so a shared bug couldn't make both sides agree on something wrong).
+
+## 4. `postgres` mode renews at half the lease's real lifetime, not a fixed margin (ADR 0095 fifth amendment, 2026-10-06)
+
+`booth-pipeline` and `booth-notebooks` both independently reported that `booth-database`'s reaper
+terminates an open session at its lease's expiry regardless of whether the sidecar has since
+renewed. Tracing it end to end (ADR 0095's fifth amendment) found the actual defect was here, not
+in the reaper (which is enforcing ADR 0080/0088's credential-dies-at-expiry invariant on purpose):
+`DefaultRenewMarginSeconds` is a fixed 60 seconds, so a client connection opened just before a
+renewal swap stayed bound to the *old* lease, which the reaper then killed roughly one margin
+later — the real guaranteed minimum life of a `postgres` connection through this proxy was about a
+minute, not the hour a lease nominally lasts.
+
+The user chose option A (`decisions/0095`'s fifth amendment): keep the reaper strict, make the
+sidecar's own guarantee real instead. Unless `--renew-margin-seconds`/`RENEW_MARGIN_SECONDS` is
+given explicitly, `postgres` mode now renews once **half of the lease's own real lifetime**
+(`ExpiresAt` minus this `Renewer`'s own local observation of when it obtained the lease — there is
+no server-provided "issued at" on the wire; `credentialbroker.Response` carries only `ExpiresAt`)
+has elapsed, instead of a fixed margin before expiry. With today's one-hour leases that guarantees
+roughly 30 minutes instead of roughly one. `s3` mode is unaffected and keeps the fixed default:
+access there is signed per request, with no long-lived connection for a margin to protect.
+
+Implementation: `Renewer.HalfLifetime` (`internal/sidecar/renewal.go`) overrides `Margin` when set;
+`cmd/credential-sidecar`'s `main.go` sets it for `--kind=postgres` only when neither the flag nor
+the env var was explicitly given (`flag.Visit` plus a direct `os.Getenv` check — an operator's
+explicit choice always wins). The lease and this Renewer's own issue-time observation are now
+stored together in one `leaseState`, read atomically as a pair, so a concurrent reader (healthz, the
+postgres proxy) can never observe one updated without the other.
+
+Pinned by `TestRenewer_HalfLifetimeRenewsAtHalfTheLeasesRealLifetime` (a fake clock and a fake
+20-minute lease — never a real hour — proving the renewal fires at half, not at a fixed margin) and
+`TestPostgresProxy_HalfLifetimeRenewalGuaranteesHalfALeaseForAnExistingConnection` (the same, but
+through the real proxy against a real embedded Postgres, with a connection opened immediately
+before the swap shown to survive, still authenticated as the pre-swap role, well past the point a
+fixed 60-second margin would already have swapped it away).
+`TestRenewer_RenewalFailureNeverDropsTheCurrentLeaseOrExitsRun` and
+`TestPostgresProxy_RenewalFailureDoesNotDropAnOpenConnection` were re-run unchanged and stay green.
+
+Cost, stated honestly per the brief's own ask: roughly two lease issuances per hour per pod instead
+of one, each a role create/drop in `booth-database`. Not found to be a problem worth reporting back
+on — nothing about this binary's own load profile makes that cost material.
 
 ## Honest residual limits
 

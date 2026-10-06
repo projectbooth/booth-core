@@ -202,6 +202,73 @@ func waitForCalls(t *testing.T, b *fakeBroker, n int) {
 	t.Fatalf("timed out waiting for %d broker call(s), got %d", n, b.callCount())
 }
 
+// waitForReady waits until r.Ready() is true — unlike waitForCalls (which only observes the
+// broker having received a request), this is the point a caller can trust r.Current()/OnRenew's
+// side effects (e.g. a stored credential) have actually landed, since Ready() is set synchronously
+// right after both in Renewer.apply.
+func waitForReady(t *testing.T, r *Renewer) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if r.Ready() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for Renewer.Ready()")
+}
+
+// waitForLeaseID waits until r.Current().LeaseID == id — stronger than waitForCalls when a test
+// needs to know a SPECIFIC renewal's credential has landed (not just that the broker has by now
+// received some further request).
+func waitForLeaseID(t *testing.T, r *Renewer, id string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cur := r.Current(); cur != nil && cur.LeaseID == id {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for lease %q to land", id)
+}
+
+// --- Regression: HalfLifetime renews at half the lease's real lifetime, not a fixed margin. --------
+
+func TestRenewer_HalfLifetimeRenewsAtHalfTheLeasesRealLifetime(t *testing.T) {
+	broker := newFakeBroker(t)
+	clock := &fakeClock{now: time.Now()}
+	const fakeLeaseLifetime = 20 * time.Minute // fake and short, never a real hour
+	broker.respond = func(int, credentialbroker.Request) (int, any) {
+		return http.StatusCreated, credentialbroker.Response{
+			LeaseID: "lease-1", Kind: "postgres", ExpiresAt: clock.Now().Add(fakeLeaseLifetime), Credential: json.RawMessage(`{}`),
+		}
+	}
+	r := &Renewer{
+		Client: newClient(broker), Request: testRequest(),
+		HalfLifetime: true, Interval: time.Millisecond, Now: clock.Now,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = r.Run(ctx); close(done) }()
+	waitForCalls(t, broker, 1)
+
+	// Just under half the lease's lifetime: must not have renewed yet (a fixed 60s margin, the old
+	// default, would have renewed almost immediately against a 20-minute lease).
+	clock.Advance(fakeLeaseLifetime/2 - 10*time.Second)
+	time.Sleep(30 * time.Millisecond)
+	if got := broker.callCount(); got != 1 {
+		t.Errorf("calls = %d, want 1 (renewed before half the lease's real lifetime elapsed)", got)
+	}
+
+	// Cross the half-lifetime threshold: the next tick must renew.
+	clock.Advance(20 * time.Second)
+	waitForCalls(t, broker, 2)
+
+	cancel()
+	<-done
+}
+
 func TestRenewer_UsesTheRealExpiresAtNotTheRequestedTTL(t *testing.T) {
 	broker := newFakeBroker(t)
 	clock := &fakeClock{now: time.Now()}

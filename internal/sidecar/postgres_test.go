@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"strconv"
 	"testing"
 	"time"
@@ -210,6 +211,109 @@ func TestPostgresProxy_RenewalFailureDoesNotDropAnOpenConnection(t *testing.T) {
 	// And the original connection is STILL fine, even now that the credential has moved on twice.
 	if _, err := conn.Exec(ctx, "SELECT 1"); err != nil {
 		t.Errorf("original connection broke after a later valid renewal: %v", err)
+	}
+}
+
+// --- Regression: the fifth amendment's actual guarantee — a connection opened just before a
+// --- renewal swap survives at least half the lease's own lifetime, driven by a fake clock and a
+// --- fake (short) lease TTL, never a real hour. --------------------------------------------------
+
+func TestPostgresProxy_HalfLifetimeRenewalGuaranteesHalfALeaseForAnExistingConnection(t *testing.T) {
+	srv := testpg.Start(t)
+	createRole(t, srv, "sidecar_half_user_a", "pw-a", "sidecar_half_db_a")
+	createRole(t, srv, "sidecar_half_user_b", "pw-b", "sidecar_half_db_b")
+
+	const fakeLeaseLifetime = 10 * time.Minute // a fake, short lease TTL — never a real hour
+	clock := &fakeClock{now: time.Now()}
+	port, err := strconv.Atoi(srv.Port)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	broker := newFakeBroker(t)
+	broker.respond = func(call int, req credentialbroker.Request) (int, any) {
+		user, pass, db := "sidecar_half_user_a", "pw-a", "sidecar_half_db_a"
+		if call > 1 {
+			user, pass, db = "sidecar_half_user_b", "pw-b", "sidecar_half_db_b"
+		}
+		raw, err := json.Marshal(PostgresCredential{Host: srv.Host, Port: port, Database: db, User: user, Password: pass})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return http.StatusCreated, credentialbroker.Response{
+			LeaseID: fmt.Sprintf("lease-%d", call), ExpiresAt: clock.Now().Add(fakeLeaseLifetime), Credential: raw,
+		}
+	}
+
+	renewer := &Renewer{
+		Client: newClient(broker), Request: testRequest(),
+		HalfLifetime: true, Interval: time.Millisecond, Now: clock.Now,
+	}
+	proxy := NewPostgresProxy(renewer)
+	addr := freePort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = proxy.Listen(ctx, "tcp", addr) }()
+	for i := 0; i < 50; i++ {
+		if conn, err := net.DialTimeout("tcp", addr, 20*time.Millisecond); err == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	go func() { _ = renewer.Run(ctx) }()
+	waitForCalls(t, broker, 1)
+	waitForReady(t, renewer) // not just received by the broker — actually stored in p.current
+
+	conn, err := pgx.Connect(ctx, fmt.Sprintf("postgres://x:y@%s/z?sslmode=disable", addr))
+	if err != nil {
+		t.Fatalf("connecting under the first lease: %v", err)
+	}
+	defer conn.Close(ctx)
+	var currentUser string
+	if err := conn.QueryRow(ctx, "SELECT current_user").Scan(&currentUser); err != nil {
+		t.Fatal(err)
+	}
+	if currentUser != "sidecar_half_user_a" {
+		t.Fatalf("connected as %q, want sidecar_half_user_a", currentUser)
+	}
+
+	// Just under half the lease's lifetime: the half-lifetime default must not have renewed yet —
+	// pins that this is HALF the lease, not the old fixed ~60s margin (which would have renewed
+	// almost immediately).
+	clock.Advance(fakeLeaseLifetime/2 - 5*time.Second)
+	time.Sleep(30 * time.Millisecond)
+	if got := broker.callCount(); got != 1 {
+		t.Fatalf("calls = %d, want 1 (renewed before half the lease's lifetime elapsed)", got)
+	}
+
+	// Cross the half-lifetime threshold: the renewal swap fires now.
+	clock.Advance(10 * time.Second)
+	waitForCalls(t, broker, 2)
+	waitForLeaseID(t, renewer, "lease-2") // the second renewal's credential has actually landed
+
+	// The connection opened under the first lease — immediately before this swap — must still be
+	// alive and must still be authenticated as the FIRST lease's role: the swap only ever affects
+	// new connections, never an already-open one.
+	if err := conn.QueryRow(ctx, "SELECT current_user").Scan(&currentUser); err != nil {
+		t.Fatalf("connection opened before the half-lifetime swap is no longer alive: %v", err)
+	}
+	if currentUser != "sidecar_half_user_a" {
+		t.Errorf("connection now authenticated as %q, want it to remain sidecar_half_user_a (unaffected by the swap)", currentUser)
+	}
+
+	// A genuinely new connection, made after the swap, does use the renewed (second) credential —
+	// confirming the swap really happened, not just that nothing was checked.
+	conn2, err := pgx.Connect(ctx, fmt.Sprintf("postgres://x:y@%s/z?sslmode=disable", addr))
+	if err != nil {
+		t.Fatalf("connecting after the swap: %v", err)
+	}
+	defer conn2.Close(ctx)
+	if err := conn2.QueryRow(ctx, "SELECT current_user").Scan(&currentUser); err != nil {
+		t.Fatal(err)
+	}
+	if currentUser != "sidecar_half_user_b" {
+		t.Errorf("new connection authenticated as %q, want sidecar_half_user_b (the renewed lease)", currentUser)
 	}
 }
 

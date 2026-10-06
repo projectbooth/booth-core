@@ -42,10 +42,19 @@ func run() error {
 		workspace         = flag.String("workspace", os.Getenv("BOOTH_WORKSPACE"), "the X-Workspace to request against (env BOOTH_WORKSPACE)")
 		token             = flag.String("token", os.Getenv("BOOTH_TOKEN"), "bearer token to present to the broker (env BOOTH_TOKEN)")
 		tokenFile         = flag.String("token-file", os.Getenv("BOOTH_TOKEN_FILE"), "path to re-read the bearer token from on every call, instead of --token (env BOOTH_TOKEN_FILE)")
-		renewMarginSecs   = flag.Int("renew-margin-seconds", envIntOr("RENEW_MARGIN_SECONDS", sidecar.DefaultRenewMarginSeconds), "renew this many seconds before the lease's real expiresAt (env RENEW_MARGIN_SECONDS)")
+		renewMarginSecs   = flag.Int("renew-margin-seconds", envIntOr("RENEW_MARGIN_SECONDS", sidecar.DefaultRenewMarginSeconds), "renew this many seconds before the lease's real expiresAt (env RENEW_MARGIN_SECONDS); unless set, postgres mode's default is half the lease's own real lifetime instead of a fixed margin (ADR 0095 fifth amendment) — s3 mode always uses this fixed margin")
 		renewIntervalSecs = flag.Int("renew-interval-seconds", envIntOr("RENEW_INTERVAL_SECONDS", sidecar.DefaultRenewIntervalSeconds), "how often to check whether renewal is due (env RENEW_INTERVAL_SECONDS)")
 	)
 	flag.Parse()
+
+	// "Explicitly given" covers both the flag and its env var — either means the operator made a
+	// real choice that postgres mode's half-lifetime default (below) must not override.
+	marginExplicit := os.Getenv("RENEW_MARGIN_SECONDS") != ""
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "renew-margin-seconds" {
+			marginExplicit = true
+		}
+	})
 
 	if err := validateFlags(*kind, *scope, *access, *credentialsFile); err != nil {
 		return err
@@ -90,6 +99,9 @@ func run() error {
 
 	switch *kind {
 	case "postgres":
+		if !marginExplicit {
+			renewer.HalfLifetime = true
+		}
 		proxy := sidecar.NewPostgresProxy(renewer)
 		network, addr := listenNetworkAddr(*listen)
 		go func() {

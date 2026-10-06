@@ -192,7 +192,7 @@ func TestS3FileWriter_WritesACompanionConfigFileWhenTheLeaseHasAnEndpoint(t *tes
 		t.Fatalf("reading companion config file: %v", err)
 	}
 	s := string(got)
-	for _, want := range []string{"[default]", "endpoint_url = https://booth-storage-minio.booth-storage.svc:9000", "region = us-east-1", "addressing_style = path"} {
+	for _, want := range []string{"[default]", "endpoint_url = https://booth-storage-minio.booth-storage.svc:9000", "region = us-east-1", "s3 =", "addressing_style = virtual"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("config file missing %q; got:\n%s", want, s)
 		}
@@ -217,25 +217,66 @@ func TestS3FileWriter_ConfigFileUsesProfilePrefixForANonDefaultProfile(t *testin
 	}
 }
 
-// ADR 0095's fourth amendment (2026-10-05): booth-notebooks measured the sidecar against a real
-// MinIO and found DuckDB needs path-style addressing, which botocore's own addressing_style key
-// communicates — not conditioned on cred.PathStyle (see writeConfig's doc comment), gated on the
-// same cred.Endpoint presence as endpoint_url/region.
-func TestS3FileWriter_ConfigFileSetsAddressingStylePathForASelfHostedBackend(t *testing.T) {
+// ADR 0095's sixth amendment (2026-10-06, correcting the fourth): booth-pipeline's integration
+// test found, and the architecture coordinator verified against real botocore 1.43, that a
+// top-level addressing_style key in the profile section is silently ignored — botocore only reads
+// it nested under an "s3 =" key. It also found that the fourth amendment's "write path
+// unconditionally" was wrong: booth-storage's own pathStyle is the backend's real declaration of
+// how it must be addressed, and must drive the value here, not be ignored. These tests assert the
+// exact bytes written for both pathStyle values, pinning both corrections at once.
+func TestS3FileWriter_ConfigFileNestsAddressingStyleUnderS3AndDerivesFromPathStyle(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		pathStyle bool
+		want      string
+	}{
+		{"pathStyle true selects path", true, "path"},
+		{"pathStyle false selects virtual", false, "virtual"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "aws-credentials")
+			w := NewS3FileWriter(path, "")
+			w.OnRenew(credentialbroker.Response{
+				LeaseID: "lease-1", ExpiresAt: time.Now().Add(time.Minute),
+				Credential: mustJSON(t, S3Credential{
+					AccessKeyID: "a", SecretAccessKey: "b",
+					Endpoint: "https://minio:9000", Region: "us-east-1", PathStyle: tc.pathStyle,
+				}),
+			})
+
+			got, err := os.ReadFile(path + ".config")
+			if err != nil {
+				t.Fatalf("reading companion config file: %v", err)
+			}
+			want := "[default]\nendpoint_url = https://minio:9000\nregion = us-east-1\ns3 =\n    addressing_style = " + tc.want + "\n"
+			if string(got) != want {
+				t.Errorf("config file bytes =\n%q\nwant\n%q", got, want)
+			}
+		})
+	}
+}
+
+// A top-level addressing_style (the fourth amendment's wrong form) must never be written again —
+// pinned directly, since "contains the nested form" alone wouldn't catch a regression that wrote
+// both forms.
+func TestS3FileWriter_ConfigFileNeverWritesATopLevelAddressingStyle(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "aws-credentials")
 	w := NewS3FileWriter(path, "")
 	w.OnRenew(credentialbroker.Response{
 		LeaseID: "lease-1", ExpiresAt: time.Now().Add(time.Minute),
-		Credential: mustJSON(t, S3Credential{AccessKeyID: "a", SecretAccessKey: "b", Endpoint: "https://minio:9000", PathStyle: false}),
+		Credential: mustJSON(t, S3Credential{AccessKeyID: "a", SecretAccessKey: "b", Endpoint: "https://minio:9000", PathStyle: true}),
 	})
 
 	got, err := os.ReadFile(path + ".config")
 	if err != nil {
 		t.Fatalf("reading companion config file: %v", err)
 	}
-	if !strings.Contains(string(got), "addressing_style = path") {
-		t.Errorf("config file missing addressing_style = path; got:\n%s", got)
+	for _, line := range strings.Split(string(got), "\n") {
+		if strings.HasPrefix(line, "addressing_style") {
+			t.Errorf("found a top-level addressing_style line (botocore ignores this form): %q", line)
+		}
 	}
 }
 

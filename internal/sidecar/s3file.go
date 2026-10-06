@@ -25,11 +25,14 @@ type S3Credential struct {
 	SecretAccessKey string `json:"secretAccessKey"`
 	SessionToken    string `json:"sessionToken,omitempty"`
 
-	// Endpoint and Region are written to the shared config file (write, below) when Endpoint is
-	// non-empty (a self-hosted backend, e.g. MinIO) — omitted entirely for real AWS S3, which has
-	// no endpoint to set. Bucket/KeyPrefix/PathStyle are decoded but not written anywhere by this
-	// mode: a consuming engine's own bucket/path (PyIceberg's warehouse location) is resolved
-	// separately, via booth-lakehouse's GET /api/warehouse, not from this file.
+	// Endpoint, Region, and PathStyle are written to the shared config file (writeConfig, below)
+	// when Endpoint is non-empty (a self-hosted backend, e.g. MinIO) — omitted entirely for real
+	// AWS S3, which has no endpoint to set. PathStyle picks the config file's addressing_style
+	// (path vs. virtual) — it is the backend's own declaration of how it must be addressed
+	// (ADR 0095's sixth amendment, 2026-10-06), not a sidecar-side assumption. Bucket/KeyPrefix
+	// are decoded but not written anywhere by this mode: a consuming engine's own bucket/path
+	// (PyIceberg's warehouse location) is resolved separately, via booth-lakehouse's
+	// GET /api/warehouse, not from this file.
 	Endpoint  string `json:"endpoint"`
 	Region    string `json:"region,omitempty"`
 	Bucket    string `json:"bucket"`
@@ -120,14 +123,20 @@ func (w *S3FileWriter) writeConfig(cred S3Credential) error {
 	if cred.Region != "" {
 		body += fmt.Sprintf("region = %s\n", cred.Region)
 	}
-	// addressing_style is botocore's own existing key (ADR 0095's fourth amendment,
-	// 2026-10-05): DuckDB's S3 client needs path-style addressing against a self-hosted
-	// backend (measured against a real MinIO by booth-notebooks) and doesn't read it from
-	// anywhere else. Written unconditionally to "path" for every self-hosted lease — gated on
-	// the same cred.Endpoint presence as endpoint_url/region above, not on cred.PathStyle
-	// (which reflects booth-storage's own bucket-addressing choice, a separate question from
-	// what this config file needs to hand a consuming engine).
-	body += "addressing_style = path\n"
+	// addressing_style must be nested under an "s3 =" key, not written at the profile's top
+	// level (ADR 0095's sixth amendment, 2026-10-06, correcting the fourth): verified against
+	// botocore 1.43, a top-level addressing_style is silently ignored — botocore only reads it
+	// from this nested form. Its value is derived from the broker's own pathStyle, not
+	// hardcoded: PathStyle is booth-storage's declaration of how THIS backend must actually be
+	// addressed (internal/backend/s3/s3.go's "forces path-style addressing"), already crossing
+	// the broker in MintedCredential — a backend that declared virtual-hosted addressing would
+	// otherwise have been handed "path" regardless and broken.
+	addressingStyle := "virtual"
+	if cred.PathStyle {
+		addressingStyle = "path"
+	}
+	body += "s3 =\n"
+	body += fmt.Sprintf("    addressing_style = %s\n", addressingStyle)
 	return atomicWriteFile(path, []byte(body), 0o600)
 }
 

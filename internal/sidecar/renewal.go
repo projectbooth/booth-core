@@ -28,6 +28,17 @@ type Renewer struct {
 	Margin   time.Duration
 	Interval time.Duration
 
+	// HalfLifetime, when true, overrides Margin: a lease is renewed once half of its own real
+	// lifetime (ExpiresAt minus the time this Renewer locally observed obtaining it) has elapsed,
+	// instead of a fixed margin before expiry. Set by postgres mode's wiring (cmd/credential-
+	// sidecar) when --renew-margin-seconds/RENEW_MARGIN_SECONDS was not explicitly given (ADR
+	// 0095 fifth amendment, 2026-10-06, docs/decisions/0015): the sidecar's default 60-second
+	// fixed margin meant a client connection opened just before a renewal swap was only
+	// guaranteed to outlive that swap by about a minute, not the lease's nominal hour. s3 mode
+	// never sets this — there is no long-lived connection to protect, only a request in flight,
+	// so the fixed default margin stays.
+	HalfLifetime bool
+
 	// OnRenew is called with each new lease, in order, from the single goroutine Run runs in —
 	// never concurrently, so a mode (postgres/s3) implementing it doesn't need its own locking
 	// around whatever it swaps in.
@@ -37,7 +48,18 @@ type Renewer struct {
 	Now func() time.Time
 
 	ready   atomic.Bool
-	current atomic.Pointer[credentialbroker.Response]
+	current atomic.Pointer[leaseState]
+}
+
+// leaseState pairs a lease with this Renewer's own local observation of when it obtained it
+// (there is no server-provided "issued at" in credentialbroker.Response — IssuedAt is an
+// audit-only, server-side field never put on the wire). Storing both together in one atomic
+// pointer, written once per successful Issue call by Run's single goroutine, means a reader on
+// another goroutine (healthz, the postgres proxy) never observes one half updated without the
+// other.
+type leaseState struct {
+	resp     credentialbroker.Response
+	issuedAt time.Time
 }
 
 // Ready reports whether at least one lease has ever been obtained — contracts/
@@ -48,7 +70,13 @@ type Renewer struct {
 func (r *Renewer) Ready() bool { return r.ready.Load() }
 
 // Current returns the most recently obtained lease, or nil if none yet.
-func (r *Renewer) Current() *credentialbroker.Response { return r.current.Load() }
+func (r *Renewer) Current() *credentialbroker.Response {
+	st := r.current.Load()
+	if st == nil {
+		return nil
+	}
+	return &st.resp
+}
 
 // Run drives the renewal loop until ctx is canceled.
 //
@@ -114,11 +142,11 @@ func (r *Renewer) obtainFirst(ctx context.Context) error {
 	}
 }
 
-// maybeRenew checks the current lease against Margin and, if it's due, attempts a renewal. A
+// maybeRenew checks the current lease against its margin and, if it's due, attempts a renewal. A
 // failure here is always non-fatal — see Run's doc comment for why.
 func (r *Renewer) maybeRenew(ctx context.Context) {
-	cur := r.current.Load()
-	if cur != nil && r.Now().Add(r.Margin).Before(cur.ExpiresAt) {
+	st := r.current.Load()
+	if st != nil && r.Now().Add(r.marginFor(st)).Before(st.resp.ExpiresAt) {
 		return // not due yet
 	}
 	resp, err := r.Client.Issue(ctx, r.Request)
@@ -129,8 +157,17 @@ func (r *Renewer) maybeRenew(ctx context.Context) {
 	r.apply(resp)
 }
 
+// marginFor returns the margin to renew st's lease by: half of its own real lifetime
+// (ExpiresAt - issuedAt) when HalfLifetime is set, the fixed Margin otherwise.
+func (r *Renewer) marginFor(st *leaseState) time.Duration {
+	if !r.HalfLifetime {
+		return r.Margin
+	}
+	return st.resp.ExpiresAt.Sub(st.issuedAt) / 2
+}
+
 func (r *Renewer) apply(resp credentialbroker.Response) {
-	r.current.Store(&resp)
+	r.current.Store(&leaseState{resp: resp, issuedAt: r.Now()})
 	r.ready.Store(true)
 	if r.OnRenew != nil {
 		r.OnRenew(resp)
