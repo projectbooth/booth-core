@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   envtest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -34,7 +34,7 @@ jobs:
         run: go test ./test/integration/... -v -timeout 120s
 
   kind-deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
