@@ -15,16 +15,26 @@ import (
 // stubIdentityMinter records every Mint call and returns a token derived from its inputs, so a
 // test can tell exactly what reached it without decoding a real JWT.
 type stubIdentityMinter struct {
-	calls []struct{ moduleID, workspace, role, subject string }
-	err   error
+	calls []struct {
+		moduleID, workspace, role, subject string
+		isOperator                         bool
+	}
+	err error
 }
 
-func (s *stubIdentityMinter) Mint(moduleID, workspace, role, subject string) (string, error) {
-	s.calls = append(s.calls, struct{ moduleID, workspace, role, subject string }{moduleID, workspace, role, subject})
+func (s *stubIdentityMinter) Mint(moduleID, workspace, role, subject string, isOperator bool) (string, error) {
+	s.calls = append(s.calls, struct {
+		moduleID, workspace, role, subject string
+		isOperator                         bool
+	}{moduleID, workspace, role, subject, isOperator})
 	if s.err != nil {
 		return "", s.err
 	}
-	return fmt.Sprintf("assertion:%s:%s:%s:%s", moduleID, workspace, role, subject), nil
+	suffix := ""
+	if isOperator {
+		suffix = ":operator"
+	}
+	return fmt.Sprintf("assertion:%s:%s:%s:%s%s", moduleID, workspace, role, subject, suffix), nil
 }
 
 func newIdentityFixture(t *testing.T, minter IframeIdentityMinter) (gw *Gateway, tokens *IframeTokenIssuer, gotHeader *http.Header) {
@@ -98,6 +108,53 @@ func TestIframeProxy_AttachesTheSignedIdentityAssertion(t *testing.T) {
 		}
 		if got := gotHeader.Get(auth.HeaderBoothIdentity); got != want {
 			t.Errorf("%s = %q, want %q", auth.HeaderBoothIdentity, got, want)
+		}
+	})
+}
+
+// ADR 0094's correction (2026-09-30/2026-10-07): a caller carrying the platform-operator claim in
+// their real token must still carry it through the iframe-proxy path, since an iframe-proxied
+// module never sees that real token at all — only the minted X-Booth-Identity assertion.
+func TestIframeProxy_CarriesThePlatformOperatorClaimThroughToTheMintedIdentity(t *testing.T) {
+	t.Run("IsOperator true reaches Mint and the minted assertion", func(t *testing.T) {
+		claims := IframeClaims{ModuleID: "superset", Workspace: "acme-analytics", Role: "owner", Subject: "u-alice", IsOperator: true}
+		minter := &stubIdentityMinter{}
+		gw, tokens, gotHeader := newIdentityFixture(t, minter)
+		entry := gw.IframeEntryHandler(tokens, func(r *http.Request) string { return "superset" }, func(r *http.Request) string { return "/x" })
+
+		rec := httptest.NewRecorder()
+		entry.ServeHTTP(rec, sessionRequest(t, tokens, claims, nil))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		if len(minter.calls) != 1 || !minter.calls[0].isOperator {
+			t.Fatalf("Mint called with %+v, want isOperator=true", minter.calls)
+		}
+		want := "assertion:superset:acme-analytics:owner:u-alice:operator"
+		if got := gotHeader.Get(auth.HeaderBoothIdentity); got != want {
+			t.Errorf("%s = %q, want %q (carrying the operator claim)", auth.HeaderBoothIdentity, got, want)
+		}
+	})
+
+	t.Run("IsOperator false (the default) does not", func(t *testing.T) {
+		claims := IframeClaims{ModuleID: "superset", Workspace: "acme-analytics", Role: "viewer", Subject: "u-bob"}
+		minter := &stubIdentityMinter{}
+		gw, tokens, gotHeader := newIdentityFixture(t, minter)
+		entry := gw.IframeEntryHandler(tokens, func(r *http.Request) string { return "superset" }, func(r *http.Request) string { return "/x" })
+
+		rec := httptest.NewRecorder()
+		entry.ServeHTTP(rec, sessionRequest(t, tokens, claims, nil))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		if len(minter.calls) != 1 || minter.calls[0].isOperator {
+			t.Fatalf("Mint called with %+v, want isOperator=false", minter.calls)
+		}
+		want := "assertion:superset:acme-analytics:viewer:u-bob"
+		if got := gotHeader.Get(auth.HeaderBoothIdentity); got != want {
+			t.Errorf("%s = %q, want %q (no operator claim)", auth.HeaderBoothIdentity, got, want)
 		}
 	})
 }

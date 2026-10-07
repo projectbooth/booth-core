@@ -20,6 +20,13 @@ type IframeClaims struct {
 	Role      string
 	Subject   string
 	ExpiresAt time.Time
+
+	// IsOperator carries the caller's real token's /platform/operator claim (ADR 0094's
+	// correction, 2026-09-30/2026-10-07) through to the iframe session, since an iframe-proxied
+	// module never sees that real token at all — set at IframeURLIssuer.URLFor time from
+	// identity.Claims.Groups and threaded through proxyIframeRequest's Mint call so the minted
+	// X-Booth-Identity assertion can carry it too.
+	IsOperator bool
 }
 
 // IframeTokenIssuer mints and verifies the short-lived, HMAC-signed tokens behind
@@ -81,10 +88,15 @@ func (i *IframeTokenIssuer) sign(payload string) string {
 // JSON+base64 — this token is never parsed by anything but this package, and none of the
 // fields can contain "|" (module IDs and workspace slugs are already restricted to
 // [a-z0-9-] by contracts/module-manifest.md and decision 0001; role is a fixed enum;
-// subject comes from the IdP's `sub` claim, which OIDC guarantees is safe ASCII).
+// subject comes from the IdP's `sub` claim, which OIDC guarantees is safe ASCII; IsOperator
+// is a fixed "1"/"0").
 func encodeClaims(c IframeClaims) string {
+	isOperator := "0"
+	if c.IsOperator {
+		isOperator = "1"
+	}
 	raw := strings.Join([]string{
-		c.ModuleID, c.Workspace, c.Role, c.Subject, strconv.FormatInt(c.ExpiresAt.Unix(), 10),
+		c.ModuleID, c.Workspace, c.Role, c.Subject, strconv.FormatInt(c.ExpiresAt.Unix(), 10), isOperator,
 	}, "|")
 	return base64.RawURLEncoding.EncodeToString([]byte(raw))
 }
@@ -95,7 +107,7 @@ func decodeClaims(payload string) (IframeClaims, error) {
 		return IframeClaims{}, err
 	}
 	parts := strings.Split(string(raw), "|")
-	if len(parts) != 5 {
+	if len(parts) != 6 {
 		return IframeClaims{}, errors.New("wrong number of claim fields")
 	}
 	expUnix, err := strconv.ParseInt(parts[4], 10, 64)
@@ -103,10 +115,11 @@ func decodeClaims(payload string) (IframeClaims, error) {
 		return IframeClaims{}, fmt.Errorf("parsing expiry: %w", err)
 	}
 	return IframeClaims{
-		ModuleID:  parts[0],
-		Workspace: parts[1],
-		Role:      parts[2],
-		Subject:   parts[3],
-		ExpiresAt: time.Unix(expUnix, 0),
+		ModuleID:   parts[0],
+		Workspace:  parts[1],
+		Role:       parts[2],
+		Subject:    parts[3],
+		ExpiresAt:  time.Unix(expUnix, 0),
+		IsOperator: parts[5] == "1",
 	}, nil
 }

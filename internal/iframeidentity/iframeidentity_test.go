@@ -62,7 +62,7 @@ func claimsOf(t *testing.T, svc *Service, raw string) (jwt.Claims, map[string]an
 func TestMint_ShapeMatchesADR0069(t *testing.T) {
 	svc := newFixture(t)
 	now := time.Now()
-	raw, err := svc.Mint("superset", "acme", "editor", "u-alice")
+	raw, err := svc.Mint("superset", "acme", "editor", "u-alice", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,10 +120,59 @@ func TestMint_ShapeMatchesADR0069(t *testing.T) {
 	}
 }
 
+// ADR 0094's correction (2026-09-30/2026-10-07): a caller carrying the platform-operator claim in
+// their real token can't reach an iframe-proxied module at all until this assertion carries it
+// too, since the module never sees the real token on this path. The core property pinned here is
+// the one a module's own code actually depends on: a token WITH the group yields
+// auth.IsOperator(groups) == true, and a token WITHOUT it yields false — the exact mechanism a
+// module already uses for a real OIDC token (ADR 0041), unchanged.
+func TestMint_CarriesThePlatformOperatorClaimOnlyWhenRequested(t *testing.T) {
+	groupsOf := func(t *testing.T, svc *Service, raw string) []string {
+		t.Helper()
+		_, extra := claimsOf(t, svc, raw)
+		raws, _ := extra["groups"].([]any)
+		var groups []string
+		for _, g := range raws {
+			groups = append(groups, g.(string))
+		}
+		return groups
+	}
+
+	t.Run("isOperator true", func(t *testing.T) {
+		svc := newFixture(t)
+		raw, err := svc.Mint("superset", "acme", "editor", "u-alice", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		groups := groupsOf(t, svc, raw)
+		if !auth.IsOperator(groups) {
+			t.Errorf("groups = %v, want auth.IsOperator to report true", groups)
+		}
+		if len(groups) != 2 {
+			t.Errorf("groups = %v, want exactly 2 entries (the workspace membership and the operator claim)", groups)
+		}
+	})
+
+	t.Run("isOperator false (the default)", func(t *testing.T) {
+		svc := newFixture(t)
+		raw, err := svc.Mint("superset", "acme", "editor", "u-bob", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		groups := groupsOf(t, svc, raw)
+		if auth.IsOperator(groups) {
+			t.Errorf("groups = %v, want auth.IsOperator to report false", groups)
+		}
+		if len(groups) != 1 {
+			t.Errorf("groups = %v, want exactly 1 entry (the workspace membership only)", groups)
+		}
+	})
+}
+
 func TestMint_HonoursTheConfiguredGroupsClaimName(t *testing.T) {
 	keys, _ := NewKeys()
 	svc := NewService(keys, Options{Issuer: issuer, GroupsClaim: "roles"})
-	raw, err := svc.Mint("notebooks", "acme", "viewer", "u-bob")
+	raw, err := svc.Mint("notebooks", "acme", "viewer", "u-bob", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +188,7 @@ func TestMint_HonoursTheConfiguredGroupsClaimName(t *testing.T) {
 func TestMint_DefaultGroupsClaimIsGroups(t *testing.T) {
 	keys, _ := NewKeys()
 	svc := NewService(keys, Options{Issuer: issuer}) // GroupsClaim left empty
-	raw, err := svc.Mint("notebooks", "acme", "viewer", "u-bob")
+	raw, err := svc.Mint("notebooks", "acme", "viewer", "u-bob", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +208,7 @@ func TestMint_RejectsMalformedInputsRatherThanMintingSomethingMeaningless(t *tes
 		"role case-mismatch": {"superset", "acme", "Editor", "u-alice"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := svc.Mint(args[0], args[1], args[2], args[3]); err == nil {
+			if _, err := svc.Mint(args[0], args[1], args[2], args[3], false); err == nil {
 				t.Fatal("Mint accepted malformed input")
 			}
 		})
@@ -188,7 +237,7 @@ func TestNewService_TrimsTrailingSlashFromIssuer(t *testing.T) {
 	if svc.Issuer() != issuer {
 		t.Errorf("Issuer() = %q, want the trailing slash trimmed", svc.Issuer())
 	}
-	raw, err := svc.Mint("superset", "acme", "owner", "u-alice")
+	raw, err := svc.Mint("superset", "acme", "owner", "u-alice", false)
 	if err != nil {
 		t.Fatal(err)
 	}

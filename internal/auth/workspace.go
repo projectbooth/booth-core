@@ -85,6 +85,22 @@ func RoleFor(memberships []Membership, workspace string) (Role, bool) {
 	return "", false
 }
 
+// PlatformOperatorGroup is the literal groups-claim entry ADR 0094 uses to mark a caller as a
+// platform operator — a property of the person, workspace-independent, not part of the
+// /workspaces/<slug>/<role> grammar DeriveMemberships parses above (contracts/
+// core-platform-api.md). Checked as an exact string match, never derived from a role.
+const PlatformOperatorGroup = "/platform/operator"
+
+// IsOperator reports whether groups carries the platform-operator claim.
+func IsOperator(groups []string) bool {
+	for _, g := range groups {
+		if g == PlatformOperatorGroup {
+			return true
+		}
+	}
+	return false
+}
+
 // ErrNoMembership is returned when a caller has no role in the requested workspace.
 var ErrNoMembership = fmt.Errorf("caller has no membership in the requested workspace")
 

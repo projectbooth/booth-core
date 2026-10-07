@@ -26,6 +26,28 @@ func TestDeriveMemberships(t *testing.T) {
 	}
 }
 
+// ADR 0094: /platform/operator is a workspace-independent, literal-string claim, checked as an
+// exact match — not matched by DeriveMemberships' /workspaces/<slug>/<role> grammar, and not
+// derivable from any role.
+func TestIsOperator(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		groups []string
+		want   bool
+	}{
+		{"present", []string{"/workspaces/acme/owner", "/platform/operator"}, true},
+		{"absent", []string{"/workspaces/acme/owner"}, false},
+		{"empty groups", nil, false},
+		{"similar but not exact", []string{"/platform/operator/extra", "platform/operator"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsOperator(tc.groups); got != tc.want {
+				t.Errorf("IsOperator(%v) = %v, want %v", tc.groups, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRoleFor(t *testing.T) {
 	memberships := []Membership{
 		{Workspace: "acme-analytics", Role: RoleOwner},

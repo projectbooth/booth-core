@@ -158,6 +158,44 @@ func TestIframeURLIssuer_URLForIsRelative(t *testing.T) {
 	}
 }
 
+// ADR 0094's correction (2026-09-30/2026-10-07): URLFor derives IsOperator from the caller's real
+// token's groups, and it must survive the Issue -> Verify round trip the navigation and cookie
+// tokens both go through, since that's the only way it reaches proxyIframeRequest at all.
+func TestIframeURLIssuer_URLForDerivesIsOperatorFromGroups(t *testing.T) {
+	tokens := NewIframeTokenIssuer([]byte("test-secret"))
+	issuer := NewIframeURLIssuer(tokens)
+
+	for _, tc := range []struct {
+		name   string
+		groups []string
+		want   bool
+	}{
+		{"carries the operator claim", []string{"/workspaces/acme-analytics/owner", "/platform/operator"}, true},
+		{"does not carry it", []string{"/workspaces/acme-analytics/owner"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			iframeURL, err := issuer.URLFor("superset", auth.Identity{
+				Claims: &auth.Claims{Subject: "user-1", Groups: tc.groups},
+				Active: auth.Membership{Workspace: "acme-analytics", Role: auth.RoleOwner},
+			})
+			if err != nil {
+				t.Fatalf("URLFor: %v", err)
+			}
+			parsedURL, err := url.Parse(iframeURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claims, err := tokens.Verify(parsedURL.Query().Get(iframeQueryParam))
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+			if claims.IsOperator != tc.want {
+				t.Errorf("IsOperator = %v, want %v", claims.IsOperator, tc.want)
+			}
+		})
+	}
+}
+
 // --- Bug 1 (ADR 0069's "Implementation notes"): the fallback must not proxy a top-level
 // --- document navigation into whatever module happens to have a live session cookie. ----------
 

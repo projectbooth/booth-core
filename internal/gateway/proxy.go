@@ -43,9 +43,11 @@ type Gateway struct {
 
 // IframeIdentityMinter mints the assertion carried as X-Booth-Identity on the iframe-proxy path
 // (ADR 0069). Implemented by iframeidentity.Service; declared as an interface here so gateway
-// doesn't need to import the JOSE/JWT libraries directly.
+// doesn't need to import the JOSE/JWT libraries directly. isOperator (ADR 0094's correction,
+// 2026-09-30/2026-10-07) carries the caller's real token's /platform/operator claim through to
+// the minted assertion's groups, since an iframe-proxied module never sees that real token.
 type IframeIdentityMinter interface {
-	Mint(moduleID, workspace, role, subject string) (string, error)
+	Mint(moduleID, workspace, role, subject string, isOperator bool) (string, error)
 }
 
 func New(modules ModuleLookup) *Gateway {

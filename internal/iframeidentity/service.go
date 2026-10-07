@@ -99,8 +99,11 @@ var errInvalidAssertionInput = errors.New("cannot mint an iframe-identity assert
 // the person's own subject (never a workload-shaped one — this path exists only for a human's
 // browser session), and the groups claim shaped exactly like ADR 0025's human-token grammar
 // (`/workspaces/<workspace>/<role>`), so a module's existing ADR 0041 role-derivation code reads
-// it with no new logic. Lifetime is fixed at DefaultTTL.
-func (s *Service) Mint(moduleID, workspace, role, subject string) (string, error) {
+// it with no new logic. isOperator (ADR 0094's correction, 2026-09-30/2026-10-07), when true,
+// appends `/platform/operator` as a second groups entry — the same literal string a module
+// already checks for directly off a real OIDC token's groups claim, so an iframe-proxied module
+// finally has a way to see it too. Lifetime is fixed at DefaultTTL.
+func (s *Service) Mint(moduleID, workspace, role, subject string, isOperator bool) (string, error) {
 	if moduleID == "" || workspace == "" || subject == "" || auth.RoleRank(auth.Role(role)) == 0 {
 		return "", fmt.Errorf("%w: moduleID=%q workspace=%q role=%q subject=%q",
 			errInvalidAssertionInput, moduleID, workspace, role, subject)
@@ -121,8 +124,12 @@ func (s *Service) Mint(moduleID, workspace, role, subject string) (string, error
 		Expiry:    jwt.NewNumericDate(now.Add(DefaultTTL)),
 		ID:        randomID(),
 	}
+	groups := []string{fmt.Sprintf("/workspaces/%s/%s", workspace, role)}
+	if isOperator {
+		groups = append(groups, auth.PlatformOperatorGroup)
+	}
 	extra := map[string]any{
-		s.opts.GroupsClaim: []string{fmt.Sprintf("/workspaces/%s/%s", workspace, role)},
+		s.opts.GroupsClaim: groups,
 		ModuleClaim:        moduleID,
 	}
 	raw, err := jwt.Signed(signer).Claims(claims).Claims(extra).Serialize()

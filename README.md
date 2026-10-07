@@ -255,17 +255,30 @@ its own `BaseURL()`. See `docs/decisions/0014` for the full design, including th
 on non-person identity for unattended renewal (not needed — the existing `owner` field already
 supports naming any current workspace owner).
 
-## Platform-operator claim (2026-09-30)
+## Platform-operator claim (2026-09-30, iframe-proxy path 2026-10-07)
 
 **ADR 0094, amending ADR 0025.** A second, workspace-independent claim shape: the literal string
 `/platform/operator` in a token's `groups` claim marks the caller as a platform operator —
 cross-tenant admin views (`booth-logging`'s log viewer, `booth-lakehouse`'s and `booth-database`'s
 admin views) aren't a per-workspace concern, and this replaces the per-module operator-allowlist
-stopgap (ADR 0067) three modules had independently reinvented. **No code changed here** — every
-module already re-verifies its own token and reads `groups` directly (ADR 0041); checking for this
-one extra literal string is the same mechanism, not a new one, and doesn't go through
-`X-Booth-Role` (workspace-scoped by construction) or any new endpoint. Documented in
-`contracts/core-platform-api.md`. The local-dev Keycloak realm
+stopgap (ADR 0067) three modules had independently reinvented. **No code changed for a module that
+reads its own caller's bearer token directly** — every such module already re-verifies its own
+token and reads `groups` directly (ADR 0041); checking for this one extra literal string is the
+same mechanism, not a new one, and doesn't go through `X-Booth-Role` (workspace-scoped by
+construction) or any new endpoint.
+
+**Correction (2026-09-30, real code shipped 2026-10-07): this did not hold for a module mounted
+`uiIntegrationMode: iframe-proxy`.** An iframe-proxied module never sees the caller's real bearer
+token at all — it only ever receives the short-lived `X-Booth-Identity` assertion core mints per
+request (ADR 0069), whose `groups` claim was synthesized from a bare `(workspace, role)` pair with
+no path for the operator claim to survive onto it. Fixed: `auth.IsOperator` (`internal/auth/
+workspace.go`) checks a token's groups for the literal claim; `IframeClaims` (`internal/gateway/
+iframetoken.go`) carries an `IsOperator` field set at `IframeURLIssuer.URLFor` time from the
+caller's real `identity.Claims.Groups`; `iframeidentity.Service.Mint` (`internal/iframeidentity/
+service.go`) appends `/platform/operator` to the minted assertion's groups when set. `booth-logging`
+was blocked on exactly this for its Grafana view.
+
+Documented in `contracts/core-platform-api.md`. The local-dev Keycloak realm
 (`booth-architecture/local-dev/keycloak/realm-export.json`) gained a `platform` → `operator` group,
 granted to `alice` (this realm's bootstrap admin — there's no separate literal "admin" user in the
 `booth-local` realm; Keycloak's own `admin`/`admin` is the master-realm console login, a different
