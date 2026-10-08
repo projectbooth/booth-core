@@ -701,3 +701,140 @@ jobs:
           kubectl -n ci-minio get all || true
           kubectl -n ci-minio describe pods || true
           kubectl -n ci-minio logs deployment/minio --tail=100 || true
+
+  # scripts/booth-admin, docs/operations/accounts-and-workspaces.md: an automated check that the
+  # operator script actually drives a real Keycloak correctly end to end, including the exact
+  # thing the whole script exists for — that a resulting token's groups claim, and booth-core's
+  # own /api/me reading it, both come out right. No kind cluster needed here; Keycloak starts
+  # cheaply as a plain container (boots in single-digit seconds), same cost class as the other
+  # real-infra steps in this workflow (MinIO, NATS).
+  booth-admin-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # scripts/testdata/ci-realm.json is a minimal, self-contained realm fixture owned by this
+      # repo (not booth-architecture's local-dev realm, which lives in a sibling repo this CI job
+      # doesn't check out) — same groups-claim mapper shape (ADR 0025: oidc-group-membership-
+      # mapper, full.path: true), a client with direct-access-grants on so this job can fetch a
+      # token without a browser, and no pre-seeded groups/users at all: booth-admin itself has to
+      # build the whole tree from nothing, which is exactly what this job is checking.
+      - name: Start Keycloak with the CI realm fixture
+        run: |
+          set -eu
+          docker run -d --name booth-admin-ci-keycloak -p 8081:8080 \
+            -e KEYCLOAK_ADMIN=admin -e KEYCLOAK_ADMIN_PASSWORD=admin \
+            -v "$PWD/scripts/testdata/ci-realm.json:/opt/keycloak/data/import/realm-export.json:ro" \
+            quay.io/keycloak/keycloak:25.0 start-dev --import-realm
+
+          echo "Waiting for the booth-ci realm to import..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8081/realms/booth-ci 2>/dev/null | grep -q booth-ci; then
+              echo "ready after ${i}00ms-ish checks"; break
+            fi
+            [ "$i" = 30 ] && { echo "Keycloak/realm never became ready"; docker logs booth-admin-ci-keycloak; exit 1; }
+            sleep 2
+          done
+
+      - name: Run the booth-admin sequence against it
+        env:
+          KEYCLOAK_URL: http://localhost:8081
+          KEYCLOAK_REALM: booth-ci
+          KEYCLOAK_ADMIN_USER: admin
+          KEYCLOAK_ADMIN_PASSWORD: admin
+        run: |
+          set -eu
+          python3 scripts/booth-admin create-workspace acme
+          python3 scripts/booth-admin create-user alice --email alice@example.com --name "Alice Owner"
+
+          # add-member, then a role change, then confirm exactly one role — the task's own
+          # required check: a user must never hold two roles in one workspace.
+          python3 scripts/booth-admin add-member alice acme editor
+          python3 scripts/booth-admin add-member alice acme viewer
+          members=$(python3 scripts/booth-admin list-members acme)
+          echo "$members"
+          [ "$members" = "$(printf 'alice\tviewer')" ] || { echo "expected exactly one role (viewer), got: $members"; exit 1; }
+
+          python3 scripts/booth-admin remove-member alice acme
+          members=$(python3 scripts/booth-admin list-members acme)
+          echo "$members" | grep -q "(no members" || { echo "expected no members after remove-member, got: $members"; exit 1; }
+
+          # Idempotency (the task's own required check): re-running changes nothing and isn't an
+          # error, for every mutating subcommand that has a natural "already there" state.
+          python3 scripts/booth-admin create-workspace acme
+          python3 scripts/booth-admin create-workspace acme | grep -q "already present"
+          python3 scripts/booth-admin add-member alice acme owner
+          python3 scripts/booth-admin add-member alice acme owner | grep -q "no change"
+          python3 scripts/booth-admin remove-member alice acme
+          python3 scripts/booth-admin remove-member alice acme | grep -q "no change"
+
+          # Leave alice as owner of acme for the groups-claim / /api/me checks below.
+          python3 scripts/booth-admin add-member alice acme owner
+
+      - name: Confirm the token's groups claim carries /workspaces/<slug>/<role>
+        run: |
+          set -eu
+          ADMIN_TOKEN=$(curl -sf -X POST "http://localhost:8081/realms/master/protocol/openid-connect/token" \
+            -d "grant_type=password&client_id=admin-cli&username=admin&password=admin" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+          USER_ID=$(curl -sf "http://localhost:8081/admin/realms/booth-ci/users?username=alice&exact=true" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
+
+          # booth-admin itself only ever sets a TEMPORARY password (by design, per its own task's
+          # requirement) — a real person resolves that through the interactive browser flow on
+          # first sign-in. This job has no browser, so it sets a permanent one directly, purely to
+          # obtain a token to inspect; this is test scaffolding, not something booth-admin does.
+          curl -sf -o /dev/null -X PUT "http://localhost:8081/admin/realms/booth-ci/users/$USER_ID/reset-password" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+            -d '{"type":"password","value":"ci-verification-password","temporary":false}'
+          curl -sf -o /dev/null -X PUT "http://localhost:8081/admin/realms/booth-ci/users/$USER_ID" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+            -d '{"requiredActions":[]}'
+
+          TOKEN=$(curl -sf -X POST "http://localhost:8081/realms/booth-ci/protocol/openid-connect/token" \
+            -d "grant_type=password&client_id=ci-client&username=alice&password=ci-verification-password" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+          echo "BOOTH_CI_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+          python3 -c "
+          import base64, json
+          payload = '$TOKEN'.split('.')[1]
+          payload += '=' * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          groups = claims.get('groups')
+          assert groups == ['/workspaces/acme/owner'], f'groups claim = {groups!r}, want exactly [\"/workspaces/acme/owner\"]'
+          print('groups claim OK:', groups)
+          "
+
+      - name: Confirm core's own /api/me shows the same workspace and role
+        run: |
+          set -eu
+          go build -o /tmp/booth-core-ci ./cmd/core
+          BOOTH_DEV_REGISTRY_PATH=hack/dev-registry.example.yaml BOOTH_HTTP_ADDR=:8099 \
+            BOOTH_OIDC_ISSUER_URL="http://localhost:8081/realms/booth-ci" BOOTH_OIDC_CLIENT_ID="ci-client" \
+            /tmp/booth-core-ci &
+          CORE_PID=$!
+
+          echo "Waiting for core to come up..."
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:8099/healthz >/dev/null 2>&1 && break
+            [ "$i" = 15 ] && { echo "core never became ready"; kill "$CORE_PID" 2>/dev/null || true; exit 1; }
+            sleep 1
+          done
+
+          RESP=$(curl -sf -H "Authorization: Bearer $BOOTH_CI_TOKEN" -H "X-Workspace: acme" http://localhost:8099/api/me)
+          echo "$RESP"
+          echo "$RESP" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert d.get('active') == {'workspace': 'acme', 'role': 'owner'}, f'active = {d.get(\"active\")!r}'
+          print('core /api/me OK')
+          "
+          kill "$CORE_PID" 2>/dev/null || true
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker logs booth-admin-ci-keycloak --tail=200 || true

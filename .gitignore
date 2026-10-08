@@ -5,3 +5,5 @@
 .envtest-bin/
 charts/*/charts/*.tgz
 dist/
+__pycache__/
+*.pyc
