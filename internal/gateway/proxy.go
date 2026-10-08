@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 
 	"github.com/projectbooth/booth-core/internal/auth"
 	"github.com/projectbooth/booth-core/internal/registry"
@@ -112,6 +113,64 @@ func (g *Gateway) Handler(idParam func(*http.Request) string, remainderPath func
 
 		proxy.ServeHTTP(w, r)
 	})
+}
+
+// PublicHandler builds the http.Handler for a module's declared public routes (ADR 0101),
+// expected to be mounted at a path like "/modules/{id}/public/*" by the caller's router with NO
+// auth.Middleware in front of it — a public route is unauthenticated by design, not merely
+// permissive. Only a path matching one of the module's own declared `publicRoutes.pathPrefixes`
+// is proxied; an unknown module, a module that never declared the field, or an undeclared path
+// under /public/ is a plain 404 from core, never routed to the module at all.
+func (g *Gateway) PublicHandler(idParam func(*http.Request) string, remainderPath func(*http.Request) string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		moduleID := idParam(r)
+		forwardPath := remainderPath(r)
+
+		mod, ok := g.Modules.Get(moduleID)
+		if !ok || !matchesPublicRoute(mod, forwardPath) {
+			http.NotFound(w, r)
+			return
+		}
+
+		target, err := url.Parse(mod.BaseURL())
+		if err != nil {
+			http.Error(w, "module has invalid base URL", http.StatusInternalServerError)
+			return
+		}
+
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		proxy.Transport = g.Transport
+		originalDirector := proxy.Director
+		proxy.Director = func(req *http.Request) {
+			originalDirector(req)
+			req.URL.Path = forwardPath
+			// ADR 0101 item 4: no auth.Middleware ran on this path, so there is no verified
+			// identity to attach — strip anything the caller tried to set on these trust headers
+			// and never set them ourselves, so nothing downstream can mistake a caller-supplied
+			// value for one core vouched for (ADR 0041 defence in depth). Authorization and every
+			// other caller header pass through completely unchanged: the module authenticates its
+			// own callers (e.g. an API key) and returns its own 401/403 (items 3 and 5).
+			req.Header.Del(auth.HeaderBoothWorkspace)
+			req.Header.Del(auth.HeaderBoothRole)
+			req.Header.Del(auth.HeaderBoothIdentity)
+		}
+
+		proxy.ServeHTTP(w, r)
+	})
+}
+
+// matchesPublicRoute reports whether forwardPath falls under one of mod's declared
+// publicRoutes.pathPrefixes (ADR 0101) — a module that never declared the field matches nothing.
+func matchesPublicRoute(mod registry.Module, forwardPath string) bool {
+	if mod.Spec.PublicRoutes == nil {
+		return false
+	}
+	for _, prefix := range mod.Spec.PublicRoutes.PathPrefixes {
+		if strings.HasPrefix(forwardPath, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func bearerTokenFromRequest(r *http.Request) string {
