@@ -146,6 +146,28 @@ type BoothModuleSpec struct {
 	// other authenticated route.
 	// +optional
 	ProvidesCredentials *CredentialProviderSpec `json:"providesCredentials,omitempty"`
+
+	// PublicRoutes declares module-relative path prefixes core's gateway proxies without a
+	// platform login, at /modules/{id}/public/<prefix> (ADR 0101). Core performs no
+	// authentication on these routes, strips any inbound X-Booth-Workspace/X-Booth-Role/
+	// X-Booth-Identity and sets none of them, and never writes to the user directory for them —
+	// the module authenticates callers itself and returns its own 401/403. Omit it and the
+	// module gets no public route at all; the ordinary /modules/{id}/* route is unaffected
+	// either way.
+	// +optional
+	PublicRoutes *PublicRoutesSpec `json:"publicRoutes,omitempty"`
+}
+
+// PublicRoutesSpec is the manifest-level declaration of a module's unauthenticated route
+// prefixes (ADR 0101). A struct rather than a bare list so it can grow (e.g. per-prefix rate
+// limits) without another manifest field.
+type PublicRoutesSpec struct {
+	// PathPrefixes lists module-relative path prefixes proxied without a platform login. Each
+	// must start and end with "/" (e.g. "/v1/") — contracts/module-manifest.md's exact grammar.
+	// +kubebuilder:validation:MinItems=1
+	// +listType=set
+	// +kubebuilder:validation:items:Pattern=`^/.*/$`
+	PathPrefixes []string `json:"pathPrefixes"`
 }
 
 // WorkloadIdentityRequirement is the manifest-level signal that a module may mint workload

@@ -104,6 +104,19 @@ func NewRouter(deps Deps) http.Handler {
 		r.Delete("/api/modules/{id}", requireAdmin(handleUninstallModule))
 	})
 
+	// ADR 0101: a module's own declared public route prefixes, proxied with NO authentication at
+	// all — no auth.Middleware, no X-Workspace requirement, no user-directory write. Registered
+	// as its own plain r.Handle (not inside any auth.Middleware group) so nothing here can ever
+	// inherit a workspace/role requirement by accident. chi's router matches this more specific
+	// literal "/public/" segment ahead of the wildcard "/modules/{id}/*" route below regardless
+	// of registration order, but it's registered first anyway so the distinction reads plainly.
+	// A path under /public/ that doesn't match one of the module's declared prefixes (or whose
+	// module never declared the field at all) is a plain 404 from core — see Gateway.PublicHandler.
+	r.Handle("/modules/{id}/public/*", deps.Gateway.PublicHandler(
+		func(r *http.Request) string { return chi.URLParam(r, "id") },
+		func(r *http.Request) string { return "/" + chi.URLParam(r, "*") },
+	))
+
 	// The gateway route (module-to-module traffic, ADR 0007) is the one place core also trusts
 	// its own workload tokens (ADR 0059), so a job's call to another module is routed and
 	// identity-stamped exactly like a person's. It gets its own group on purpose: every other
