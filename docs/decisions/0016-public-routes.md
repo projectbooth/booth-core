@@ -14,7 +14,7 @@ of registration order — verified directly (`TestRouter_PublicRouteRequiresNoPl
 either way is a real risk: public traffic accidentally requiring auth would be a availability bug,
 and ordinary traffic accidentally skipping auth would be the opposite kind of bug entirely.
 
-## 2. Prefix matching is a plain `strings.HasPrefix` on the module-relative forwarded path
+## 2. Prefix matching is `strings.HasPrefix` — against a decoded, validated, cleaned path, not the raw one chi hands over
 
 A request to `/modules/api/public/v1/x` forwards `/v1/x` to the module — the same path shape the
 ordinary route already forwards, prefix included. `matchesPublicRoute`
@@ -23,6 +23,61 @@ plain prefix check; a module whose `PublicRoutes` field is nil (the overwhelming
 matches nothing, and anything under `/public/` that doesn't match a declared prefix is a 404 from
 core, never reaching the module (`TestPublicHandler_UndeclaredPathUnderPublicIs404`,
 `TestRouter_UndeclaredPathUnderPublicIs404`).
+
+**This was a real path-traversal bug, not a theoretical one, caught in review before merge.** The
+prefix check originally ran directly against whatever `remainderPath(r)` returned, and that same
+value was then forwarded unmodified. `GET /modules/api/public/v1/../admin` forwards
+`/v1/../admin`, which passes `strings.HasPrefix(path, "/v1/")` textually and would have reached
+the module exactly as sent — the declared prefix bounded nothing. Tracing it found something
+worse than plain `".."` handling: chi's router (`go-chi/chi/v5`'s `mux.go`, `routeHTTP`) matches
+against `r.URL.RawPath` whenever it's non-empty, falling back to `r.URL.Path` only otherwise, and
+`net/url` sets `RawPath` to the caller's **original, undecoded** text whenever `Path`'s own
+canonical re-escaping wouldn't reproduce it — which covers any percent-encoded `.`, `/`, or `\`
+(none of which strictly need encoding). So `chi.URLParam(r, "*")` can hand back either raw wire
+text or an already-decoded-once string depending on exactly what encoding the caller used,
+inconsistently — a bare substring check for `%2e`/`%2f` (an earlier version of this fix) caught
+some encoded variants only by accident of which branch chi happened to take, and missed others
+(an encoded backslash, verified to still reach the module backend in a now-passing regression
+test before the real fix landed).
+
+**Fix**: `PublicHandler` now calls `url.PathUnescape` on `remainderPath(r)` exactly once,
+explicitly, before anything else — this is correct regardless of how many times (zero or one)
+net/url/chi already decoded the string, because the two paths this fix actually has to handle are
+"chi handed back raw wire text, needs one decode" and "chi handed back already-decoded text that
+itself still contains a literal encoded sequence because the caller double-encoded it, needs one
+more decode" — both resolved by exactly one additional explicit pass. `publicPathIsSafe` then
+rejects (404) a `.` or `..` segment, a backslash, or a NUL byte in that decoded string — a hard
+refusal, not an attempt to clean these specific shapes up, since a public route is unauthenticated
+and the conservative answer to "does this look like an escape attempt" is to refuse outright.
+`cleanPublicPath` (`path.Clean`, with a trailing slash restored if the input had one — `path.Clean`
+drops it, which would otherwise break matching a request for exactly a bare declared prefix)
+canonicalizes what's left, and matching + forwarding both happen against that same cleaned string,
+never the original. `req.URL.RawPath` is explicitly cleared before forwarding too, so the proxy's
+own request serialization can't fall back to the caller's stale, unvalidated raw encoding instead
+of the rewritten `Path`.
+
+Tests at both the `Gateway`-unit level (`internal/gateway/public_test.go`) and the real chi router
+(`internal/api/public_routes_test.go`): a literal `..`, singly- and double-percent-encoded `..`
+(both cases), an encoded slash splitting a `..` out of what looked like one segment, a literal
+`.`, a backslash, an embedded NUL, a doubled slash (benign — still matches and forwards in its
+cleaned form), a request for exactly a declared prefix with its trailing slash, and an ordinary
+multi-segment path. Mutation-tested: reverted to the original naive forwarding and confirmed every
+one of these fails, then restored and reconfirmed green. The `Gateway`-unit test harness's own
+`chiStarParam` helper was itself a source of false confidence on the first pass — it read
+`r.URL.Path` directly, which doesn't reproduce chi's `RawPath`-preference, so a backslash test
+passed at that level while still reaching the module through the real router. Fixed to mirror
+chi's actual preference explicitly, rather than trust it implicitly.
+
+**The existing authenticated `/modules/{id}/*` route (`Handler`/`proxyTo`) has the identical
+mechanism — same unclean, unvalidated `r.URL.Path = forwardPath` — but not the same weakness.**
+Checked directly, not assumed: `Handler` (`internal/gateway/proxy.go`) imposes no declared-prefix
+or any other path-based restriction at all — an authenticated caller for a module can already
+reach any path on it, with or without a traversal trick, since there is no allowlist for one to
+bypass. A `..` there can only ever change which path gets requested on the *same* module's *same*
+backend (the target host:port comes from `mod.BaseURL()`, fixed independently of the forwarded
+path), never grant access to a path that caller's identity/workspace/role didn't already allow.
+Left unchanged in this PR, per instruction — flagged here, not fixed, in case a future prefix-style
+restriction is ever added to that route too.
 
 ## 3. Header handling: strip and never set, let everything else through unmodified
 
