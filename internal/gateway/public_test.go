@@ -40,12 +40,20 @@ func publicHandlerFixture(t *testing.T, prefixes []string) (handler http.Handler
 }
 
 // chiStarParam stands in for chi.URLParam(r, "*") in these unit-level tests, which don't run
-// through chi's router at all — the request's own path, minus the fixed "/modules/api/public/"
-// prefix a real router would already have consumed.
+// through chi's router at all. Mirrors chi's own choice in mux.go's routeHTTP: RawPath when
+// non-empty (set by net/url whenever the request's original encoding wouldn't round-trip through
+// Path's own canonical re-escaping — e.g. any percent-encoded ".", "/", or "\", none of which
+// strictly need encoding), falling back to the already-decoded-once Path otherwise. Getting this
+// wrong here would let these tests pass for the wrong reason: PublicHandler must cope with
+// whichever of the two chi actually hands it, not just with Path.
 func chiStarParam(r *http.Request) string {
+	raw := r.URL.Path
+	if r.URL.RawPath != "" {
+		raw = r.URL.RawPath
+	}
 	const prefix = "/modules/api/public/"
-	if len(r.URL.Path) > len(prefix) && r.URL.Path[:len(prefix)] == prefix {
-		return r.URL.Path[len(prefix):]
+	if len(raw) > len(prefix) && raw[:len(prefix)] == prefix {
+		return raw[len(prefix):]
 	}
 	return ""
 }
@@ -127,6 +135,92 @@ func TestPublicHandler_StripsTrustHeadersAndLeavesOthersUntouched(t *testing.T) 
 	}
 	if got := gotHeader.Get("X-Custom-Caller-Header"); got != "untouched" {
 		t.Errorf("X-Custom-Caller-Header = %q, want it passed through unchanged", got)
+	}
+}
+
+// A traversal-shaped path must never reach the module, no matter how it's spelled — a prefix
+// check against the raw, uncleaned path lets a caller escape the declared prefix entirely (the
+// original bug: /v1/../admin passes a naive strings.HasPrefix(forwardPath, "/v1/") check and
+// would have been forwarded as-is). Every variant here is rejected before ever reaching
+// matchesPublicRoute.
+func TestPublicHandler_RejectsTraversalShapedPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		target string
+	}{
+		{"literal dot-dot segment", "/modules/api/public/v1/../admin"},
+		{"lowercase percent-encoded dot-dot (decodes to a literal .. before this handler sees it)", "/modules/api/public/v1/%2e%2e/admin"},
+		{"uppercase percent-encoded dot-dot", "/modules/api/public/v1/%2E%2E/admin"},
+		{"percent-encoded slash splitting a dot-dot out of the final segment", "/modules/api/public/v1/..%2fadmin"},
+		{"literal single-dot segment", "/modules/api/public/v1/./x"},
+		{"double-encoded dot-dot (the literal %2e the net/http stack couldn't have produced itself)", "/modules/api/public/v1/%252e%252e/admin"},
+		{"double-encoded slash", "/modules/api/public/v1/..%252fadmin"},
+		{"backslash", "/modules/api/public/v1/..%5c..%5cadmin"},
+		{"embedded NUL byte", "/modules/api/public/v1/%00/admin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, _, gotPath := publicHandlerFixture(t, []string{"/v1/"})
+			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("status = %d, want 404", rec.Code)
+			}
+			if *gotPath != "" {
+				t.Errorf("request reached the module backend at %q; a traversal-shaped path must never be proxied", *gotPath)
+			}
+		})
+	}
+}
+
+// A doubled slash is benign, not traversal-shaped — it must still match the declared prefix and
+// forward in its canonical, cleaned form (not the raw doubled-slash form).
+func TestPublicHandler_DoubledSlashIsCleanedAndStillMatches(t *testing.T) {
+	handler, _, gotPath := publicHandlerFixture(t, []string{"/v1/"})
+
+	req := httptest.NewRequest(http.MethodGet, "/modules/api/public/v1//x", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a doubled slash is not a traversal attempt)", rec.Code)
+	}
+	if *gotPath != "/v1/x" {
+		t.Errorf("forwarded path = %q, want /v1/x (the cleaned form)", *gotPath)
+	}
+}
+
+// A legitimate, ordinary multi-segment path still works end to end after the fix.
+func TestPublicHandler_OrdinaryMultiSegmentPathStillWorks(t *testing.T) {
+	handler, _, gotPath := publicHandlerFixture(t, []string{"/v1/"})
+
+	req := httptest.NewRequest(http.MethodGet, "/modules/api/public/v1/x/y", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if *gotPath != "/v1/x/y" {
+		t.Errorf("forwarded path = %q, want /v1/x/y", *gotPath)
+	}
+}
+
+// A request for exactly the declared prefix itself (with its trailing slash) must still match
+// after cleaning — path.Clean alone would drop that trailing slash and break this case.
+func TestPublicHandler_ExactPrefixWithTrailingSlashStillMatches(t *testing.T) {
+	handler, _, gotPath := publicHandlerFixture(t, []string{"/v1/"})
+
+	req := httptest.NewRequest(http.MethodGet, "/modules/api/public/v1/", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if *gotPath != "/v1/" {
+		t.Errorf("forwarded path = %q, want /v1/ (trailing slash preserved)", *gotPath)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strings"
 
 	"github.com/projectbooth/booth-core/internal/auth"
@@ -124,7 +125,40 @@ func (g *Gateway) Handler(idParam func(*http.Request) string, remainderPath func
 func (g *Gateway) PublicHandler(idParam func(*http.Request) string, remainderPath func(*http.Request) string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		moduleID := idParam(r)
-		forwardPath := remainderPath(r)
+
+		// remainderPath's wildcard capture is NOT reliably decoded: chi's own router
+		// (go-chi/chi/v5's mux.go routeHTTP) matches against r.URL.RawPath whenever it's
+		// non-empty, falling back to r.URL.Path only when it's not — and net/url sets RawPath
+		// to the ORIGINAL, undecoded request text every time the "default" escaping of Path
+		// would differ from what the caller actually sent, which includes a percent-encoded
+		// ".", "/", or "\" (none of which strictly need encoding, so Path's own canonical
+		// re-escaping never reproduces them, which is exactly the divergence that makes RawPath
+		// win). Decoding exactly once here, explicitly, makes everything below independent of
+		// that ambiguity: whatever chi handed us — raw wire text, or already decoded once by
+		// net/url — one more explicit decode always yields the one, fully-resolved path the
+		// caller actually meant, with no guessing about which layer survived.
+		decoded, err := url.PathUnescape(remainderPath(r))
+		if err != nil {
+			// Malformed percent-encoding (e.g. a bare "%" not followed by two hex digits) is
+			// already a malformed request; refused the same way an unmatched path is, not
+			// treated as a special case.
+			http.NotFound(w, r)
+			return
+		}
+
+		// Reject anything traversal-shaped outright, before matching or cleaning — a path that
+		// merely LOOKS like it might escape a declared prefix is refused, not normalized and
+		// let through. See publicPathIsSafe's own doc comment for exactly what this catches and
+		// why.
+		if !publicPathIsSafe(decoded) {
+			http.NotFound(w, r)
+			return
+		}
+		// Match and forward from the SAME canonical form — matching against the raw path and
+		// then forwarding it unmodified is exactly the bug this fixes (a declared prefix must
+		// bound what's actually requested of the module, not just what the path starts with
+		// textually before normalization).
+		forwardPath := cleanPublicPath(decoded)
 
 		mod, ok := g.Modules.Get(moduleID)
 		if !ok || !matchesPublicRoute(mod, forwardPath) {
@@ -144,6 +178,13 @@ func (g *Gateway) PublicHandler(idParam func(*http.Request) string, remainderPat
 		proxy.Director = func(req *http.Request) {
 			originalDirector(req)
 			req.URL.Path = forwardPath
+			// RawPath must not be left holding the ORIGINAL (uncleaned) request's raw encoding —
+			// net/url's own serialization prefers a non-empty RawPath over Path when the two are
+			// still a consistent encoding of each other, which a stale RawPath generally won't be
+			// once Path has been rewritten to the cleaned form above. Clearing it forces
+			// re-escaping from the cleaned Path alone, so what's actually sent on the wire can
+			// never silently revert to the caller's original, unvalidated bytes.
+			req.URL.RawPath = ""
 			// ADR 0101 item 4: no auth.Middleware ran on this path, so there is no verified
 			// identity to attach — strip anything the caller tried to set on these trust headers
 			// and never set them ourselves, so nothing downstream can mistake a caller-supplied
@@ -159,8 +200,42 @@ func (g *Gateway) PublicHandler(idParam func(*http.Request) string, remainderPat
 	})
 }
 
+// publicPathIsSafe reports whether p — already decoded exactly once by PublicHandler's own
+// explicit url.PathUnescape call, so any encoded form (single- or double-percent-encoded) has
+// already been resolved to real characters by this point — contains no traversal-shaped
+// construct: a "." or ".." segment, a backslash, or a NUL byte. Deliberately a hard refusal
+// rather than an attempt to clean these specific forms up: a public route is unauthenticated, so
+// the conservative answer to "does this look like an attempt to escape the declared prefix" is
+// to refuse it outright, not to guess at the one correct normalization and let it through.
+func publicPathIsSafe(p string) bool {
+	if strings.ContainsRune(p, '\\') || strings.ContainsRune(p, 0) {
+		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// cleanPublicPath canonicalizes an already-validated (publicPathIsSafe) path: collapses a
+// doubled slash via path.Clean. path.Clean also drops a trailing slash, which would otherwise
+// break matching a request for exactly a declared prefix (e.g. a request for "/v1/" itself must
+// still match the declared prefix "/v1/" after cleaning), so a trailing slash present on the
+// input is restored on the output.
+func cleanPublicPath(p string) string {
+	cleaned := path.Clean(p)
+	if strings.HasSuffix(p, "/") && !strings.HasSuffix(cleaned, "/") {
+		cleaned += "/"
+	}
+	return cleaned
+}
+
 // matchesPublicRoute reports whether forwardPath falls under one of mod's declared
 // publicRoutes.pathPrefixes (ADR 0101) — a module that never declared the field matches nothing.
+// forwardPath must already be validated and cleaned (see PublicHandler) — this function only
+// matches, it does not itself guard against a traversal-shaped path.
 func matchesPublicRoute(mod registry.Module, forwardPath string) bool {
 	if mod.Spec.PublicRoutes == nil {
 		return false

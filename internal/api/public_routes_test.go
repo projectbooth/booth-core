@@ -119,6 +119,73 @@ func TestRouter_PublicRouteStripsTrustHeaders(t *testing.T) {
 	}
 }
 
+// A traversal-shaped path must 404 through the real router too, not just the handler in
+// isolation — confirms chi's own path handling doesn't do anything (e.g. its own cleaning, or
+// lack thereof) that changes the result at this layer.
+func TestRouter_PublicRouteRejectsTraversalShapedPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		target string
+	}{
+		{"literal dot-dot segment", "/modules/api/public/v1/../admin"},
+		{"lowercase percent-encoded dot-dot", "/modules/api/public/v1/%2e%2e/admin"},
+		{"uppercase percent-encoded dot-dot", "/modules/api/public/v1/%2E%2E/admin"},
+		{"percent-encoded slash splitting a dot-dot out of the final segment", "/modules/api/public/v1/..%2fadmin"},
+		{"literal single-dot segment", "/modules/api/public/v1/./x"},
+		{"double-encoded dot-dot", "/modules/api/public/v1/%252e%252e/admin"},
+		{"backslash", "/modules/api/public/v1/..%5c..%5cadmin"},
+		{"embedded NUL byte", "/modules/api/public/v1/%00/admin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idp := newTestIDP(t)
+			var gotPath *string
+			router := routerWith(t, idp, func(d *Deps) { _, gotPath = addPublicBackend(t, d, "api", []string{"/v1/"}) })
+
+			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusNotFound {
+				t.Errorf("status = %d, want 404", rec.Code)
+			}
+			if *gotPath != "" {
+				t.Errorf("request reached the module backend at %q; must never be proxied", *gotPath)
+			}
+		})
+	}
+}
+
+// A doubled slash and an exact-prefix-with-trailing-slash request both still work correctly
+// through the real router, and an ordinary multi-segment path is unaffected.
+func TestRouter_PublicRouteBenignPathShapesStillWork(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		target   string
+		wantPath string
+	}{
+		{"doubled slash is cleaned", "/modules/api/public/v1//x", "/v1/x"},
+		{"exact prefix with trailing slash", "/modules/api/public/v1/", "/v1/"},
+		{"ordinary multi-segment path", "/modules/api/public/v1/x/y", "/v1/x/y"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idp := newTestIDP(t)
+			var gotPath *string
+			router := routerWith(t, idp, func(d *Deps) { _, gotPath = addPublicBackend(t, d, "api", []string{"/v1/"}) })
+
+			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			if *gotPath != tc.wantPath {
+				t.Errorf("forwarded path = %q, want %q", *gotPath, tc.wantPath)
+			}
+		})
+	}
+}
+
 // ADR 0101 item 7: the ordinary /modules/{id}/* route is unchanged by this new route's presence
 // — it still requires a real platform login, same as before this change.
 func TestRouter_OrdinaryGatewayRouteStillRequiresAuth(t *testing.T) {
