@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""booth-admin: account and workspace administration against Keycloak.
+
+Operations tooling only -- this talks to Keycloak's own Admin REST API. It does not talk to
+booth-core at all: core has no user/workspace/membership management by design
+(booth-architecture/decisions/0025-workspace-role-claim-shape.md), and Keycloak (or whichever
+OIDC provider a deployment runs) is the source of truth. Core derives workspace membership and
+role entirely from the `groups` claim on a verified token -- see contracts/core-platform-api.md
+and ADR 0025/0094 -- so what this script actually does is maintain a Keycloak group tree shaped
+like:
+
+    /workspaces/<slug>/owner
+    /workspaces/<slug>/editor
+    /workspaces/<slug>/viewer
+    /platform/operator
+
+and manage which users belong to which of those groups. A membership change takes effect for a
+user the next time their token refreshes (sign out and back in to force it sooner).
+
+Python 3 standard library only -- no pip install needed on an operator's machine.
+
+Config (environment variables):
+    KEYCLOAK_URL             Base URL, e.g. https://keycloak.example.com. Required.
+    KEYCLOAK_REALM           Realm name. Defaults to "booth".
+    KEYCLOAK_ADMIN_USER      Admin username (master realm, admin-cli). Required.
+    KEYCLOAK_ADMIN_PASSWORD  Admin password. If unset, prompted for silently. Never accept this
+                              (or any secret) as a command-line argument -- it would show up in
+                              `ps`, shell history, and process lists.
+
+Usage:
+    booth-admin create-workspace <slug>
+    booth-admin create-user <username> --email <email> [--name "First Last"] [--verify-email]
+    booth-admin add-member <username> <slug> <owner|editor|viewer>
+    booth-admin remove-member <username> <slug>
+    booth-admin grant-operator <username>
+    booth-admin revoke-operator <username>
+    booth-admin list-workspaces
+    booth-admin list-members <slug>
+
+All subcommands accept --dry-run, which prints the requests that would be made (without making
+any change) -- read-only lookups still happen, since dry-run needs to know the current state to
+say what it would do.
+
+This script never deletes a user or a workspace, and has no delete subcommand for either --
+remove-member only removes a group membership, leaving the user and the workspace's groups
+themselves untouched.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import re
+import secrets
+import string
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# ADR 0025 item 3: the workspace slug grammar, matched before any request is sent.
+SLUG_PATTERN = re.compile(r"^[a-z0-9-]+$")
+ROLES = ("owner", "editor", "viewer")
+
+
+class BoothAdminError(Exception):
+    """A clear, user-facing failure -- caught in main() and reported with a non-zero exit."""
+
+
+class KeycloakClient:
+    """A thin wrapper over Keycloak's Admin REST API. Holds the admin token in memory only --
+    never written to disk, fetched fresh once per run (see main())."""
+
+    def __init__(self, base_url, realm, token, dry_run):
+        self.base_url = base_url.rstrip("/")
+        self.realm = realm
+        self.token = token
+        self.dry_run = dry_run
+
+    def _request(self, method, path, body=None, allow_404=False):
+        url = self.base_url + path
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        if method in ("POST", "PUT", "DELETE") and self.dry_run:
+            rendered = f"{method} {url}"
+            if body is not None:
+                rendered += " " + json.dumps(body)
+            print(f"[dry-run] {rendered}")
+            return None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", "Bearer " + self.token)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req) as resp:
+                raw = resp.read()
+                if not raw:
+                    return None
+                return json.loads(raw.decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 404 and allow_404:
+                return None
+            raise BoothAdminError(_format_keycloak_error(e)) from None
+        except urllib.error.URLError as e:
+            raise BoothAdminError(f"could not reach {self.base_url}: {e.reason}") from None
+
+    def get(self, path, allow_404=False):
+        return self._request("GET", path, allow_404=allow_404)
+
+    def post(self, path, body):
+        return self._request("POST", path, body=body)
+
+    def put(self, path, body=None):
+        return self._request("PUT", path, body=body if body is not None else {})
+
+    def delete(self, path, allow_404=False):
+        return self._request("DELETE", path, allow_404=allow_404)
+
+    def admin_path(self, suffix):
+        return f"/admin/realms/{self.realm}{suffix}"
+
+
+def _format_keycloak_error(e):
+    body = e.read()
+    message = None
+    if body:
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+            message = (
+                parsed.get("errorMessage")
+                or parsed.get("error_description")
+                or parsed.get("error")
+            )
+        except (ValueError, UnicodeDecodeError):
+            message = body.decode("utf-8", errors="replace")
+    if message:
+        return f"Keycloak returned HTTP {e.code}: {message}"
+    return f"Keycloak returned HTTP {e.code} ({e.reason})"
+
+
+# --- Group tree helpers -----------------------------------------------------------------------
+#
+# contracts/core-platform-api.md / ADR 0025/0094: a user's workspace membership and role come
+# from a full group PATH on their token's groups claim, e.g. "/workspaces/acme/editor" or the
+# literal "/platform/operator". Keycloak's own group tree must therefore actually nest the
+# groups this way (not just a flat group named "acme-editor") for the configured
+# oidc-group-membership-mapper (full.path: true) to emit the right strings.
+
+
+def _top_level_groups(kc):
+    return kc.get(kc.admin_path("/groups")) or []
+
+
+def _children(kc, group_id):
+    return kc.get(kc.admin_path(f"/groups/{group_id}/children")) or []
+
+
+def _find_by_name(groups, name):
+    for g in groups:
+        if g.get("name") == name:
+            return g
+    return None
+
+
+def ensure_group_path(kc, parts):
+    """Ensures a chain of nested groups exists (e.g. ["workspaces", "acme", "owner"]), creating
+    whatever's missing. Returns (leaf_group_id_or_None, created_bool). leaf_group_id is None in
+    --dry-run when any ancestor had to be (hypothetically) created, since there is no real id to
+    keep descending under -- the remaining levels are printed and the walk stops there."""
+    parent_id = None
+    created_any = False
+    siblings = _top_level_groups(kc)
+    for depth, name in enumerate(parts):
+        existing = _find_by_name(siblings, name)
+        if existing is not None:
+            parent_id = existing["id"]
+            if depth + 1 < len(parts):
+                siblings = _children(kc, parent_id)
+            continue
+
+        created_any = True
+        if parent_id is None:
+            kc.post(kc.admin_path("/groups"), {"name": name})
+        else:
+            kc.post(kc.admin_path(f"/groups/{parent_id}/children"), {"name": name})
+
+        if kc.dry_run:
+            # No real id was created; print the rest of the chain as hypothetical and stop.
+            for remaining in parts[depth + 1 :]:
+                print(f"[dry-run] would also create group {remaining!r} under it")
+            return None, True
+
+        # Re-fetch to get the real id of what was just created.
+        refreshed = _children(kc, parent_id) if parent_id else _top_level_groups(kc)
+        found = _find_by_name(refreshed, name)
+        if found is None:
+            raise BoothAdminError(f"created group {name!r} but could not find it immediately after")
+        parent_id = found["id"]
+        siblings = _children(kc, parent_id) if depth + 1 < len(parts) else siblings
+    return parent_id, created_any
+
+
+def find_group_path(kc, parts):
+    """Looks up an existing nested group chain without creating anything. Returns the leaf
+    group's id, or None if any part of the chain is missing."""
+    parent_id = None
+    siblings = _top_level_groups(kc)
+    for name in parts:
+        existing = _find_by_name(siblings, name)
+        if existing is None:
+            return None
+        parent_id = existing["id"]
+        siblings = _children(kc, parent_id)
+    return parent_id
+
+
+# --- User helpers ------------------------------------------------------------------------------
+
+
+def find_user(kc, username):
+    results = kc.get(kc.admin_path(f"/users?username={urllib.parse.quote(username)}&exact=true")) or []
+    for u in results:
+        if u.get("username") == username:
+            return u
+    return None
+
+
+def require_user(kc, username):
+    user = find_user(kc, username)
+    if user is None:
+        raise BoothAdminError(f"no such user {username!r}")
+    return user
+
+
+def user_group_paths(kc, user_id):
+    groups = kc.get(kc.admin_path(f"/users/{user_id}/groups")) or []
+    return {g.get("path") for g in groups if g.get("path")}
+
+
+def generate_temp_password():
+    # 24 random characters from letters+digits+a few symbols -- printed once, never logged,
+    # never written to a file (see create_user below).
+    alphabet = string.ascii_letters + string.digits + "!@#%^&*-_=+"
+    return "".join(secrets.choice(alphabet) for _ in range(24))
+
+
+# --- Validation --------------------------------------------------------------------------------
+
+
+def validate_slug(slug):
+    if not SLUG_PATTERN.match(slug):
+        raise BoothAdminError(
+            f"invalid workspace slug {slug!r}: must match {SLUG_PATTERN.pattern} "
+            "(ADR 0025) -- lowercase letters, digits, hyphens only"
+        )
+
+
+def validate_keycloak_url(url):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise BoothAdminError(f"KEYCLOAK_URL {url!r} must be http:// or https://")
+    if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1"):
+        raise BoothAdminError(
+            f"refusing a plain http:// KEYCLOAK_URL ({url!r}) against a non-local host "
+            f"{parsed.hostname!r} -- the admin password and every token this script fetches "
+            "would cross the network in the clear. Use https://, or point this at localhost/"
+            "127.0.0.1 (e.g. through kubectl port-forward)."
+        )
+
+
+# --- Subcommands -------------------------------------------------------------------------------
+
+
+def cmd_create_workspace(kc, args):
+    existing = find_group_path(kc, ["workspaces", args.slug])
+    if existing is not None:
+        print(f"workspace {args.slug!r}: already present")
+        return
+
+    if kc.dry_run:
+        print(f"[dry-run] would create group {args.slug!r} under /workspaces, with child groups: {', '.join(ROLES)}")
+        print(f"workspace {args.slug!r}: would be created")
+        return
+
+    for role in ROLES:
+        ensure_group_path(kc, ["workspaces", args.slug, role])
+    print(f"workspace {args.slug!r}: created")
+
+
+def cmd_create_user(kc, args):
+    existing = find_user(kc, args.username)
+    if existing is not None:
+        print(f"user {args.username!r}: already present")
+        return
+
+    body = {
+        "username": args.username,
+        "email": args.email,
+        "enabled": True,
+        "emailVerified": bool(args.verify_email),
+        "requiredActions": ["UPDATE_PASSWORD"],
+    }
+    if args.name:
+        parts = args.name.split(None, 1)
+        body["firstName"] = parts[0]
+        if len(parts) > 1:
+            body["lastName"] = parts[1]
+
+    password = generate_temp_password()
+
+    if kc.dry_run:
+        kc.post(kc.admin_path("/users"), body)
+        print("[dry-run] would also set a generated temporary password (UPDATE_PASSWORD required)")
+        print(f"user {args.username!r}: would be created")
+        return
+
+    kc.post(kc.admin_path("/users"), body)
+    created = find_user(kc, args.username)
+    if created is None:
+        raise BoothAdminError(f"created user {args.username!r} but could not find it immediately after")
+
+    kc.put(kc.admin_path(f"/users/{created['id']}/reset-password"), {
+        "type": "password",
+        "value": password,
+        "temporary": True,
+    })
+
+    print(f"user {args.username!r}: created")
+    print(f"Temporary password (shown once -- it is not logged or saved anywhere): {password}")
+
+
+def _role_group_parts(slug, role):
+    return ["workspaces", slug, role]
+
+
+def cmd_add_member(kc, args):
+    # add-member deliberately does not create the workspace itself -- only create-workspace
+    # does, so a role subgroup is never created alone without its two siblings.
+    if find_group_path(kc, ["workspaces", args.slug]) is None:
+        raise BoothAdminError(f"no such workspace {args.slug!r} -- run create-workspace first")
+    user = require_user(kc, args.username)
+
+    # Self-heals a single missing role subgroup under an otherwise-existing workspace (e.g. one
+    # manually removed outside this script); does not create the workspace tree from scratch.
+    target_id, _ = ensure_group_path(kc, _role_group_parts(args.slug, args.role))
+    target_path = f"/workspaces/{args.slug}/{args.role}"
+
+    current_paths = user_group_paths(kc, user["id"])
+    other_role_paths = {
+        f"/workspaces/{args.slug}/{r}" for r in ROLES if r != args.role
+    } & current_paths
+
+    already_in_target = target_path in current_paths
+
+    for other_path in other_role_paths:
+        other_id = find_group_path(kc, other_path.strip("/").split("/"))
+        if other_id is not None:
+            kc.delete(kc.admin_path(f"/users/{user['id']}/groups/{other_id}"), allow_404=True)
+
+    if not already_in_target and target_id is not None:
+        kc.put(kc.admin_path(f"/users/{user['id']}/groups/{target_id}"))
+
+    will = "would be " if kc.dry_run else ""
+    if already_in_target and not other_role_paths:
+        print(f"{args.username!r} is already {args.role} in {args.slug!r}: no change")
+    elif other_role_paths:
+        old_roles = ", ".join(sorted(p.rsplit("/", 1)[1] for p in other_role_paths))
+        verb = "would move" if kc.dry_run else "moved"
+        print(f"{args.username!r} {verb} from {old_roles} to {args.role} in {args.slug!r}")
+    else:
+        print(f"{args.username!r} {will}added as {args.role} in {args.slug!r}")
+
+
+def cmd_remove_member(kc, args):
+    user = require_user(kc, args.username)
+    current_paths = user_group_paths(kc, user["id"])
+    removed_any = False
+    for role in ROLES:
+        path = f"/workspaces/{args.slug}/{role}"
+        if path not in current_paths:
+            continue
+        group_id = find_group_path(kc, ["workspaces", args.slug, role])
+        if group_id is not None:
+            kc.delete(kc.admin_path(f"/users/{user['id']}/groups/{group_id}"), allow_404=True)
+            removed_any = True
+    if removed_any:
+        will = "would be removed" if kc.dry_run else "removed"
+        print(f"{args.username!r} {will} from {args.slug!r}")
+    else:
+        print(f"{args.username!r} was not a member of {args.slug!r}: no change")
+
+
+def _set_operator(kc, username, grant):
+    user = require_user(kc, username)
+    current_paths = user_group_paths(kc, user["id"])
+    is_operator = "/platform/operator" in current_paths
+
+    if grant:
+        if is_operator:
+            print(f"{username!r} is already a platform operator: no change")
+            return
+        group_id, _ = ensure_group_path(kc, ["platform", "operator"])
+        if group_id is not None:
+            kc.put(kc.admin_path(f"/users/{user['id']}/groups/{group_id}"))
+        will = "would be granted" if kc.dry_run else "granted"
+        print(f"{username!r} {will} platform operator")
+    else:
+        if not is_operator:
+            print(f"{username!r} is not a platform operator: no change")
+            return
+        group_id = find_group_path(kc, ["platform", "operator"])
+        if group_id is not None:
+            kc.delete(kc.admin_path(f"/users/{user['id']}/groups/{group_id}"), allow_404=True)
+        will = "would be revoked" if kc.dry_run else "revoked"
+        print(f"{username!r} {will} as platform operator")
+
+
+def cmd_grant_operator(kc, args):
+    _set_operator(kc, args.username, grant=True)
+
+
+def cmd_revoke_operator(kc, args):
+    _set_operator(kc, args.username, grant=False)
+
+
+def cmd_list_workspaces(kc, args):
+    workspaces_id = find_group_path(kc, ["workspaces"])
+    if workspaces_id is None:
+        print("(no workspaces group exists yet)")
+        return
+    children = _children(kc, workspaces_id)
+    if not children:
+        print("(no workspaces)")
+        return
+    for g in sorted(children, key=lambda g: g.get("name", "")):
+        print(g["name"])
+
+
+def cmd_list_members(kc, args):
+    rows = []
+    for role in ROLES:
+        group_id = find_group_path(kc, ["workspaces", args.slug, role])
+        if group_id is None:
+            continue
+        members = kc.get(kc.admin_path(f"/groups/{group_id}/members")) or []
+        for m in members:
+            rows.append((m.get("username", "?"), role))
+    if not rows:
+        print(f"(no members in {args.slug!r})")
+        return
+    for username, role in sorted(rows):
+        print(f"{username}\t{role}")
+
+
+# --- CLI wiring --------------------------------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="booth-admin",
+        description="Account and workspace administration against Keycloak (see this file's own module docstring).",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add(name, func, help_text):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument("--dry-run", action="store_true", help="print requests without making any change")
+        p.set_defaults(func=func)
+        return p
+
+    p = add("create-workspace", cmd_create_workspace, "create a workspace's owner/editor/viewer groups")
+    p.add_argument("slug")
+
+    p = add("create-user", cmd_create_user, "create a user with a generated temporary password")
+    p.add_argument("username")
+    p.add_argument("--email", required=True)
+    p.add_argument("--name", help='display name, e.g. "First Last"')
+    p.add_argument("--verify-email", action="store_true", help="mark the email as verified")
+
+    p = add("add-member", cmd_add_member, "add (or change the role of) a workspace member")
+    p.add_argument("username")
+    p.add_argument("slug")
+    p.add_argument("role", choices=ROLES)
+
+    p = add("remove-member", cmd_remove_member, "remove a user's membership in a workspace")
+    p.add_argument("username")
+    p.add_argument("slug")
+
+    p = add("grant-operator", cmd_grant_operator, "grant the platform-operator claim")
+    p.add_argument("username")
+
+    p = add("revoke-operator", cmd_revoke_operator, "revoke the platform-operator claim")
+    p.add_argument("username")
+
+    p = add("list-workspaces", cmd_list_workspaces, "list all workspace slugs")
+
+    p = add("list-members", cmd_list_members, "list a workspace's members and roles")
+    p.add_argument("slug")
+
+    return parser
+
+
+def get_admin_token(base_url, admin_user, admin_password):
+    url = base_url.rstrip("/") + "/realms/master/protocol/openid-connect/token"
+    form = urllib.parse.urlencode({
+        "grant_type": "password",
+        "client_id": "admin-cli",
+        "username": admin_user,
+        "password": admin_password,
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=form, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode("utf-8"))["access_token"]
+    except urllib.error.HTTPError as e:
+        raise BoothAdminError(_format_keycloak_error(e)) from None
+    except urllib.error.URLError as e:
+        raise BoothAdminError(f"could not reach {base_url}: {e.reason}") from None
+
+
+# Which subcommands carry a slug positional argument, validated before any request (including
+# the admin token fetch) per the task's own requirement.
+_SLUG_COMMANDS = {"create-workspace", "add-member", "remove-member", "list-members"}
+
+
+def validate_static_args(args):
+    """Validates everything that can be checked without talking to Keycloak at all -- called
+    before the admin token is even fetched, so a malformed slug never costs a network round
+    trip or prompts for a password it won't end up needing."""
+    if args.command in _SLUG_COMMANDS:
+        validate_slug(args.slug)
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        validate_static_args(args)
+
+        base_url = os.environ.get("KEYCLOAK_URL")
+        if not base_url:
+            raise BoothAdminError("KEYCLOAK_URL is required")
+        validate_keycloak_url(base_url)
+
+        realm = os.environ.get("KEYCLOAK_REALM", "booth")
+        admin_user = os.environ.get("KEYCLOAK_ADMIN_USER")
+        if not admin_user:
+            raise BoothAdminError("KEYCLOAK_ADMIN_USER is required")
+
+        admin_password = os.environ.get("KEYCLOAK_ADMIN_PASSWORD")
+        if not admin_password:
+            admin_password = getpass.getpass(f"Keycloak admin password for {admin_user}: ")
+        if not admin_password:
+            raise BoothAdminError("no admin password given")
+
+        # Fetched fresh every run; never written to disk (per the task's own requirement).
+        token = get_admin_token(base_url, admin_user, admin_password)
+        kc = KeycloakClient(base_url, realm, token, dry_run=args.dry_run)
+
+        args.func(kc, args)
+    except BoothAdminError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print()
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
