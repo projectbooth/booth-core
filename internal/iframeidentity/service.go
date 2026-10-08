@@ -36,6 +36,11 @@ const (
 	// `aud`, carried as its own claim purely for a downstream log line to read without decoding
 	// `aud`'s array-or-string ambiguity.
 	ModuleClaim = "booth_module"
+
+	// PreferredUsernameClaim is the standard OIDC claim name (not a booth_-prefixed one, unlike
+	// ModuleClaim above) — a module already reads this key off a real token, so it reads it
+	// identically here.
+	PreferredUsernameClaim = "preferred_username"
 )
 
 // Options configures a Service.
@@ -102,8 +107,11 @@ var errInvalidAssertionInput = errors.New("cannot mint an iframe-identity assert
 // it with no new logic. isOperator (ADR 0094's correction, 2026-09-30/2026-10-07), when true,
 // appends `/platform/operator` as a second groups entry — the same literal string a module
 // already checks for directly off a real OIDC token's groups claim, so an iframe-proxied module
-// finally has a way to see it too. Lifetime is fixed at DefaultTTL.
-func (s *Service) Mint(moduleID, workspace, role, subject string, isOperator bool) (string, error) {
+// finally has a way to see it too. preferredUsername, when non-empty, is carried as the standard
+// `preferred_username` claim — a module that would otherwise only see the raw `sub` can show
+// something more readable; omitted entirely when empty (not every provider populates it), same
+// as a real OIDC token would omit it. Lifetime is fixed at DefaultTTL.
+func (s *Service) Mint(moduleID, workspace, role, subject string, isOperator bool, preferredUsername string) (string, error) {
 	if moduleID == "" || workspace == "" || subject == "" || auth.RoleRank(auth.Role(role)) == 0 {
 		return "", fmt.Errorf("%w: moduleID=%q workspace=%q role=%q subject=%q",
 			errInvalidAssertionInput, moduleID, workspace, role, subject)
@@ -131,6 +139,9 @@ func (s *Service) Mint(moduleID, workspace, role, subject string, isOperator boo
 	extra := map[string]any{
 		s.opts.GroupsClaim: groups,
 		ModuleClaim:        moduleID,
+	}
+	if preferredUsername != "" {
+		extra[PreferredUsernameClaim] = preferredUsername
 	}
 	raw, err := jwt.Signed(signer).Claims(claims).Claims(extra).Serialize()
 	if err != nil {

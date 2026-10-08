@@ -53,11 +53,12 @@ func NewIframeURLIssuer(tokens *IframeTokenIssuer) *IframeURLIssuer {
 // whatever origin the browser is already on with no operator configuration at all.
 func (i *IframeURLIssuer) URLFor(moduleID string, identity auth.Identity) (string, error) {
 	token, err := i.tokens.Issue(IframeClaims{
-		ModuleID:   moduleID,
-		Workspace:  identity.Active.Workspace,
-		Role:       string(identity.Active.Role),
-		Subject:    identity.Claims.Subject,
-		IsOperator: auth.IsOperator(identity.Claims.Groups),
+		ModuleID:          moduleID,
+		Workspace:         identity.Active.Workspace,
+		Role:              string(identity.Active.Role),
+		Subject:           identity.Claims.Subject,
+		IsOperator:        auth.IsOperator(identity.Claims.Groups),
+		PreferredUsername: identity.Claims.PreferredUsername,
 	}, navigationTokenTTL)
 	if err != nil {
 		return "", fmt.Errorf("issuing iframe token: %w", err)
@@ -205,7 +206,7 @@ func (g *Gateway) proxyIframeRequest(w http.ResponseWriter, r *http.Request, cla
 		// header rather than a stale or client-supplied one reaching the module.
 		req.Header.Del(auth.HeaderBoothIdentity)
 		if g.IframeIdentity != nil {
-			token, err := g.IframeIdentity.Mint(claims.ModuleID, claims.Workspace, claims.Role, claims.Subject, claims.IsOperator)
+			token, err := g.IframeIdentity.Mint(claims.ModuleID, claims.Workspace, claims.Role, claims.Subject, claims.IsOperator, claims.PreferredUsername)
 			if err != nil {
 				log.Printf("iframe-proxy identity: minting failed for module %q: %v", claims.ModuleID, err)
 			} else {

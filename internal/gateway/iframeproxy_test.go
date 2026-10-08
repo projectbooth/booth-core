@@ -196,6 +196,56 @@ func TestIframeURLIssuer_URLForDerivesIsOperatorFromGroups(t *testing.T) {
 	}
 }
 
+// Optional small addition: URLFor derives PreferredUsername from the caller's real token, and it
+// must survive the Issue -> Verify round trip — specifically including a value containing "|",
+// the one character this token's pipe-delimited format (see encodeClaims' doc comment) can't
+// otherwise tolerate. This is the regression test for the percent-encoding fix: mutation-tested
+// by temporarily removing it, which confirmed the real failure mode is Verify returning "wrong
+// number of claim fields" (the raw pipe splits the username into an extra field) — a legitimate
+// user whose IdP happens to set a username containing "|" would be denied the iframe-proxy
+// session entirely, not silently misrouted.
+func TestIframeURLIssuer_URLForPreferredUsernameSurvivesRoundTripIncludingPipeCharacter(t *testing.T) {
+	tokens := NewIframeTokenIssuer([]byte("test-secret"))
+	issuer := NewIframeURLIssuer(tokens)
+
+	for _, tc := range []struct {
+		name     string
+		username string
+	}{
+		{"ordinary username", "alice"},
+		{"empty (the common case)", ""},
+		{"contains a literal pipe", "alice|injected-field"},
+		{"contains other special characters", "alice bob/éx&=?"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			iframeURL, err := issuer.URLFor("superset", auth.Identity{
+				Claims: &auth.Claims{Subject: "user-1", PreferredUsername: tc.username},
+				Active: auth.Membership{Workspace: "acme-analytics", Role: auth.RoleOwner},
+			})
+			if err != nil {
+				t.Fatalf("URLFor: %v", err)
+			}
+			parsedURL, err := url.Parse(iframeURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claims, err := tokens.Verify(parsedURL.Query().Get(iframeQueryParam))
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+			if claims.PreferredUsername != tc.username {
+				t.Errorf("PreferredUsername = %q, want %q", claims.PreferredUsername, tc.username)
+			}
+			// Confirms the whole token still decoded successfully (an unescaped pipe would have
+			// made Verify fail outright — see this test's doc comment), not just that
+			// PreferredUsername itself came back right.
+			if claims.Role != "owner" {
+				t.Errorf("Role = %q, want owner", claims.Role)
+			}
+		})
+	}
+}
+
 // --- Bug 1 (ADR 0069's "Implementation notes"): the fallback must not proxy a top-level
 // --- document navigation into whatever module happens to have a live session cookie. ----------
 

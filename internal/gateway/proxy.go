@@ -48,8 +48,11 @@ type Gateway struct {
 // doesn't need to import the JOSE/JWT libraries directly. isOperator (ADR 0094's correction,
 // 2026-09-30/2026-10-07) carries the caller's real token's /platform/operator claim through to
 // the minted assertion's groups, since an iframe-proxied module never sees that real token.
+// preferredUsername, when non-empty, carries the caller's real token's preferred_username claim
+// through the same way, so a module (e.g. booth-streamlit) can show something more readable
+// than the raw subject.
 type IframeIdentityMinter interface {
-	Mint(moduleID, workspace, role, subject string, isOperator bool) (string, error)
+	Mint(moduleID, workspace, role, subject string, isOperator bool, preferredUsername string) (string, error)
 }
 
 func New(modules ModuleLookup) *Gateway {
