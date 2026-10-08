@@ -16,23 +16,26 @@ import (
 // test can tell exactly what reached it without decoding a real JWT.
 type stubIdentityMinter struct {
 	calls []struct {
-		moduleID, workspace, role, subject string
-		isOperator                         bool
+		moduleID, workspace, role, subject, preferredUsername string
+		isOperator                                            bool
 	}
 	err error
 }
 
-func (s *stubIdentityMinter) Mint(moduleID, workspace, role, subject string, isOperator bool) (string, error) {
+func (s *stubIdentityMinter) Mint(moduleID, workspace, role, subject string, isOperator bool, preferredUsername string) (string, error) {
 	s.calls = append(s.calls, struct {
-		moduleID, workspace, role, subject string
-		isOperator                         bool
-	}{moduleID, workspace, role, subject, isOperator})
+		moduleID, workspace, role, subject, preferredUsername string
+		isOperator                                            bool
+	}{moduleID, workspace, role, subject, preferredUsername, isOperator})
 	if s.err != nil {
 		return "", s.err
 	}
 	suffix := ""
 	if isOperator {
 		suffix = ":operator"
+	}
+	if preferredUsername != "" {
+		suffix += ":" + preferredUsername
 	}
 	return fmt.Sprintf("assertion:%s:%s:%s:%s%s", moduleID, workspace, role, subject, suffix), nil
 }
@@ -108,6 +111,45 @@ func TestIframeProxy_AttachesTheSignedIdentityAssertion(t *testing.T) {
 		}
 		if got := gotHeader.Get(auth.HeaderBoothIdentity); got != want {
 			t.Errorf("%s = %q, want %q", auth.HeaderBoothIdentity, got, want)
+		}
+	})
+}
+
+// Optional small addition: a caller's preferred_username reaches Mint through the iframe-proxy
+// path the same way IsOperator does, so a module (e.g. booth-streamlit) can show something more
+// readable than the raw subject. Empty (the common case) passes through unchanged.
+func TestIframeProxy_CarriesPreferredUsernameThroughToMint(t *testing.T) {
+	t.Run("non-empty", func(t *testing.T) {
+		claims := IframeClaims{ModuleID: "superset", Workspace: "acme-analytics", Role: "editor", Subject: "u-alice", PreferredUsername: "alice"}
+		minter := &stubIdentityMinter{}
+		gw, tokens, _ := newIdentityFixture(t, minter)
+		entry := gw.IframeEntryHandler(tokens, func(r *http.Request) string { return "superset" }, func(r *http.Request) string { return "/x" })
+
+		rec := httptest.NewRecorder()
+		entry.ServeHTTP(rec, sessionRequest(t, tokens, claims, nil))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		if len(minter.calls) != 1 || minter.calls[0].preferredUsername != "alice" {
+			t.Fatalf("Mint called with %+v, want preferredUsername=alice", minter.calls)
+		}
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		claims := IframeClaims{ModuleID: "superset", Workspace: "acme-analytics", Role: "viewer", Subject: "u-bob"}
+		minter := &stubIdentityMinter{}
+		gw, tokens, _ := newIdentityFixture(t, minter)
+		entry := gw.IframeEntryHandler(tokens, func(r *http.Request) string { return "superset" }, func(r *http.Request) string { return "/x" })
+
+		rec := httptest.NewRecorder()
+		entry.ServeHTTP(rec, sessionRequest(t, tokens, claims, nil))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		if len(minter.calls) != 1 || minter.calls[0].preferredUsername != "" {
+			t.Fatalf("Mint called with %+v, want preferredUsername=\"\"", minter.calls)
 		}
 	})
 }

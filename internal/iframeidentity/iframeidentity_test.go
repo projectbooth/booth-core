@@ -62,7 +62,7 @@ func claimsOf(t *testing.T, svc *Service, raw string) (jwt.Claims, map[string]an
 func TestMint_ShapeMatchesADR0069(t *testing.T) {
 	svc := newFixture(t)
 	now := time.Now()
-	raw, err := svc.Mint("superset", "acme", "editor", "u-alice", false)
+	raw, err := svc.Mint("superset", "acme", "editor", "u-alice", false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestMint_CarriesThePlatformOperatorClaimOnlyWhenRequested(t *testing.T) {
 
 	t.Run("isOperator true", func(t *testing.T) {
 		svc := newFixture(t)
-		raw, err := svc.Mint("superset", "acme", "editor", "u-alice", true)
+		raw, err := svc.Mint("superset", "acme", "editor", "u-alice", true, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -155,7 +155,7 @@ func TestMint_CarriesThePlatformOperatorClaimOnlyWhenRequested(t *testing.T) {
 
 	t.Run("isOperator false (the default)", func(t *testing.T) {
 		svc := newFixture(t)
-		raw, err := svc.Mint("superset", "acme", "editor", "u-bob", false)
+		raw, err := svc.Mint("superset", "acme", "editor", "u-bob", false, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -169,10 +169,39 @@ func TestMint_CarriesThePlatformOperatorClaimOnlyWhenRequested(t *testing.T) {
 	})
 }
 
+// Optional small addition: a module that would otherwise only see the raw `sub` (e.g.
+// booth-streamlit) can show something more readable, mirroring a real OIDC token's own
+// `preferred_username` claim name exactly.
+func TestMint_CarriesPreferredUsernameOnlyWhenNonEmpty(t *testing.T) {
+	t.Run("non-empty", func(t *testing.T) {
+		svc := newFixture(t)
+		raw, err := svc.Mint("superset", "acme", "editor", "u-alice", false, "alice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, extra := claimsOf(t, svc, raw)
+		if got := extra[PreferredUsernameClaim]; got != "alice" {
+			t.Errorf("%s = %v, want %q", PreferredUsernameClaim, got, "alice")
+		}
+	})
+
+	t.Run("empty omits the claim entirely", func(t *testing.T) {
+		svc := newFixture(t)
+		raw, err := svc.Mint("superset", "acme", "editor", "u-bob", false, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, extra := claimsOf(t, svc, raw)
+		if _, present := extra[PreferredUsernameClaim]; present {
+			t.Errorf("claims = %v, want no %s claim at all when empty", extra, PreferredUsernameClaim)
+		}
+	})
+}
+
 func TestMint_HonoursTheConfiguredGroupsClaimName(t *testing.T) {
 	keys, _ := NewKeys()
 	svc := NewService(keys, Options{Issuer: issuer, GroupsClaim: "roles"})
-	raw, err := svc.Mint("notebooks", "acme", "viewer", "u-bob", false)
+	raw, err := svc.Mint("notebooks", "acme", "viewer", "u-bob", false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +217,7 @@ func TestMint_HonoursTheConfiguredGroupsClaimName(t *testing.T) {
 func TestMint_DefaultGroupsClaimIsGroups(t *testing.T) {
 	keys, _ := NewKeys()
 	svc := NewService(keys, Options{Issuer: issuer}) // GroupsClaim left empty
-	raw, err := svc.Mint("notebooks", "acme", "viewer", "u-bob", false)
+	raw, err := svc.Mint("notebooks", "acme", "viewer", "u-bob", false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +237,7 @@ func TestMint_RejectsMalformedInputsRatherThanMintingSomethingMeaningless(t *tes
 		"role case-mismatch": {"superset", "acme", "Editor", "u-alice"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := svc.Mint(args[0], args[1], args[2], args[3], false); err == nil {
+			if _, err := svc.Mint(args[0], args[1], args[2], args[3], false, ""); err == nil {
 				t.Fatal("Mint accepted malformed input")
 			}
 		})
@@ -237,7 +266,7 @@ func TestNewService_TrimsTrailingSlashFromIssuer(t *testing.T) {
 	if svc.Issuer() != issuer {
 		t.Errorf("Issuer() = %q, want the trailing slash trimmed", svc.Issuer())
 	}
-	raw, err := svc.Mint("superset", "acme", "owner", "u-alice", false)
+	raw, err := svc.Mint("superset", "acme", "owner", "u-alice", false, "")
 	if err != nil {
 		t.Fatal(err)
 	}

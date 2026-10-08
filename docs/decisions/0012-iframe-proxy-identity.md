@@ -102,6 +102,29 @@ matching half):
    `f8b6804`), so a relative URL resolves against whatever origin the browser is already on — no
    operator configuration needed, and the failure mode is removed rather than made configurable.
 
+## Small addition (2026-10-08): `preferred_username` on the assertion
+
+Asked for separately, not driven by a new ADR: `booth-streamlit` wants to show something more
+readable than the raw `sub` for an iframe-proxied caller. The shape is a direct mirror of ADR
+0094's correction (`IsOperator`, above) — `IframeClaims.PreferredUsername`
+(`internal/gateway/iframetoken.go`) is set at `IframeURLIssuer.URLFor` time from
+`identity.Claims.PreferredUsername`, carried through the iframe session token, and threaded into
+`iframeidentity.Service.Mint`'s new `preferredUsername` parameter, which emits it as the standard
+`preferred_username` claim (same key a real OIDC token already uses) when non-empty — omitted
+entirely when empty, matching what a real token would do.
+
+**The one real wrinkle**: this token's encoding (`encodeClaims`/`decodeClaims`) is a plain
+pipe-delimited string specifically because every existing field is guaranteed never to contain
+`|` (module IDs/workspace slugs are regex-restricted, role is a fixed enum, `IsOperator` is a fixed
+`"1"`/`"0"`, and `sub` is OIDC-guaranteed safe ASCII). `preferred_username` carries none of those
+guarantees — it's a free-form display string an IdP can populate with anything, including a
+literal `|`. Verified directly, not assumed: percent-encoding (`url.QueryEscape`/`QueryUnescape`)
+is applied to this one field before joining, and mutation-testing the fix (temporarily removing
+it) confirmed the real failure mode without it is `Verify` returning "wrong number of claim
+fields" — a legitimate user whose IdP happens to set a username containing `|` would be denied the
+iframe-proxy session entirely, not silently misrouted onto someone else's identity. Pinned by
+`TestIframeURLIssuer_URLForPreferredUsernameSurvivesRoundTripIncludingPipeCharacter`.
+
 ## Honest residual limits
 
 1. **No revocation, same as every short-lived-token design in this repo.** A 2-minute lifetime

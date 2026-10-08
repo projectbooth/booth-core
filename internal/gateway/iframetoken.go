@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,12 @@ type IframeClaims struct {
 	// identity.Claims.Groups and threaded through proxyIframeRequest's Mint call so the minted
 	// X-Booth-Identity assertion can carry it too.
 	IsOperator bool
+
+	// PreferredUsername carries the caller's real token's preferred_username claim through to
+	// the iframe session, the same way IsOperator does, so the minted X-Booth-Identity assertion
+	// can show a module (e.g. booth-streamlit) something more readable than the raw `sub`. Often
+	// empty — not every provider/client scope includes it (auth.Claims' own doc comment).
+	PreferredUsername string
 }
 
 // IframeTokenIssuer mints and verifies the short-lived, HMAC-signed tokens behind
@@ -85,11 +92,14 @@ func (i *IframeTokenIssuer) sign(payload string) string {
 }
 
 // encodeClaims/decodeClaims use a deliberately simple pipe-delimited format rather than
-// JSON+base64 — this token is never parsed by anything but this package, and none of the
-// fields can contain "|" (module IDs and workspace slugs are already restricted to
-// [a-z0-9-] by contracts/module-manifest.md and decision 0001; role is a fixed enum;
-// subject comes from the IdP's `sub` claim, which OIDC guarantees is safe ASCII; IsOperator
-// is a fixed "1"/"0").
+// JSON+base64 — this token is never parsed by anything but this package. Every field except
+// PreferredUsername is guaranteed not to contain "|" (module IDs and workspace slugs are
+// already restricted to [a-z0-9-] by contracts/module-manifest.md and decision 0001; role is a
+// fixed enum; subject comes from the IdP's `sub` claim, which OIDC guarantees is safe ASCII;
+// IsOperator is a fixed "1"/"0"). PreferredUsername has no such guarantee — it's a free-form
+// display string an IdP can populate with anything, including "|" — so it alone is
+// percent-encoded (url.QueryEscape/QueryUnescape) before joining, which both removes any literal
+// "|" and tolerates an empty string unchanged.
 func encodeClaims(c IframeClaims) string {
 	isOperator := "0"
 	if c.IsOperator {
@@ -97,6 +107,7 @@ func encodeClaims(c IframeClaims) string {
 	}
 	raw := strings.Join([]string{
 		c.ModuleID, c.Workspace, c.Role, c.Subject, strconv.FormatInt(c.ExpiresAt.Unix(), 10), isOperator,
+		url.QueryEscape(c.PreferredUsername),
 	}, "|")
 	return base64.RawURLEncoding.EncodeToString([]byte(raw))
 }
@@ -107,19 +118,24 @@ func decodeClaims(payload string) (IframeClaims, error) {
 		return IframeClaims{}, err
 	}
 	parts := strings.Split(string(raw), "|")
-	if len(parts) != 6 {
+	if len(parts) != 7 {
 		return IframeClaims{}, errors.New("wrong number of claim fields")
 	}
 	expUnix, err := strconv.ParseInt(parts[4], 10, 64)
 	if err != nil {
 		return IframeClaims{}, fmt.Errorf("parsing expiry: %w", err)
 	}
+	preferredUsername, err := url.QueryUnescape(parts[6])
+	if err != nil {
+		return IframeClaims{}, fmt.Errorf("decoding preferred username: %w", err)
+	}
 	return IframeClaims{
-		ModuleID:   parts[0],
-		Workspace:  parts[1],
-		Role:       parts[2],
-		Subject:    parts[3],
-		ExpiresAt:  time.Unix(expUnix, 0),
-		IsOperator: parts[5] == "1",
+		ModuleID:          parts[0],
+		Workspace:         parts[1],
+		Role:              parts[2],
+		Subject:           parts[3],
+		ExpiresAt:         time.Unix(expUnix, 0),
+		IsOperator:        parts[5] == "1",
+		PreferredUsername: preferredUsername,
 	}, nil
 }
