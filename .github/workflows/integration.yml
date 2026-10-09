@@ -38,6 +38,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Authenticated pulls get a much higher Docker Hub rate limit than anonymous ones --
+      # docker build and kind's own node image both pull from docker.io. Guarded so forks and
+      # Dependabot (neither receives these org secrets) are skipped rather than failing.
+      - uses: docker/login-action@v3
+        if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - uses: helm/kind-action@v1
         with:
           cluster_name: booth-core-ci
@@ -721,6 +730,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Authenticated pulls get a much higher Docker Hub rate limit than anonymous ones --
+      # docker build and kind's own node image both pull from docker.io. Guarded so forks and
+      # Dependabot (neither receives these org secrets) are skipped rather than failing.
+      - uses: docker/login-action@v3
+        if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - uses: helm/kind-action@v1
         with:
           cluster_name: booth-core-keycloak-ci
@@ -800,6 +818,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      # Authenticated pulls get a much higher Docker Hub rate limit than anonymous ones.
+      # Guarded so forks and Dependabot (neither receives these org secrets) are skipped
+      # rather than failing.
+      - uses: docker/login-action@v3
+        if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - uses: actions/setup-go@v5
         with:

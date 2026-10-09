@@ -25,6 +25,16 @@ jobs:
       - id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
+      # Authenticated pulls get a much higher Docker Hub rate limit than anonymous ones --
+      # the build below pulls its base images from docker.io. Guarded so forks and Dependabot
+      # (neither receives these org secrets) are skipped rather than failing; this workflow
+      # only ever runs on a tag push, so the guard is inert here, not load-bearing.
+      - uses: docker/login-action@v3
+        if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
