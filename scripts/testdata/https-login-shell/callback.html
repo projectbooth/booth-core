@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>booth https-login-check shell - callback</title></head>
+<body>
+<h1>callback</h1>
+<div id="status">processing...</div>
+<script>
+const ISSUER = window.location.origin + "/realms/booth";
+const CLIENT_ID = "booth-design";
+const REDIRECT_URI = window.location.origin + "/ci-shell/callback.html";
+
+function setStatus(s) {
+  document.getElementById('status').textContent = s;
+  console.log("STATUS: " + s);
+}
+
+(async () => {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const error = params.get('error');
+    if (error) {
+      setStatus("LOGIN_FAILED: authorization error: " + error + " - " + params.get('error_description'));
+      return;
+    }
+    const code = params.get('code');
+    const state = params.get('state');
+    const expectedState = sessionStorage.getItem('pkce_state');
+    const verifier = sessionStorage.getItem('pkce_verifier');
+    if (!code) {
+      setStatus("LOGIN_FAILED: no authorization code in callback");
+      return;
+    }
+    if (state !== expectedState) {
+      setStatus("LOGIN_FAILED: state mismatch");
+      return;
+    }
+    setStatus("exchanging code for token...");
+    const body = new URLSearchParams();
+    body.set('grant_type', 'authorization_code');
+    body.set('client_id', CLIENT_ID);
+    body.set('redirect_uri', REDIRECT_URI);
+    body.set('code', code);
+    body.set('code_verifier', verifier);
+
+    const resp = await fetch(ISSUER + "/protocol/openid-connect/token", {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString()
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      setStatus("LOGIN_FAILED: token exchange failed: " + JSON.stringify(data));
+      return;
+    }
+    if (!data.access_token) {
+      setStatus("LOGIN_FAILED: no access_token in response: " + JSON.stringify(data));
+      return;
+    }
+
+    // The shell sends the ACCESS token (getAccessToken), never the id_token -- this is the
+    // exact distinction whose absence (a missing audience mapper on the shipped client) PR A's
+    // review caught: core's requireAudience check runs against this token.
+    setStatus("calling core's /api/me with the access token...");
+    const meResp = await fetch(window.location.origin + "/api/me", {
+      headers: { 'Authorization': 'Bearer ' + data.access_token }
+    });
+    const me = await meResp.json();
+    if (!meResp.ok) {
+      setStatus("LOGIN_FAILED: /api/me rejected the access token: " + meResp.status + " " + JSON.stringify(me));
+      return;
+    }
+    setStatus("LOGIN_OK: /api/me = " + JSON.stringify(me));
+  } catch (e) {
+    setStatus("LOGIN_FAILED: exception during callback: " + e.message);
+  }
+})();
+</script>
+</body>
+</html>

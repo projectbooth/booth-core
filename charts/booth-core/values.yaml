@@ -166,6 +166,39 @@ keycloak:
     digest: sha256:09a381c715ab0b111835b70f2905955274843a219c6f27efb348e4d9f4086858
   resources: {}
 
+# Ingress and TLS (ADR 0108): fronts the shell/core and Keycloak's login paths behind one
+# host, over https. On by default (pairs with keycloak.enabled's own default) -- an
+# external-provider install that doesn't want this chart managing an Ingress at all should set
+# this false explicitly, the same way it sets keycloak.enabled=false.
+#
+# ingress.host is REQUIRED when both this and keycloak.enabled are true (a chart-enforced
+# install-time failure, not a silent gap) -- set it to a LAN hostname your router/hosts file
+# resolves to this node (see the operations doc's "first login" runbook). Routes
+# /realms/<realm>/* and /resources/* to the bundled Keycloak (login and its page assets only --
+# never /admin or /realms/master, which stay reachable only by port-forward) and everything
+# else to core (the shell, /api/*, /modules/*, /iframe/*).
+ingress:
+  enabled: true
+  host: ""
+  # Empty = the cluster's own default IngressClass (k3s ships Traefik). Set this if your
+  # cluster has more than one IngressClass and none is marked default.
+  ingressClassName: ""
+  # Free-form, merged onto the Ingress as-is -- e.g. a cert-manager issuer annotation for TLS
+  # mode (c) below. This chart adds no cert-manager dependency; it only doesn't get in the way.
+  annotations: {}
+  tls:
+    # Mode (a): an operator-supplied Secret (kubernetes.io/tls) already in this namespace.
+    # Setting this means the chart never generates or touches anything -- it's used verbatim.
+    secretName: ""
+    # Mode (b), the default, used only when secretName is empty: core generates a self-signed
+    # CA and a leaf certificate (SAN = ingress.host) itself, the same create-then-adopt Secret
+    # pattern already used for the bundled PostgreSQL/Keycloak admin passwords -- see the
+    # operations doc for how an operator retrieves and trusts the CA. Set this false (with
+    # secretName still empty) for mode (c): cert-manager issues into the same computed Secret
+    # name instead, driven by your own annotations above; this chart's own TLS provisioning
+    # then does nothing; it never fights cert-manager for the same Secret.
+    selfSigned: true
+
 postgres:
   # dsn, if set, is used verbatim as booth-core's OWN database connection string instead of
   # core provisioning one (an escape hatch; normally leave empty).

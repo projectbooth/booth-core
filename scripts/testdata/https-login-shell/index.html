@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<!--
+  Stand-in shell for the ADR 0108 real-browser HTTPS login check (.github/workflows/integration.yml's
+  ingress-tls-check job). booth-core ships no frontend of its own (that's booth-design's job) --
+  this is the minimal PKCE client needed to drive a real login through the real, shipped
+  "booth-design" realm client over a real Ingress/TLS, so the check exercises the actual
+  redirect URI / audience-mapper configuration a real browser login depends on, not a
+  test-only stand-in client (ADR 0108 "part two" review: no test-only client in this path).
+-->
+<html>
+<head><meta charset="utf-8"><title>booth https-login-check shell</title></head>
+<body>
+<h1>booth https-login-check shell</h1>
+<div id="status">not started</div>
+<button id="login">Log in</button>
+<script>
+const ISSUER = window.location.origin + "/realms/booth";
+const CLIENT_ID = "booth-design";
+const REDIRECT_URI = window.location.origin + "/ci-shell/callback.html";
+
+function setStatus(s) {
+  document.getElementById('status').textContent = s;
+  console.log("STATUS: " + s);
+}
+
+function b64url(bytes) {
+  let str = btoa(String.fromCharCode(...new Uint8Array(bytes)));
+  return str.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+document.getElementById('login').addEventListener('click', async () => {
+  try {
+    setStatus("checking crypto.subtle...");
+    if (!window.crypto || !window.crypto.subtle) {
+      setStatus("LOGIN_FAILED: crypto.subtle is unavailable (insecure context)");
+      return;
+    }
+    setStatus("generating PKCE verifier/challenge...");
+    const verifierBytes = new Uint8Array(32);
+    window.crypto.getRandomValues(verifierBytes);
+    const verifier = b64url(verifierBytes);
+    sessionStorage.setItem('pkce_verifier', verifier);
+
+    const enc = new TextEncoder().encode(verifier);
+    const digest = await window.crypto.subtle.digest('SHA-256', enc);
+    const challenge = b64url(digest);
+
+    const state = b64url(window.crypto.getRandomValues(new Uint8Array(16)));
+    sessionStorage.setItem('pkce_state', state);
+
+    const url = new URL(ISSUER + "/protocol/openid-connect/auth");
+    url.searchParams.set('client_id', CLIENT_ID);
+    url.searchParams.set('redirect_uri', REDIRECT_URI);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('scope', 'openid');
+    url.searchParams.set('code_challenge', challenge);
+    url.searchParams.set('code_challenge_method', 'S256');
+    url.searchParams.set('state', state);
+
+    setStatus("redirecting to Keycloak...");
+    window.location.href = url.toString();
+  } catch (e) {
+    setStatus("LOGIN_FAILED: exception during PKCE setup: " + e.message);
+  }
+});
+</script>
+</body>
+</html>

@@ -34,6 +34,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/keycloakprov"
 	"github.com/projectbooth/booth-core/internal/natsauth"
 	"github.com/projectbooth/booth-core/internal/registry"
+	"github.com/projectbooth/booth-core/internal/tlsprov"
 	"github.com/projectbooth/booth-core/internal/workload"
 )
 
@@ -197,6 +198,20 @@ func run() error {
 				return fmt.Errorf("provisioning the bundled Keycloak's database: %w", err)
 			}
 			log.Print("bundled Keycloak provisioning enabled (admin Secret and database credentials)")
+		}
+
+		// Self-signed certificate (ADR 0108 item 2(b)), mode (b) only -- modes (a)/(c) never
+		// set BOOTH_TLS_ENABLED, since an operator-supplied Secret or cert-manager already
+		// owns the certificate and core must not generate or touch anything in either case.
+		if cfg.TLS.Enabled {
+			if err := tlsprov.Ensure(ctx, direct, cfg.KubeNamespace, cfg.TLS.SecretName, cfg.TLS.Host); err != nil {
+				return fmt.Errorf("provisioning the self-signed TLS certificate: %w", err)
+			}
+			log.Printf("self-signed TLS certificate provisioned (host %s, Secret %s)", cfg.TLS.Host, cfg.TLS.SecretName)
+			// "Adopt what is there" must not mean "expires silently" (ADR 0108 condition 4):
+			// core may run for months without restarting, so the 30-day renewal window needs
+			// its own periodic recheck, not just the one-shot call above.
+			go renewTLSCertificate(ctx, direct, cfg.KubeNamespace, cfg.TLS.SecretName, cfg.TLS.Host)
 		}
 
 		// Workload identity (ADR 0056): core's own signing key, and per-module minting credentials.
@@ -470,6 +485,33 @@ func pinBundledPostgresNode(ctx context.Context, c client.Client, namespace, sta
 			}
 			backoff = time.Second // reset, so a future transient failure retries quickly again
 			wait = steadyStateInterval
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+	}
+}
+
+// renewTLSCertificate re-checks the self-signed leaf certificate once a day, forever --
+// tlsprov.Ensure itself decides whether anything actually needs to happen (it's a no-op
+// unless the leaf is within 30 days of expiry or its SAN no longer matches host). A failure
+// retries sooner, with backoff, rather than waiting a full day to try again.
+func renewTLSCertificate(ctx context.Context, c client.Client, namespace, secretName, host string) {
+	const maxBackoff = 10 * time.Minute
+	const steadyStateInterval = 24 * time.Hour
+	backoff := time.Minute
+	for {
+		wait := steadyStateInterval
+		if err := tlsprov.Ensure(ctx, c, namespace, secretName, host); err != nil {
+			log.Printf("TLS certificate renewal check failed (%v); retrying in %s", err, backoff)
+			wait = backoff
+			if backoff *= 2; backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		} else {
+			backoff = time.Minute // reset, so a future transient failure retries quickly again
 		}
 		select {
 		case <-ctx.Done():
