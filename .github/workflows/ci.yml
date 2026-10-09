@@ -59,7 +59,8 @@ jobs:
           helm lint . \
             --set oidc.issuerUrl=https://keycloak.example.com/realms/booth \
             --set oidc.clientId=booth-core \
-            --set iframeSigningKey=ci-placeholder
+            --set iframeSigningKey=ci-placeholder \
+            --set keycloak.enabled=false
 
       - name: helm template (render check)
         working-directory: charts/booth-core
@@ -69,4 +70,14 @@ jobs:
             --set oidc.issuerUrl=https://keycloak.example.com/realms/booth \
             --set oidc.clientId=booth-core \
             --set iframeSigningKey=ci-placeholder \
+            --set keycloak.enabled=false \
+            --include-crds > /dev/null
+
+      - name: helm template (render check, the bundled default)
+        working-directory: charts/booth-core
+        run: |
+          helm template booth-core . \
+            --namespace booth-system \
+            --set iframeSigningKey=ci-placeholder \
+            --set ingress.host=booth.example.test \
             --include-crds > /dev/null
