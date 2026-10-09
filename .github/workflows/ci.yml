@@ -42,6 +42,13 @@ jobs:
         # fast, cluster-free layer.
         run: go test -race -count=1 $(go list ./... | grep -v /test/integration)
 
+      - name: scripts/booth-admin unit tests
+        # Pure stdlib, no real Keycloak -- scripts/testdata/test_booth_admin.py fakes every
+        # Admin REST API call. The real-Keycloak end-to-end coverage is integration.yml's
+        # booth-admin-check job; this is the fast, cluster-free layer for the pieces that
+        # don't need one (set-password, harden-master).
+        run: python3 scripts/testdata/test_booth_admin.py -v
+
   helm-lint:
     runs-on: ubuntu-24.04
     steps:

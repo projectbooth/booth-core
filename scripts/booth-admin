@@ -36,6 +36,8 @@ Usage:
     booth-admin revoke-operator <username>
     booth-admin list-workspaces
     booth-admin list-members <slug>
+    booth-admin set-password <username>
+    booth-admin harden-master
 
 All subcommands accept --dry-run, which prints the requests that would be made (without making
 any change) -- read-only lookups still happen, since dry-run needs to know the current state to
@@ -328,6 +330,53 @@ def cmd_create_user(kc, args):
     print(f"Temporary password (shown once -- it is not logged or saved anywhere): {password}")
 
 
+def cmd_set_password(kc, args):
+    # ADR 0106 condition 7: there is no mail server, so a locked-out user otherwise has no
+    # recovery path at all. Same temporary-password mechanism as create-user -- generated,
+    # printed once, never logged or saved -- except this resets an EXISTING user rather than
+    # creating one. Setting a credential with temporary=True is what makes Keycloak require an
+    # UPDATE_PASSWORD on the user's next login; no separate requiredActions call is needed.
+    user = require_user(kc, args.username)
+    password = generate_temp_password()
+
+    kc.put(kc.admin_path(f"/users/{user['id']}/reset-password"), {
+        "type": "password",
+        "value": password,
+        "temporary": True,
+    })
+
+    if kc.dry_run:
+        print("[dry-run] would also require a password change on next login (UPDATE_PASSWORD)")
+        print(f"{args.username!r}: password would be reset")
+        return
+
+    print(f"{args.username!r}: password reset")
+    print(f"Temporary password (shown once -- it is not logged or saved anywhere): {password}")
+
+
+def cmd_harden_master(kc, args):
+    # ADR 0108 condition 6 / the coordinator's PR B review: --import-realm cannot alter the
+    # already-existing master realm (confirmed empirically, not assumed -- a partial
+    # master-realm import file is silently ignored even when the only field present is
+    # bruteForceProtected), and the bundled Keycloak's NetworkPolicy admits any namespace to
+    # :8080, including /admin and /realms/master. This is the idempotent fix: read the real
+    # master realm representation, flip the one field, and PUT the whole thing back -- never a
+    # partial body, since Keycloak's realm PUT is a full update, not a merge.
+    realm = kc.get("/admin/realms/master")
+    if realm is None:
+        raise BoothAdminError("could not read the master realm")
+
+    if realm.get("bruteForceProtected"):
+        print("master realm: brute-force protection already enabled, no change")
+        return
+
+    realm["bruteForceProtected"] = True
+    kc.put("/admin/realms/master", realm)
+
+    will = "would be enabled" if kc.dry_run else "enabled"
+    print(f"master realm: brute-force protection {will}")
+
+
 def _role_group_parts(slug, role):
     return ["workspaces", slug, role]
 
@@ -495,6 +544,11 @@ def build_parser():
 
     p = add("list-members", cmd_list_members, "list a workspace's members and roles")
     p.add_argument("slug")
+
+    p = add("set-password", cmd_set_password, "reset a user's password to a generated temporary one")
+    p.add_argument("username")
+
+    add("harden-master", cmd_harden_master, "enable brute-force protection on the master realm (idempotent)")
 
     return parser
 
