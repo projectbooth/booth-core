@@ -13,7 +13,13 @@ belong to.
 creates and nests the groups the grammar above expects, creates users, and manages their group
 memberships. It never talks to `booth-core` itself.
 
-## Prerequisite: this script does not provision Keycloak itself
+**First time setting up a bundled install?** `docs/operations/first-login-runbook.md` walks
+through install → retrieve the generated admin password/certificate → create the first
+workspace and user → sign in, start to finish. This doc is the reference underneath it:
+`booth-admin`'s own subcommands, the shared values every module needs, and facts worth knowing
+once you're running.
+
+## Prerequisite: what realm this script expects
 
 `scripts/booth-admin` assumes a realm already exists with:
 
@@ -23,20 +29,20 @@ memberships. It never talks to `booth-core` itself.
   nested group like `/workspaces/acme/owner` actually emits that exact string on the token,
   rather than just the group's bare name.
 
-**As of this writing, a fresh `booth-core` Helm install does not provision any of this.**
-ADR 0004 states "Keycloak ships as the default, bundled identity provider for self-hosted
-installs," but `charts/booth-core` has no Keycloak dependency, template, or realm-import
-mechanism at all — `oidc.issuerUrl`/`oidc.clientId` are empty by default and every real-install
-instruction in this repo's own `README.md` requires the operator to supply them, pointing at
-infrastructure they bring themselves. This is a real gap between that ADR's decision and what's
-actually shipped, not something this script works around — it's flagged back to the architecture
-coordinator separately, not fixed here. Until it's resolved, a fresh homelab install needs its
-own Keycloak (or other OIDC provider), realm, client, and groups mapper set up by hand (or via
-the local-dev realm export below as a starting template) before this script has anything to
-manage.
+**A default `booth-core` Helm install now provisions exactly this**, via the bundled Keycloak
+(ADR 0106/0108): a starter realm named `booth`, imported on first boot, with the `workspaces`/
+`platform` group tree already present and a `groups` client-scope mapper already attached — see
+`docs/operations/first-login-runbook.md` for the full install-to-first-sign-in walkthrough. This
+script still never talks to `booth-core` or provisions Keycloak itself; it only manages the
+group/user structure inside whichever realm you point it at, bundled or external.
 
-The one realm this script is actually verified against today is the local-dev one described
-below.
+Running an **external** identity provider instead (`keycloak.enabled=false`)? You bring your own
+realm, client, and groups mapper matching the shape above — see "Shared values across module
+installs" below for the `oidc.*` values every module (including core) then needs set by hand.
+
+The realm this script's own CI (`booth-admin-check`, below) runs against is a disposable fixture
+it owns (`scripts/testdata/ci-realm.json`), not the bundled starter realm or the local-dev one
+shown next.
 
 ## Reaching Keycloak from your laptop
 
@@ -78,65 +84,69 @@ values from anywhere but its own chart's `--set`/`values.yaml` — an operator s
 on every module install, by hand, every time. This was checked directly against every
 module's chart, not assumed from its absence.
 
-**As of this writing, that's 12 individual values across 9 module installs** for exactly
-what this section documents — `oidc.issuerUrl` on 9 modules, plus the workload-issuer
-setting on the 3 named for Streamlit apps (`booth-storage`, `booth-catalog`,
-`booth-lakehouse`) — using **5 different key-path spellings for 2 underlying concepts**,
-not 2:
+**Updated as each module's own `oidc.jwksUrl` PR landed** (checked directly against every
+module's chart again, not left at the earlier snapshot): `oidc.issuerUrl` and `oidc.jwksUrl` on
+9 modules, plus the workload-issuer setting on the 3 named for Streamlit apps (`booth-storage`,
+`booth-catalog`, `booth-lakehouse`) — **7 different key-path spellings for 3 underlying
+concepts**, not 3:
 
 | Concept | Modules | Key path(s) actually used |
 |---|---|---|
-| OIDC issuer | `booth-storage`, `booth-catalog`, `booth-module-store`, `booth-api`, `booth-database`, `booth-logging`, `booth-pipeline`, `booth-notebooks` (8) | `oidc.issuerUrl` — consistent across all 8 |
-| OIDC issuer | `booth-lakehouse` (1) | `identity.oidcIssuerUrl` — **the one outlier**, confirmed against this chart's own `values.yaml`/`api.yaml` and called out explicitly in `booth-e2e/bringup/bringup.sh`'s own comments ("not the `oidc.*` key every other module here uses") |
+| OIDC issuer | `booth-storage`, `booth-catalog`, `booth-module-store`, `booth-api`, `booth-database`, `booth-logging`, `booth-pipeline` (7), `booth-notebooks` (optional, see below) | `oidc.issuerUrl` — consistent across all 8 |
+| OIDC issuer | `booth-lakehouse` (1) | `identity.oidcIssuerUrl` — **the one outlier**, called out explicitly in `booth-e2e/bringup/bringup.sh`'s own comments ("not the `oidc.*` key every other module here uses") |
+| Key-fetch override (ADR 0108) | The same 7 modules as the `oidc.issuerUrl` row above | `oidc.jwksUrl` — landed in every one of them. `booth-notebooks` has no equivalent (its default path never touches the primary IdP at all — see below) |
+| Key-fetch override (ADR 0108) | `booth-lakehouse` (1) | `identity.oidcJwksUrl` — the same outlier naming as its issuer URL |
 | Workload-issuer trust | `booth-storage` | `oidc.workloadIssuerUrl` |
 | Workload-issuer trust | `booth-catalog` | `workloadIdentity.issuerUrl` (a separate top-level block, not under `oidc`) |
 | Workload-issuer trust | `booth-lakehouse` | `identity.workloadIssuerUrl` |
 
-`oidc.jwksUrl` (ADR 0108's key-fetch override, merged into `booth-core` itself in this
-same change) **does not exist in any module chart yet, as of this writing** — setting it
-on any module install today is a no-op, not an error (Helm doesn't reject an unrecognized
-`--set` path). Each module picks this up in its own, separately-coordinated PR; this
-section will need updating once that lands, including whichever key-path each module
-settles on, which may not match `oidc.jwksUrl` exactly given the inconsistency already
-found above.
+**`booth-notebooks` is the one module that may need none of this at all.** Its default,
+actually-configured path trusts core's own iframe-identity issuer (`identity.issuerUrl`,
+pre-filled to a sensible default), not the primary IdP directly — so `oidc.jwksUrl` was never
+added there, and `oidc.issuerUrl` stays optional, needed only if you deliberately reconfigure it
+to trust the primary IdP directly instead.
 
-**Until that propagation problem is solved some other way** (the coordinator's call, not
-built here — this section only documents today's manual reality, per instruction), the
-values an operator currently pastes into each module's `helm install`/`values.yaml`, using
-each chart's own real key names:
+The values an operator pastes into each module's `helm install`/`values.yaml`, using each
+chart's own real key names, with the bundled Keycloak's in-cluster Service as the example
+`jwksUrl`/workload-issuer target (adjust for your actual release/namespace if different from
+`booth-core`/`booth-system`):
 
 ```yaml
 # booth-storage, booth-module-store, booth-api, booth-database, booth-logging, booth-pipeline:
 oidc:
   issuerUrl: "https://<your-idp-issuer>"
+  jwksUrl: "http://booth-core-keycloak.booth-system.svc.cluster.local:8080/realms/booth/protocol/openid-connect/certs"
 
-# booth-catalog: the same oidc.issuerUrl, plus a separate block for workload-issuer trust:
+# booth-catalog: the same oidc.issuerUrl/jwksUrl, plus a separate block for workload-issuer trust:
 oidc:
   issuerUrl: "https://<your-idp-issuer>"
+  jwksUrl: "http://booth-core-keycloak.booth-system.svc.cluster.local:8080/realms/booth/protocol/openid-connect/certs"
 workloadIdentity:
   issuerUrl: "http://booth-core.booth-system.svc.cluster.local:8080"
 
 # booth-storage also needs workload-issuer trust, under oidc (not a separate block):
 oidc:
   issuerUrl: "https://<your-idp-issuer>"
+  jwksUrl: "http://booth-core-keycloak.booth-system.svc.cluster.local:8080/realms/booth/protocol/openid-connect/certs"
   workloadIssuerUrl: "http://booth-core.booth-system.svc.cluster.local:8080"
 
-# booth-notebooks: oidc.issuerUrl is optional here (only needed if this deployment's
-# proxy forwards the user's own token instead of core's iframe-identity assertion —
-# the default, and today's only actually-configured path, needs no oidc.* values at all):
+# booth-notebooks: both oidc.* values are optional here, and left unset by default (see above):
 oidc:
-  issuerUrl: "https://<your-idp-issuer>"   # omit entirely for the default iframe-identity path
+  issuerUrl: "https://<your-idp-issuer>"   # only if reconfiguring away from the iframe-identity default
 
-# booth-lakehouse: the one outlier key path, for both concepts:
+# booth-lakehouse: the one outlier key path, for every concept:
 identity:
   oidcIssuerUrl: "https://<your-idp-issuer>"
   oidcAudience: "booth-design"
+  oidcJwksUrl: "http://booth-core-keycloak.booth-system.svc.cluster.local:8080/realms/booth/protocol/openid-connect/certs"
   workloadIssuerUrl: "http://booth-core.booth-system.svc.cluster.local:8080"
 ```
 
-`http://booth-core.booth-system.svc.cluster.local:8080` above assumes `booth-core` is
-installed as release `booth-core` in namespace `booth-system` — adjust for your actual
-release/namespace, exactly as `core.url` is documented per-module elsewhere.
+For the **bundled** Keycloak specifically, `oidc.issuerUrl` is `https://<ingress.host>/realms/booth`
+(the same value every token-verifying module must agree on), and the `jwksUrl` shown above is
+the exact in-cluster value the bundled install needs — deliberately plain `http://` and
+in-cluster-only, so no module needs to trust the Ingress's certificate just to fetch signing
+keys (ADR 0108's whole point for this value).
 
 ## Worked example: a new workspace with an owner and an editor
 
@@ -222,5 +232,13 @@ noticing.
 
 The realm it runs against (`scripts/testdata/ci-realm.json`) is a minimal fixture owned by this
 repo for exactly this check — not the local-dev realm shown above (which lives in a sibling repo
-this CI job doesn't check out), and not a stand-in for the still-open "what does a real install's
-Keycloak actually ship with" question noted above.
+this CI job doesn't check out), and not the bundled starter realm.
+
+**The bundled starter realm itself** is covered separately, by `integration.yml`'s
+`bundled-keycloak-check` job: installs the real chart with no overrides, runs `booth-admin`
+(including `harden-master`, asserted idempotent by running it twice) against the real realm the
+chart actually produced, and asserts a real token and `/api/me` agree — the thing that would
+catch a starter-realm mistake (a missing mapper, a wrong client setting) that a fixture built
+independently of the real chart never could. `ingress-tls-check` covers the same realm again,
+this time through a real Ingress with a real browser, and additionally asserts the admin console
+and master realm are never reachable through it (item (g) in the first-login runbook).
