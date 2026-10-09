@@ -63,6 +63,81 @@ export KEYCLOAK_ADMIN_USER=<your admin username>
 # KEYCLOAK_ADMIN_PASSWORD left unset -- the script prompts for it silently.
 ```
 
+## Shared values across module installs
+
+Every module verifies the deployment's identity provider independently
+(`contracts/core-platform-api.md`'s "Auth enforcement") — there is **no core-delivered
+ConfigMap or Secret carrying the OIDC issuer, the ADR 0108 key-fetch override, or the
+workload-issuer-trust setting**. The only configuration core actually provisions
+automatically into a module's namespace is the small set of declarative, per-module
+Secrets ADR 0020 already covers (`booth-database-credentials`,
+`booth-event-bus-credentials`, `booth-workload-minting-credentials`) — each gated behind
+that module's own manifest declaring `database`/`events`/`workloadIdentity.mint`, and
+none of them carry the primary IdP's issuer or key-fetch settings. Nothing reads these
+values from anywhere but its own chart's `--set`/`values.yaml` — an operator sets them
+on every module install, by hand, every time. This was checked directly against every
+module's chart, not assumed from its absence.
+
+**As of this writing, that's 12 individual values across 9 module installs** for exactly
+what this section documents — `oidc.issuerUrl` on 9 modules, plus the workload-issuer
+setting on the 3 named for Streamlit apps (`booth-storage`, `booth-catalog`,
+`booth-lakehouse`) — using **5 different key-path spellings for 2 underlying concepts**,
+not 2:
+
+| Concept | Modules | Key path(s) actually used |
+|---|---|---|
+| OIDC issuer | `booth-storage`, `booth-catalog`, `booth-module-store`, `booth-api`, `booth-database`, `booth-logging`, `booth-pipeline`, `booth-notebooks` (8) | `oidc.issuerUrl` — consistent across all 8 |
+| OIDC issuer | `booth-lakehouse` (1) | `identity.oidcIssuerUrl` — **the one outlier**, confirmed against this chart's own `values.yaml`/`api.yaml` and called out explicitly in `booth-e2e/bringup/bringup.sh`'s own comments ("not the `oidc.*` key every other module here uses") |
+| Workload-issuer trust | `booth-storage` | `oidc.workloadIssuerUrl` |
+| Workload-issuer trust | `booth-catalog` | `workloadIdentity.issuerUrl` (a separate top-level block, not under `oidc`) |
+| Workload-issuer trust | `booth-lakehouse` | `identity.workloadIssuerUrl` |
+
+`oidc.jwksUrl` (ADR 0108's key-fetch override, merged into `booth-core` itself in this
+same change) **does not exist in any module chart yet, as of this writing** — setting it
+on any module install today is a no-op, not an error (Helm doesn't reject an unrecognized
+`--set` path). Each module picks this up in its own, separately-coordinated PR; this
+section will need updating once that lands, including whichever key-path each module
+settles on, which may not match `oidc.jwksUrl` exactly given the inconsistency already
+found above.
+
+**Until that propagation problem is solved some other way** (the coordinator's call, not
+built here — this section only documents today's manual reality, per instruction), the
+values an operator currently pastes into each module's `helm install`/`values.yaml`, using
+each chart's own real key names:
+
+```yaml
+# booth-storage, booth-module-store, booth-api, booth-database, booth-logging, booth-pipeline:
+oidc:
+  issuerUrl: "https://<your-idp-issuer>"
+
+# booth-catalog: the same oidc.issuerUrl, plus a separate block for workload-issuer trust:
+oidc:
+  issuerUrl: "https://<your-idp-issuer>"
+workloadIdentity:
+  issuerUrl: "http://booth-core.booth-system.svc.cluster.local:8080"
+
+# booth-storage also needs workload-issuer trust, under oidc (not a separate block):
+oidc:
+  issuerUrl: "https://<your-idp-issuer>"
+  workloadIssuerUrl: "http://booth-core.booth-system.svc.cluster.local:8080"
+
+# booth-notebooks: oidc.issuerUrl is optional here (only needed if this deployment's
+# proxy forwards the user's own token instead of core's iframe-identity assertion —
+# the default, and today's only actually-configured path, needs no oidc.* values at all):
+oidc:
+  issuerUrl: "https://<your-idp-issuer>"   # omit entirely for the default iframe-identity path
+
+# booth-lakehouse: the one outlier key path, for both concepts:
+identity:
+  oidcIssuerUrl: "https://<your-idp-issuer>"
+  oidcAudience: "booth-design"
+  workloadIssuerUrl: "http://booth-core.booth-system.svc.cluster.local:8080"
+```
+
+`http://booth-core.booth-system.svc.cluster.local:8080` above assumes `booth-core` is
+installed as release `booth-core` in namespace `booth-system` — adjust for your actual
+release/namespace, exactly as `core.url` is documented per-module elsewhere.
+
 ## Worked example: a new workspace with an owner and an editor
 
 ```sh
