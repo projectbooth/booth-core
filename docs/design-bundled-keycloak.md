@@ -322,3 +322,72 @@ This is the identical sequence `booth-admin-check` already proves against its ow
 fixture, run one more time against the *real* bundled chart's *real* starter realm — the thing
 that would have caught a starter-realm mistake (a missing mapper, a wrong client setting) that a
 fixture built independently of the real chart could never catch.
+
+## Spike result, 2026-10-08: secure-context question (coordinator condition 1) — FAILS
+
+Per the coordinator's instruction, this was tested empirically on a real `kind` cluster before
+any chart work, using the pinned image from (a)
+(`quay.io/keycloak/keycloak@sha256:09a381c715ab0b111835b70f2905955274843a219c6f27efb348e4d9f4086858`,
+Keycloak 26.0.8) and the proposed `KC_HOSTNAME`/`KC_HTTP_ENABLED` hostname setup from (c).
+
+**Setup:**
+- Keycloak deployed as a real `Deployment` + `NodePort` `Service` on a dedicated `kind` cluster
+  (`keycloak-spike`), reachable at the node's Docker-assigned IP on a NodePort
+  (`http://<node-ip>:30180`) — a real non-localhost, plain-http origin, the same shape a homelab
+  NodePort install would present.
+- A starter-realm-shaped import (`workspaces`/`platform/operator` groups, a full-path `groups`
+  client-scope mapper, a public client `booth-design` with `standardFlowEnabled`,
+  `pkce.code.challenge.method: S256`, matching `redirectUris`/`webOrigins`) imported on first boot.
+- A minimal stand-in "shell" page (static HTML+JS, no framework) implementing a real Authorization
+  Code + PKCE flow by hand — `crypto.getRandomValues` for the verifier,
+  `crypto.subtle.digest('SHA-256', ...)` for the challenge, base64url encoding, redirect to
+  Keycloak's `/auth`, and a callback page exchanging the code for a token via `fetch` — served from
+  a second `NodePort` on the same node IP (`http://<node-ip>:30181`), so the shell's own origin is
+  also non-localhost plain http.
+- A real Chromium (Playwright, no flags weakening secure-context behavior) navigating to the
+  shell's non-localhost http origin and driving the login end-to-end.
+
+**Result — browser leg: FAILS.** Chromium reports `crypto.subtle` as `undefined` on the shell's
+origin before any redirect to Keycloak happens:
+
+```
+STATUS: checking crypto.subtle...
+STATUS: LOGIN_FAILED: crypto.subtle is unavailable (insecure context) - cannot generate PKCE code_challenge
+```
+
+This is exactly the risk named in condition 1: the Web Crypto `SubtleCrypto` interface is only
+exposed by the browser on a secure context (`https:`, or `http:` on `localhost`/`127.0.0.1`/
+`[::1]`), and a NodePort on a LAN/Docker-assigned IP over plain `http` is none of those. The
+failure is unconditional and happens on the shell's own page, before Keycloak is even reached —
+it is not something the realm, the client config, or `KC_HOSTNAME` can fix, because it has nothing
+to do with Keycloak; it is the browser refusing to expose `crypto.subtle` to the page's own script
+based on the page's origin alone.
+
+**Result — in-cluster discovery leg: PASSES.** From a real Kubernetes `Pod` (`curlimages/curl`, not
+the `kind` node container) inside the cluster:
+
+```
+$ curl http://<node-ip>:30180/realms/booth/.well-known/openid-configuration
+{"issuer":"http://<node-ip>:30180/realms/booth", ...,
+ "code_challenge_methods_supported":["plain","S256"], ...}
+```
+
+The issuer in the discovery document is exactly the `KC_HOSTNAME` value, independent of how the
+request actually arrived — confirming the hostname-v2 fix for the issuer-matching problem (item c)
+works as designed, and that the NodePort issuer URL is reachable and discoverable from inside the
+cluster. This half of condition 1 is not in question; only the browser leg is the blocker.
+
+**Conclusion:** per the explicit instruction, stopping here rather than choosing a fallback. The
+two options the coordinator named are both still open and neither has been acted on:
+
+1. **Localhost-only access by tunnel** — e.g. `kubectl port-forward` or an SSH tunnel so the
+   browser's origin is `http://localhost:<port>`, which *is* a secure context by the browser's own
+   rule, at the cost of requiring a tunnel for every browser session (no direct LAN access).
+2. **Chart-optional TLS (Ingress)**, using k3s's bundled Traefik, with a self-signed or
+   operator-supplied certificate — gives a real `https://` origin reachable directly over the LAN,
+   at the cost of building and documenting a cert story (self-signed means a browser warning/manual
+   trust step; a supplied cert means the operator needs one) and taking a first position on the
+   Ingress/TLS question that ARCHITECTURE item 37a has left open.
+
+Both remain the coordinator's call, not mine. Everything after this section (chart, `EnsureKeycloak`,
+CI, docs) is on hold pending that decision.
