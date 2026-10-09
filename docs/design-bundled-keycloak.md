@@ -621,3 +621,47 @@ Real Chromium, over `https`, through the real shell, reusing most of the spike's
   merely updated.** ADR 0108 item 3 removes this exposure outright — the admin console and master
   realm are never routed through the Ingress at all. The design note's answer to condition 6 should
   now read "resolved: not exposed," not "accepted for v0."
+
+## Fleet inventory (ADR 0108 "part two", condition 1)
+
+Every repository under the project, read directly (not inferred from a grep hit's absence). Columns:
+how it verifies tokens, the exact file:function, the config field holding the issuer URL, and every
+*other* use of the issuer URL besides discovery/JWKS.
+
+| Repo | Verifies primary IdP? | File:function | Issuer config field | Other issuer-URL uses |
+|---|---|---|---|---|
+| `booth-core` | Yes, go-oidc discovery | `internal/auth/oidc.go:42` `NewVerifier` | `config.OIDCConfig.IssuerURL` (env `BOOTH_OIDC_ISSUER_URL`) | none |
+| `booth-storage` | Yes, go-oidc discovery | `internal/auth/auth.go:95` `NewVerifier` | `OIDCConfig.IssuerURL` | none |
+| `booth-catalog` | Yes, go-oidc discovery | `internal/auth/auth.go:85` `NewVerifier` | `OIDCConfig.IssuerURL` | none |
+| `booth-module-store` | Yes, go-oidc discovery | `internal/auth/oidc.go:45` `NewVerifier` | `config.OIDCConfig.IssuerURL`, required at startup | none |
+| `booth-api` | Yes, go-oidc discovery | `internal/auth/auth.go:78` `NewVerifier` | `OIDCConfig.IssuerURL` | none |
+| `booth-database` | Yes, go-oidc discovery | `internal/auth/auth.go:77` `NewVerifier` | `OIDCConfig.IssuerURL` | none |
+| `booth-logging` | Yes, go-oidc discovery | `internal/auth/auth.go:100` `NewVerifier` | `OIDCConfig.IssuerURL`, required at startup | **Grafana's own `[auth.jwt]`** (`charts/booth-logging/templates/grafana-config.yaml:5`) — but against a *different* chart value, `grafana.identity.issuerUrl`, pointed at core's own iframe-identity issuer, never at `oidc.issuerUrl`. Already solves an equivalent http-vs-https JWKS problem by a different mechanism: an init container pre-fetches the JWKS to a local file, since Grafana's `auth.jwt` can only load `jwk_set_url` over https. Unrelated to this change; cited as a precedent only. |
+| `booth-pipeline` | Yes, hand-rolled discovery | `src/booth_pipeline/auth.py:74-83` `OIDCVerifier._client`/`.verify` | `config.py:45` `oidc_issuer_url` (env `BOOTH_OIDC_ISSUER_URL`, required) | none |
+| `booth-lakehouse` (server) | Yes, hand-rolled discovery | `src/booth_lakehouse_server/identity.py:67-77` `_IssuerKeys.client` | `config.py:35-36`, env `BOOTH_OIDC_ISSUER_URL` | none |
+| `booth-notebooks` | **Conditionally.** Two independently-configurable trusted issuers; discovery is identical code either way | `src/booth_notebooks/identity.py:79-89` `_IssuerKeys.client` (used by both) | `hubconfig.py:55-74` `trusted_issuers(env)`: `BOOTH_IDENTITY_ISSUER_URL` (core's own iframe-identity issuer) **and/or** `BOOTH_OIDC_ISSUER_URL` (the real IdP) | **JupyterHub's own hub-level login is not a separate OAuth client** — `authenticator.py`'s `BoothAuthenticator` extends plain `Authenticator` (not `OAuthenticator`), reads the already-forwarded `X-Booth-Identity` header, and calls the same `identity.py` verifier for both login and per-request re-verification. **Today's actual deployed default is `BOOTH_IDENTITY_ISSUER_URL`** (core's own issuer, already in-cluster plain http — no CA-trust problem exists for this path regardless of ADR 0108). `BOOTH_OIDC_ISSUER_URL` exists in the code as a supported alternative/addition but isn't what's configured today; *if* an operator ever points this at Keycloak directly, it hits the identical discovery problem the other 9 have, so it needs the same `oidc.jwksUrl` support to stay correct — hence ADR 0108's own "10 or more" phrasing. **Naming inconsistency, surfaced by `booth-e2e`'s bring-up fixture** (`bringup.sh:308,323,338`): this repo's chart value is `identity.oidcIssuerUrl`/`identity.oidcAudience`, not the `oidc.issuerUrl`/`oidc.clientId` key every other repo uses — worth fixing or at least noting before wiring an automatic `oidc.jwksUrl` default through, since the chart key this repo expects doesn't match the fleet convention. |
+| `booth-streamlit` | **No** — iframe-proxy, trusts core's own issuer only | `internal/identity/identity.go:100` `identity.New`, already using the decoupled `oidc.NewRemoteKeySet`/`oidc.NewVerifier` pattern (line 107/118) | `Config.IssuerURL`, explicitly documented as core's iframe-identity issuer | none. **Needs no change**: already decoupled, and the issuer it trusts (core's own) is already in-cluster plain http — there is no https/self-signed leg in this path at all. |
+| `booth-design` (the shell) | **Never fetches JWKS at all** — the only repo that talks to the primary IdP directly, client-side, for the real PKCE flow | `src/lib/auth/discovery.ts` `fetchDiscoveryDocument()`; config in `src/lib/auth/config.ts` `getOidcConfig()` | `oidc.issuerUrl`/`oidc.clientId` via runtime `/config.js` (prod) or `VITE_OIDC_ISSUER_URL`/`VITE_OIDC_CLIENT_ID` (dev) | `authorization_endpoint` (login redirect), `token_endpoint` (code exchange and refresh), and **`end_session_endpoint`** (RP-initiated logout, `authClient.ts:~195`) — a genuine other-use the coordinator asked about. **Needs no change**: it never fetches a JWKS itself (it only carries the bearer token to core), so the self-signed-CA problem doesn't apply to it — it's covered entirely by the browser-side cert modes in the Ingress/TLS section, not by `oidc.jwksUrl`. |
+| `booth-e2e` | No module code — a test-fixture/bring-up repo | `bringup.sh` (stands up its own Keycloak + realm), `smoke_test.py` | drives Keycloak directly; `bringup.sh:484-489` independently re-verifies the discovery `issuer` field matches `oidc.issuerUrl`, the same check this session's own spike already proved empirically | gets tokens via direct password-grant requests, not a real browser/PKCE flow (no Playwright/Chromium found anywhere in the repo). **Needs no change**: not a shipped production module, and its bring-up already controls Keycloak's transport directly in its own ephemeral test clusters. |
+| `booth-spark` | **Repo does not exist yet** — bare `.git`, no commits locally or on `origin` | — | — | — |
+| `booth-superset` | **Repo does not exist yet** — same as `booth-spark` | — | — | — |
+| `booth-metabase` | **Repo does not exist yet** — same as `booth-spark` | — | — | — |
+
+**Exact counts:**
+- **Needs the `oidc.jwksUrl` change, unconditionally: 9** — `booth-core`, `booth-storage`, `booth-catalog`,
+  `booth-module-store`, `booth-api`, `booth-database`, `booth-logging`, `booth-pipeline`,
+  `booth-lakehouse`.
+- **Needs it conditionally: 1** — `booth-notebooks`, only on the (currently unused) path where an
+  operator configures `BOOTH_OIDC_ISSUER_URL` directly instead of relying on core's iframe-identity
+  assertion. This is why ADR 0108's own ruling text says "10 or more," not "10 exactly" — this
+  inventory confirms that count precisely rather than approximating it.
+- **Needs no change at all, and why: 4** — `booth-design` (never fetches a JWKS; the browser-side
+  PKCE flow is covered by the Ingress/TLS certificate modes, not this mechanism), `booth-streamlit`
+  (already uses the decoupled key-fetch pattern, but against core's own already-in-cluster-http
+  issuer, not Keycloak's), `booth-e2e` (a test fixture, not a shipped module, and controls its own
+  transport), and nothing changes for Grafana inside `booth-logging` either (it trusts a distinct
+  issuer — core's iframe-identity issuer, via a separate chart value — never the primary IdP).
+- **Cannot be assessed: 3** — `booth-spark`, `booth-superset`, `booth-metabase` do not exist yet
+  (empty repositories, no commits anywhere, confirmed via `git fetch origin` finding no
+  `origin/HEAD`). There is no code to read and nothing to say about how they will verify tokens;
+  this is a hard "doesn't exist," not an "unclear."
