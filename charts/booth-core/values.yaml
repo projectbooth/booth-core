@@ -23,6 +23,14 @@ oidc:
   clientId: ""
   requireAudience: true
   groupsClaim: groups
+  # Optional key-fetch override (ADR 0108): when set, core fetches signing keys from
+  # this URL directly instead of the issuer's own discovery document, while still
+  # validating `iss` exactly against issuerUrl. A future bundled-Keycloak install sets
+  # this automatically to Keycloak's in-cluster Service over plain http, so core never
+  # needs to trust a self-signed Ingress certificate just to verify tokens. Setting this
+  # without issuerUrl is a startup error. Empty (the default) means ordinary discovery,
+  # unchanged — this is what every external-provider install uses today.
+  jwksUrl: ""
 
 # Workload identity (ADR 0056): booth-core acts as a second trusted token issuer, for exactly
 # one purpose — short-lived (10 minute), workspace-scoped tokens that represent a job/run rather
