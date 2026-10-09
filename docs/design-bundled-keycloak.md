@@ -391,3 +391,233 @@ two options the coordinator named are both still open and neither has been acted
 
 Both remain the coordinator's call, not mine. Everything after this section (chart, `EnsureKeycloak`,
 CI, docs) is on hold pending that decision.
+
+## Ingress and TLS (ADR 0108)
+
+The user chose HTTPS on the LAN. This section answers the seven questions the coordinator asked
+before any chart work resumes; it does not build anything.
+
+### 1) Hostnames
+
+**One hostname, path-based routing — not two.** Core already serves the shell's static assets,
+`/api/*`, `/modules/{id}/*`, `/modules/{id}/public/*` and `/iframe/{id}/*` off a single listener
+(`internal/api/server.go`), and none of those paths collide with Keycloak's own fixed path
+convention (`/realms/...`, `/admin/...`, `/resources/...`). A second hostname buys nothing and
+costs the operator a second DNS/hosts entry and, for the self-signed mode, a second SAN to manage.
+
+One new chart value, `ingress.host` (operator-chosen, e.g. `booth.home.arpa` or a bare LAN name),
+feeds every place a hostname currently has to agree with every other:
+
+| Value | Templated as |
+|---|---|
+| `KC_HOSTNAME` | `https://<ingress.host>` |
+| `oidc.issuerUrl` | `https://<ingress.host>/realms/<realm>` (Keycloak's own fixed realm-path convention, appended) |
+| shell origin | `https://<ingress.host>/` (core itself; no separate shell origin exists) |
+| client redirect URIs / web origins | `https://<ingress.host>/*` / `https://<ingress.host>` |
+| certificate SAN | `<ingress.host>` (one name, one cert) |
+
+**The issuer URL an operator ends up with:** `https://booth.home.arpa/realms/booth` (using the
+starter realm's name from item (d)) — same shape the spike already proved Keycloak produces
+correctly and independent of transport, just `https` instead of `http` and an Ingress hostname
+instead of a NodePort IP.
+
+### 2) Name resolution on a LAN
+
+**Only the browser needs to resolve `ingress.host` — no pod does.** The operator points
+`ingress.host` at the node's LAN IP once, by whichever mechanism their router/network supports:
+a router-level local-DNS override (works for every device, including phones, with zero per-device
+setup — the recommended method) or a per-device `/etc/hosts`/`hosts` file entry (works, but must be
+repeated on every device and re-done if the node's IP ever changes).
+
+Pods don't need this at all: with the key-fetching design in item 4, no module ever dials the
+external hostname — Keycloak's own in-cluster Service DNS (Kubernetes-provided, zero operator
+action) is all any pod uses. The external hostname is purely a browser-facing concern.
+
+**What breaks if the operator gets it wrong:** loudly, not silently. No entry at all → the browser
+can't resolve the name, the page never loads (a DNS error, not a confusing partial failure).
+Resolving to the wrong device → either a connection refusal/timeout (nothing is listening there) or,
+if something else happens to be listening, a certificate name mismatch (the cert's SAN is
+`ingress.host`; nothing else validates against it), which browsers surface as a loud
+untrusted-certificate warning, not a silent login to the wrong place. There is no path where a bad
+DNS entry quietly lets someone sign in against an impostor. The one real operational note for the
+runbook: if the node's LAN IP changes (DHCP reassignment, hardware swap), the operator's DNS/hosts
+entry goes stale and must be updated — ordinary for any self-hosted LAN service, not specific to
+this design.
+
+### 3) Certificates — the three ADR 0108 modes
+
+**(a) Operator-supplied Secret.** `ingress.tls.secretName` names a pre-existing
+`kubernetes.io/tls` Secret the operator created however they like (their own cert, or one from
+their own internal CA). The chart's Ingress template only ever references it by name; nothing in
+the chart generates or inspects its contents in this mode.
+
+**(b) Chart-generated self-signed cert, CA exported.** Generated the same way the bundled
+Keycloak/Postgres admin passwords already are — core's own startup code, not a Helm template
+function. Helm's `genCA`/`genSelfSignedCert` regenerate on every `helm template` evaluation unless
+guarded by a `lookup` (and `lookup` doesn't work in dry-run/diff tooling), so this reuses
+`internal/dbprov`'s existing create-then-adopt Secret pattern (`EnsureCore`/`ensure`) instead of
+inventing a template-time mechanism: on first boot, core checks for the TLS Secret, generates a
+self-signed CA plus a leaf cert (SAN = `ingress.host`) if it's missing, and writes both the leaf
+cert/key (for the Ingress to serve) and the CA's public cert (`ca.crt`, a separate key in the same
+Secret) for the operator to retrieve — once created, every later boot adopts what's already there,
+so the cert survives upgrades and restarts exactly like the admin password does.
+
+**The browser experience:** first visit shows the ordinary self-signed warning (Chrome's "Your
+connection is not private", Firefox's "Warning: Potential Security Risk"). The operator either
+clicks through once per browser/device (`Advanced → Proceed`, accepted risk, no further action), or
+retrieves the exported CA once (`kubectl get secret ... -o jsonpath='{.data["ca\.crt"]}' | base64 -d
+> booth-ca.crt`) and imports it into their OS or browser trust store, after which every device with
+that CA installed gets a clean, trusted padlock. This is the same experience as most self-hosted
+homelab appliances (Proxmox, TrueNAS, pfSense) that ship a self-signed cert by default — not a novel
+UX to design, a well-worn one to document.
+
+**(c) cert-manager annotation passthrough.** A free-form `ingress.annotations` chart value is
+merged onto the generated Ingress resource with no interpretation — an operator who already runs
+cert-manager sets `cert-manager.io/cluster-issuer: <name>` (or equivalent) themselves, and
+cert-manager issues into the same `ingress.tls.secretName` the Ingress already references. No
+cert-manager CRD, dependency, or chart logic is added for this mode; it is purely "the chart doesn't
+get in cert-manager's way."
+
+### 4) The hard part: how pods trust (or avoid needing to trust) a self-signed issuer
+
+**Current state, read from the code, not assumed:** every module that verifies the primary OIDC
+provider's tokens does full discovery-driven verification —
+`oidc.NewProvider(ctx, cfg.IssuerURL)` (go-oidc) fetches `<issuer>/.well-known/openid-configuration`
+and trusts *that document's own* `jwks_uri` field to then fetch keys. Confirmed identical in
+`booth-core` (`internal/auth/oidc.go`), `booth-storage`, `booth-catalog`, `booth-module-store`,
+`booth-api`, `booth-database`, `booth-logging` (all Go, same `go-oidc` call), and in
+`booth-notebooks` (`identity.py`'s `_IssuerKeys.client()`) and `booth-pipeline` (`auth.py`) in
+Python, both doing the equivalent fetch-discovery-then-`jwks_uri` dance by hand. **That's 10
+production codebases, fleet-wide**, not just the three named.
+
+With a self-signed issuer, every one of those 10 would need to trust the generated CA for that
+discovery/JWKS fetch to succeed over `https`. But — critically — **every one of them already ships
+a second, decoupled pattern for exactly this shape of problem**, built for booth-core's own
+workload-token issuer (ADR 0056/0058): `booth-storage`'s and `booth-catalog`'s `NewWorkloadVerifier`
+construct the key set directly — `oidc.NewRemoteKeySet(ctx, issuer+WorkloadJWKSPath)` — and build
+the verifier from a separately-supplied issuer string (`oidc.NewVerifier(issuer, keys, cfg)`),
+never touching discovery or trusting a document's self-reported `jwks_uri` at all. `booth-notebooks`
+has the same shape (`DiscoveryKeySource`/`KeySource` is already a seam built for substituting a
+different key-fetch strategy).
+
+**Recommendation: option (a), a separate in-cluster plain-`http` key URL, reusing that existing
+pattern — not CA injection, not a publicly-trusted certificate.**
+
+- New optional chart value, `oidc.jwksUrl`. Empty (the default, for external-provider installs)
+  means exactly today's behavior — full discovery, unchanged, zero risk to any existing deployment.
+  For the bundled install, the chart sets it automatically, from the same values that already
+  produce `oidc.issuerUrl` and `KC_HOSTNAME` — the operator never sets this themselves — to
+  Keycloak's **in-cluster Service DNS**, over plain `http`:
+  `http://<release>-keycloak.<namespace>.svc.cluster.local:8080/realms/<realm>/protocol/openid-connect/certs`.
+- Each module's existing `OIDCConfig`/equivalent struct gets one new optional field
+  (`JWKSURL`/`jwks_url`). When set, `NewVerifier` skips `oidc.NewProvider` entirely and instead does
+  exactly what `NewWorkloadVerifier` already does: `oidc.NewRemoteKeySet(ctx, cfg.JWKSURL)` +
+  `oidc.NewVerifier(cfg.IssuerURL, keys, verifierCfg)` — the validated `iss` stays
+  `https://<ingress.host>/realms/<realm>` unchanged; only *where the keys are physically fetched
+  from* changes.
+- **Why this avoids the trust problem rather than just working around it:** this traffic never
+  crosses the TLS boundary at all. The self-signed CA only needs to be trusted by browsers (item 3)
+  — no in-cluster pod-to-pod call needs to go through the Ingress or its certificate, so there is no
+  CA to inject into any pod in the first place.
+- **Cost, named exactly as asked:** 10 codebases (7 Go, 3 Python), each a small, mechanical,
+  already-precedented change — one new config field plus one new conditional branch reusing code
+  that already exists and is already tested in each repo, not a new mechanism. Plus one new chart
+  value/env-var line in each of those 10 repos' own Helm charts to pass `jwksUrl` through. No new
+  dependency in any of them.
+- **Why not (b), CA injection into every pod:** touches the identical 10 codebases/charts (a CA
+  ConfigMap mount + a trust-store env var in each), for strictly *more* risk than (a) — Go and
+  Python don't honor an injected CA the same way (`SSL_CERT_FILE`/`SSL_CERT_DIR` vs. `verify=`/
+  `REQUESTS_CA_BUNDLE`, library-dependent), so it is 10 codebases' worth of change plus a
+  cross-language trust-store problem to get right, to solve a problem (a) shows doesn't need
+  solving at all.
+- **Why not (c), a publicly-trusted certificate, as the universal default:** zero module changes,
+  but impractical as *the bundled default* — there is no public DNS name on a LAN-only homelab, so
+  no ACME HTTP-01/DNS-01 path exists to obtain one automatically. It remains exactly what ADR 0108
+  item 2(c) already scopes it as: the escape hatch for an operator who already runs cert-manager
+  with their own domain, not something to build the default around.
+- **Contract impact: none.** `contracts/core-platform-api.md`'s "Auth enforcement" bullet already
+  says a module verifies "signature via the provider's published JWKS" — it does not mandate that
+  the JWKS be fetched over the same network path as the issuer's public discovery document, and the
+  validated `iss` is unchanged. `oidc.jwksUrl` is an additive, optional per-deployment config value,
+  the same category `GroupsClaim`/`RequireAudience` already are — unset, every existing deployment
+  behaves exactly as it does today. This does not need its own ADR.
+
+### 5) Ingress routing
+
+**One Ingress resource, one host, two path-based rules:**
+
+- `/realms/<realm>/*` → Keycloak's Service. Covers exactly what login needs: discovery
+  (`/.well-known/openid-configuration`), `/protocol/openid-connect/{auth,token,certs,userinfo,logout}`
+  — everything under the starter realm, nothing else.
+- everything else (`/`, `/api/*`, `/modules/*`, `/iframe/*`, `/healthz`) → core's Service — already
+  one listener serving all of it today, so this is a single catch-all rule, not new routing logic.
+
+**Not routed, by omission, not by an explicit deny rule:** Keycloak's admin console (`/admin/*`)
+and the master realm (`/realms/master/*`, including its own discovery/auth endpoints). Neither path
+is matched by the one rule above, so neither is reachable through the Ingress at all — only by
+`kubectl port-forward` directly to Keycloak's Service. This **resolves** the ADR 0106 addendum's
+item 6 exposure (accepted for v0) rather than carrying it forward; see item 7 below.
+
+**Mixed content:** the shell (core's Service) and Keycloak are both fronted by the same Ingress and
+the same `https://<ingress.host>` origin/scheme — there is no `http` leg anywhere the browser talks
+to, so no mixed-content block can occur.
+
+**Iframe-proxy modules (websockets for Streamlit/Jupyter) and `/modules/{id}/public/*`:** unaffected.
+Core's gateway already proxies through `httputil.ReverseProxy` (`internal/gateway/proxy.go`), which
+transparently hijacks and forwards `Upgrade: websocket` connections with no special code; Traefik
+(k3s's bundled IngressClass) passes HTTP/1.1 Upgrade requests through with no annotation required.
+`/modules/{id}/public/*` falls under core's own catch-all rule like any other core-served path — the
+path-traversal fix already shipped (canonicalize-then-match inside `PublicHandler` itself) is what
+enforces that boundary, not the Ingress, and an Ingress in front changes nothing about it.
+
+### 6) The browser test
+
+Real Chromium, over `https`, through the real shell, reusing most of the spike's own script
+(`pkce_test.py`) nearly unchanged:
+
+1. Install the chart on a CI `kind` cluster with `ingress.enabled=true` and a real IngressClass —
+   `kind` ships none by default, so this check needs one installed onto the CI cluster specifically
+   for this job (Traefik, matching k3s's default; a build-phase task, not decided here).
+2. Core generates/adopts the self-signed CA + leaf cert on first boot (item 3b); the test pulls the
+   CA's public cert out of the cluster the same way an operator would
+   (`kubectl get secret ... -o jsonpath='{.data["ca\.crt"]}'`) — not to install it into a trust
+   store, but to confirm it exists and is well-formed.
+3. The Playwright browser itself is launched with `ignoreHTTPSErrors: true` rather than attempting
+   to install the CA into the container's OS/NSS trust store: what this test proves is that the
+   PKCE secure-context unlock works over `https` (the thing condition 1 found broken over `http`),
+   not that this specific self-signed CA chains correctly — cert-chain validation is a separate,
+   well-understood browser behavior, not the thing being spiked.
+4. The test runner resolves `ingress.host` the same way a real operator would — a `/etc/hosts`-style
+   entry (`docker run --add-host <ingress.host>:<node-ip>` for the containerized runner) pointing at
+   the node, not a synthetic shortcut.
+5. Navigate to `https://<ingress.host>/`, click login, land on Keycloak's real
+   `https://<ingress.host>/realms/<realm>/protocol/openid-connect/auth` login form (same host,
+   different path — confirming item 5's routing), sign in as a test user, confirm the redirect back
+   to the shell's callback and a successful token exchange — the same pass/fail shape the spike
+   script already asserts, with `http`+two-NodePorts swapped for `https`+one-Ingress-host.
+
+### 7) Updates to the earlier conditions, now that the origin is https
+
+- **Condition 1 (secure-context):** now passes by construction — `https` is always a secure
+  context — provided the Ingress is actually in front. The chart must make `ingress.enabled=true`
+  the bundled install's real default, not merely available; an operator who disables it falls back
+  to the already-documented localhost-tunnel path (`kubectl port-forward` to core's Service, origin
+  becomes `http://localhost:<port>`, itself secure-context-eligible), stated explicitly as the
+  supported no-Ingress fallback rather than left to silently break.
+- **Condition 3 (redirect-URI staleness on first-boot-only realm import):** unchanged in shape —
+  still needs a reconcile Job or a documented re-import step — but the value that goes stale is now
+  `ingress.host`, not a NodePort IP; still deferred to the build phase, not decided here.
+- **Condition 4 (name the exact values; confirm the Keycloak 26 hostname flags by running them):**
+  shell origin is now `https://<ingress.host>/` (item 1); `KC_HOSTNAME=https://<ingress.host>` (full
+  URL form, scheme now `https`, otherwise identical to what the spike already confirmed running
+  against the pinned image). **`KC_HTTP_ENABLED=true` is still required** — TLS terminates at the
+  Ingress, not at the Keycloak pod, so Keycloak's own listener stays plain `http` regardless of the
+  external scheme; this is worth stating explicitly so it isn't mistaken for something the https
+  move removes.
+- **Condition 5 (bootstrap admin is temporary):** unaffected; the port-forward path to create a
+  permanent admin is unchanged, and per item 5 above it is now the *only* path to the admin console,
+  not merely the recommended one.
+- **Condition 6 (admin console on the same surface as login, accepted for v0):** **superseded, not
+  merely updated.** ADR 0108 item 3 removes this exposure outright — the admin console and master
+  realm are never routed through the Ingress at all. The design note's answer to condition 6 should
+  now read "resolved: not exposed," not "accepted for v0."
