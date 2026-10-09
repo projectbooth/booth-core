@@ -7,11 +7,21 @@ the real chart (that's scripts/testdata/ci-realm.json's own job, booth-admin-che
 
 Runs scripts/booth-admin itself (mounted alongside this script via the same ConfigMap) against
 the real bundled Keycloak, then uses a test-only client (created here, through the admin API --
-the shipped client has direct grants off) to obtain a real token and confirm:
+the shipped client has direct grants off, so only a test-only client can fetch a token
+non-interactively) to obtain a real token and confirm:
   1. the groups claim reads exactly ["/workspaces/<slug>/<role>"] -- the starter realm's own
      groups-client-scope mapper actually produces what ADR 0025's grammar needs;
   2. booth-core's own /api/me, called at its in-cluster Service DNS name, reports the same
      workspace and role -- the full chain, nothing stubbed.
+
+Critically, the test-only client supplies NO protocol mappers of its own: it copies the
+*shipped* booth-design client's actual protocolMappers (read live from the realm over the
+admin API) onto itself, so a missing/wrong audience mapper on the real client fails this check
+exactly as it would fail a real browser login -- this is what an earlier version of this check
+got wrong (it gave the test client its own audience mapper, which hid a real missing-mapper
+defect on the shipped client entirely). Also asserts the shipped client's own
+publicClient/directAccessGrantsEnabled/implicitFlowEnabled/PKCE settings, read live, so ADR
+0106 item (d)'s settings are pinned against drift.
 """
 from __future__ import annotations
 
@@ -34,6 +44,7 @@ WORKSPACE = "bundled-check"
 USERNAME = "bundled-check-user"
 VERIFICATION_PASSWORD = "bundled-check-verification-password"
 TEST_CLIENT_ID = "bundled-check-test-only"
+SHIPPED_CLIENT_ID = "booth-design"  # ADR 0106 item (d)'s fixed, shipped client id
 
 
 def post_form(url: str, data: dict[str, str]) -> dict:
@@ -136,19 +147,40 @@ def main() -> None:
         "grant_type": "password", "client_id": "admin-cli", "username": "admin", "password": ADMIN_PASSWORD,
     })["access_token"]
 
-    # The shipped client (booth-design) has direct grants off (ADR 0106 item d) -- this is a
-    # test-only client, created here, never part of the starter realm itself. It needs its own
-    # audience mapper: the chart's real default (oidc.requireAudience=true, clientId=booth-design)
-    # is in effect for this check, and Keycloak's default `aud` ("account") would not satisfy it.
+    # Read the SHIPPED client live, from the realm the chart actually produced -- not asserted
+    # against the template, which could silently drift from what Keycloak actually imported.
+    status, resp = call("GET", f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients?clientId={SHIPPED_CLIENT_ID}", token=admin_token)
+    shipped_matches = json.loads(resp)
+    if status != 200 or not shipped_matches:
+        raise SystemExit(f"the shipped client {SHIPPED_CLIENT_ID!r} was not found in the live realm: {status} {resp!r}")
+    shipped = shipped_matches[0]
+
+    # ADR 0106 item (d)'s settings, pinned against drift -- read live, not assumed.
+    if shipped.get("publicClient") is not True:
+        raise SystemExit(f"shipped client publicClient = {shipped.get('publicClient')!r}, want True")
+    if shipped.get("directAccessGrantsEnabled") is not False:
+        raise SystemExit(f"shipped client directAccessGrantsEnabled = {shipped.get('directAccessGrantsEnabled')!r}, want False")
+    if shipped.get("implicitFlowEnabled") is not False:
+        raise SystemExit(f"shipped client implicitFlowEnabled = {shipped.get('implicitFlowEnabled')!r}, want False")
+    pkce = (shipped.get("attributes") or {}).get("pkce.code.challenge.method")
+    if pkce != "S256":
+        raise SystemExit(f"shipped client pkce.code.challenge.method = {pkce!r}, want 'S256'")
+    print("shipped client settings OK: publicClient/directAccessGrantsEnabled/implicitFlowEnabled/PKCE all as expected")
+
+    # The shipped client has direct grants off (ADR 0106 item d), so only a test-only client can
+    # fetch a token non-interactively here. Deliberately NO protocolMappers of its own: it copies
+    # the shipped client's actual mappers (read above), so a missing/wrong audience mapper on the
+    # real client fails this check exactly as it would fail a real browser login -- never supply
+    # a mapper here that the shipped client doesn't already have. Each mapper's own "id" is
+    # stripped before reposting: Keycloak's admin API treats a supplied "id" as authoritative, so
+    # reusing the shipped client's mapper id(s) verbatim on a second client silently corrupts
+    # client creation instead of giving the copy fresh ids of its own.
+    copied_mappers = [{k: v for k, v in m.items() if k != "id"} for m in shipped.get("protocolMappers", [])]
     status, resp = call("POST", f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients", token=admin_token, body={
         "clientId": TEST_CLIENT_ID, "publicClient": True, "directAccessGrantsEnabled": True,
         "standardFlowEnabled": False, "serviceAccountsEnabled": False,
         "defaultClientScopes": ["groups", "profile", "email", "roles", "web-origins", "basic", "acr"],
-        "protocolMappers": [{
-            "name": "audience-booth-design", "protocol": "openid-connect", "protocolMapper": "oidc-audience-mapper",
-            "consentRequired": False,
-            "config": {"included.custom.audience": "booth-design", "id.token.claim": "false", "access.token.claim": "true"},
-        }],
+        "protocolMappers": copied_mappers,
     })
     if status not in (201, 409):
         raise SystemExit(f"creating the test client failed: {status} {resp!r}")
@@ -175,6 +207,15 @@ def main() -> None:
     if claims.get("groups") != [want_group]:
         raise SystemExit(f"groups claim = {claims.get('groups')!r}, want exactly [{want_group!r}]")
     print("groups claim OK:", claims["groups"])
+
+    # Entirely from the copied mapper, nothing this script supplied -- the actual defect this
+    # check exists to catch: Keycloak's own default access-token `aud` is "account", which core's
+    # real default (oidc.requireAudience=true, clientId=booth-design) would reject.
+    aud = claims.get("aud")
+    aud_list = aud if isinstance(aud, list) else [aud]
+    if SHIPPED_CLIENT_ID not in aud_list:
+        raise SystemExit(f"aud claim = {aud!r}, does not include {SHIPPED_CLIENT_ID!r} -- the shipped client's audience mapper is missing or wrong")
+    print("aud claim OK:", aud)
 
     status, resp = call("GET", f"{CORE_URL}/api/me", token=token, headers={"X-Workspace": WORKSPACE})
     if status != 200:

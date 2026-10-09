@@ -80,7 +80,19 @@
       "webOrigins": ["{{ include "booth-core.shellOrigin" . }}"],
       "attributes": {
         "pkce.code.challenge.method": "S256"
-      }
+      },
+      "protocolMappers": [
+        {
+          "name": "booth-design-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.client.audience": "{{ include "booth-core.keycloakClientId" . }}",
+            "id.token.claim": "false",
+            "access.token.claim": "true"
+          }
+        }
+      ]
     }
   ],
   "groups": [
