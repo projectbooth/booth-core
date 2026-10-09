@@ -225,6 +225,28 @@ def main() -> None:
         raise SystemExit(f"core's /api/me active = {me.get('active')!r}, want workspace={WORKSPACE!r} role=owner")
     print("core /api/me OK:", me["active"])
 
+    # ADR 0108 condition 6 / the coordinator's PR B review: --import-realm cannot alter the
+    # already-existing master realm, and the bundled Keycloak's NetworkPolicy admits any
+    # namespace to :8080, including /realms/master -- harden-master is the real fix, run here
+    # against the real bundled Keycloak, not just unit-tested against a fake transport
+    # (scripts/testdata/test_booth_admin.py covers that separately).
+    run_booth_admin(booth_admin_url, "harden-master")
+    status, resp = call("GET", f"{KEYCLOAK_URL}/admin/realms/master", token=admin_token)
+    if status != 200:
+        raise SystemExit(f"reading the master realm failed: {status} {resp!r}")
+    if not json.loads(resp).get("bruteForceProtected"):
+        raise SystemExit("master realm bruteForceProtected is not true after harden-master")
+    print("harden-master OK: master realm bruteForceProtected = true")
+
+    # Idempotence, proven by running it again -- not just asserted by reading the code.
+    second_output = run_booth_admin(booth_admin_url, "harden-master")
+    if "already enabled" not in second_output:
+        raise SystemExit(f"harden-master run a second time did not report idempotence: {second_output!r}")
+    status, resp = call("GET", f"{KEYCLOAK_URL}/admin/realms/master", token=admin_token)
+    if not json.loads(resp).get("bruteForceProtected"):
+        raise SystemExit("master realm bruteForceProtected was unset by the second harden-master run")
+    print("harden-master OK: idempotent on a second run")
+
     print("=== bundled Keycloak default verified end to end ===")
 
 
