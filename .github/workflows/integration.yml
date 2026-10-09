@@ -64,6 +64,7 @@ jobs:
             --set oidc.issuerUrl=https://keycloak.example.com/realms/booth \
             --set oidc.clientId=booth-core \
             --set iframeSigningKey=ci-placeholder \
+            --set keycloak.enabled=false \
             --wait --timeout 5m
 
       - name: Verify rollout
@@ -701,6 +702,93 @@ jobs:
           kubectl -n ci-minio get all || true
           kubectl -n ci-minio describe pods || true
           kubectl -n ci-minio logs deployment/minio --tail=100 || true
+
+  # ADR 0106/0108 design note section (h): proves the *real* bundled chart default -- no
+  # oidc.*/keycloak.enabled overrides at all -- end to end: core's EnsureKeycloak provisioning,
+  # the generated admin/database Secrets, the real starter realm, and oidc.jwksUrl all working
+  # together on a real kind cluster. A sibling job to kind-deploy rather than a step inside it:
+  # kind-deploy's own install commits to the external-provider path from its very first step
+  # (oidc.issuerUrl=https://keycloak.example.com, keycloak.enabled=false) and many later steps
+  # build on that specific configuration persisting: a separate, isolated install is simpler and
+  # safer than threading a second identity-provider configuration through the same long-lived
+  # release. Runs the real-world sequence in-cluster (not a port-forward out to the runner, per
+  # the design note): scripts/booth-admin itself creates the workspace/user against the real
+  # realm, a test-only client (created here -- the shipped client has direct grants off) obtains
+  # a real token, and core's own /api/me (at its in-cluster Service DNS name) is asserted to
+  # agree with it -- nothing stubbed.
+  bundled-keycloak-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: booth-core-keycloak-ci
+
+      - uses: azure/setup-helm@v4
+
+      - name: Build and load booth-core image
+        run: |
+          docker build -t booth-core:ci .
+          kind load docker-image booth-core:ci --name booth-core-keycloak-ci
+
+      - name: helm dependency update
+        working-directory: charts/booth-core
+        run: helm dependency update
+
+      - name: Install booth-core with the true bundled default
+        working-directory: charts/booth-core
+        run: |
+          helm install booth-core . \
+            --namespace booth-system --create-namespace \
+            --set image.repository=booth-core \
+            --set image.tag=ci \
+            --set image.pullPolicy=Never \
+            --set iframeSigningKey=ci-placeholder \
+            --wait --timeout 6m
+
+      - name: Verify the bundled Keycloak end to end
+        run: |
+          set -eu
+          kubectl -n booth-system create configmap bundled-keycloak-check \
+            --from-file=booth-admin=scripts/booth-admin \
+            --from-file=check.py=scripts/testdata/bundled-keycloak-check.py
+
+          ADMIN_PASSWORD=$(kubectl -n booth-system get secret booth-keycloak-admin -o jsonpath='{.data.password}' | base64 -d)
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata: {name: bundled-keycloak-check, namespace: booth-system}
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: check
+                    image: python:3.12-slim
+                    env:
+                      - {name: KEYCLOAK_URL, value: "http://booth-core-keycloak:8080"}
+                      - {name: CORE_URL, value: "http://booth-core:8080"}
+                      - {name: KEYCLOAK_ADMIN_PASSWORD, value: "$ADMIN_PASSWORD"}
+                    command: ["python", "/scripts/check.py"]
+                    volumeMounts: [{name: scripts, mountPath: /scripts}]
+                volumes:
+                  - name: scripts
+                    configMap: {name: bundled-keycloak-check, defaultMode: 0755}
+          EOF
+          kubectl -n booth-system wait --for=condition=complete job/bundled-keycloak-check --timeout=180s
+          kubectl -n booth-system logs job/bundled-keycloak-check
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n booth-system get all
+          kubectl -n booth-system describe pod -l app.kubernetes.io/name=keycloak || true
+          kubectl -n booth-system logs deployment/booth-core-keycloak --tail=200 || true
+          kubectl -n booth-system logs deployment/booth-core --tail=200 || true
+          kubectl -n booth-system logs job/bundled-keycloak-check --tail=200 || true
 
   # scripts/booth-admin, docs/operations/accounts-and-workspaces.md: an automated check that the
   # operator script actually drives a real Keycloak correctly end to end, including the exact

@@ -35,6 +35,14 @@ type Config struct {
 	// (unlike NATSURL, which core itself uses from its own namespace).
 	NATSModuleURL string
 
+	// KeycloakEnabled turns on the bundled Keycloak's own provisioning (ADR 0106/0108):
+	// core generates its bootstrap-admin Secret and its database credentials before its
+	// Deployment starts. The chart sets this to match keycloak.enabled; it is independent
+	// of Postgres.Bundled (an operator could run bundled Postgres with an external
+	// Keycloak, or vice versa) and does not, on its own, change oidc.issuerUrl/jwksUrl's
+	// defaults — those are computed by the chart itself, not by this flag.
+	KeycloakEnabled bool
+
 	// DevRegistryPath, if set, points at a static YAML file listing BoothModule-shaped
 	// entries for local development without a real Kubernetes cluster (ADR 0019's
 	// "worth building as a convenience" fallback). Empty means "use the real CRD
@@ -208,6 +216,14 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("BOOTH_OIDC_REQUIRE_AUDIENCE: %w", err)
 		}
 		cfg.OIDC.RequireAudience = b
+	}
+
+	if v := os.Getenv("BOOTH_KEYCLOAK_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("BOOTH_KEYCLOAK_ENABLED: %w", err)
+		}
+		cfg.KeycloakEnabled = b
 	}
 
 	if v := os.Getenv("BOOTH_EVENTBUS_AUTH"); v != "" {

@@ -527,6 +527,28 @@ func TestAgainstRealPostgres(t *testing.T) {
 			}
 		})
 
+		t.Run("the bundled Keycloak's database uses the same mechanism", func(t *testing.T) {
+			p, c := newP(t, ns("booth-system"))
+			dsn, err := p.EnsureKeycloak(ctx, "booth-system")
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				t.Fatalf("Keycloak DSN doesn't work: %v", err)
+			}
+			conn.Close(ctx)
+
+			again, err := p.EnsureKeycloak(ctx, "booth-system")
+			if err != nil || again != dsn {
+				t.Errorf("EnsureKeycloak not stable: %q vs %q (%v)", again, dsn, err)
+			}
+			sec, _ := getSecret(t, c, "booth-system", KeycloakCredentialsSecretName)
+			if sec == nil || sec.StringData[KeyDatabase] != KeycloakDatabaseName {
+				t.Errorf("Keycloak credentials Secret = %v", sec)
+			}
+		})
+
 		// Two modules through the provisioner, end to end: the isolation guarantee holds for
 		// credentials actually handed out, not only for hand-built ones.
 		t.Run("credentials it hands out can't cross module boundaries", func(t *testing.T) {

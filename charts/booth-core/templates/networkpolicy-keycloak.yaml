@@ -1,0 +1,25 @@
+{{- if and .Values.keycloak.enabled .Values.networkPolicy.enabled }}
+# ADR 0106/0108 design note, section (f): mirrors networkpolicy-postgresql.yaml's shape, but
+# cannot be scoped as narrowly -- every module's pod independently re-verifies tokens (ADR
+# 0041), so Keycloak's discovery/JWKS endpoints need to be reachable by the whole fleet, not
+# an opt-in subset. This admits ingress from any namespace: the same posture as not having a
+# policy for this specific traffic class, stated plainly rather than looking more restrictive
+# than it is.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "booth-core.keycloakFullname" . }}
+  labels:
+    {{- include "booth-core.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: keycloak
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8080
+{{- end }}
