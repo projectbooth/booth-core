@@ -27,16 +27,22 @@ spec:
               value: ":8080"
             - name: BOOTH_NAMESPACE
               value: {{ .Release.Namespace | quote }}
+            # ADR 0106/0108: an explicit oidc.* value always wins; only an empty one defaults to
+            # the bundled Keycloak (keycloak.enabled) — see _helpers.tpl's "effectiveOidc*"
+            # templates, the one place issuerUrl/clientId/jwksUrl and Keycloak's own KC_HOSTNAME
+            # are computed from, so they cannot independently drift.
             - name: BOOTH_OIDC_ISSUER_URL
-              value: {{ .Values.oidc.issuerUrl | quote }}
+              value: {{ include "booth-core.effectiveOidcIssuerUrl" . | quote }}
             - name: BOOTH_OIDC_CLIENT_ID
-              value: {{ .Values.oidc.clientId | quote }}
+              value: {{ include "booth-core.effectiveOidcClientId" . | quote }}
             - name: BOOTH_OIDC_REQUIRE_AUDIENCE
               value: {{ .Values.oidc.requireAudience | quote }}
             - name: BOOTH_OIDC_GROUPS_CLAIM
               value: {{ .Values.oidc.groupsClaim | quote }}
             - name: BOOTH_OIDC_JWKS_URL
-              value: {{ .Values.oidc.jwksUrl | quote }}
+              value: {{ include "booth-core.effectiveOidcJwksUrl" . | quote }}
+            - name: BOOTH_KEYCLOAK_ENABLED
+              value: {{ .Values.keycloak.enabled | quote }}
             {{- if .Values.workloadIdentity.enabled }}
             # ADR 0056: core as a second token issuer. The URL is where modules reach core (it
             # serves the JWKS and the minting endpoint); it becomes the `iss` of minted tokens.

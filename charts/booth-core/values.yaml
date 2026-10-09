@@ -16,20 +16,23 @@ service:
 namespaceOverride: ""
 
 oidc:
-  # Required: the OIDC issuer URL and client ID (ADR 0004). Left empty by default —
-  # every real install must set these, whether pointed at the bundled Keycloak or an
-  # external IdP.
+  # The OIDC issuer URL and client ID (ADR 0004). Left empty here by default, but NOT
+  # actually empty for the bundled install below: when keycloak.enabled (the default), an
+  # empty issuerUrl/clientId/jwksUrl here means "use the bundled Keycloak's own values",
+  # computed by this chart itself (_helpers.tpl's "effectiveOidc*" templates) so they
+  # cannot drift from Keycloak's own KC_HOSTNAME. Set these explicitly to point at your
+  # own external IdP instead (keycloak.enabled=false then costs nothing to flip).
   issuerUrl: ""
   clientId: ""
   requireAudience: true
   groupsClaim: groups
   # Optional key-fetch override (ADR 0108): when set, core fetches signing keys from
   # this URL directly instead of the issuer's own discovery document, while still
-  # validating `iss` exactly against issuerUrl. A future bundled-Keycloak install sets
-  # this automatically to Keycloak's in-cluster Service over plain http, so core never
-  # needs to trust a self-signed Ingress certificate just to verify tokens. Setting this
-  # without issuerUrl is a startup error. Empty (the default) means ordinary discovery,
-  # unchanged — this is what every external-provider install uses today.
+  # validating `iss` exactly against issuerUrl. The bundled install (above) sets this
+  # automatically to Keycloak's in-cluster Service over plain http, so core never needs to
+  # trust a self-signed Ingress certificate just to verify tokens. Setting this without
+  # issuerUrl is a startup error. Empty with keycloak.enabled=false (an external provider)
+  # means ordinary discovery, unchanged.
   jwksUrl: ""
 
 # Workload identity (ADR 0056): booth-core acts as a second trusted token issuer, for exactly
@@ -144,6 +147,24 @@ postgresql:
       repository: amazon/aws-cli
       tag: "2.36.49"
     resources: {}
+
+# Bundled Keycloak (ADR 0106/0108): the default identity provider for self-hosted installs.
+# Switchable off with keycloak.enabled=false plus the existing oidc.* values for an external
+# provider, the same pattern as bundled NATS/PostgreSQL. Its database lives on the bundled
+# PostgreSQL above (postgresql.enabled must stay true, or postgres.external.* must point
+# somewhere real) — core provisions it the same way it provisions its own and every module's.
+#
+# No Ingress exists yet (a separate, later change) -- this Keycloak is reachable in-cluster
+# only, for core/module token verification (oidc.jwksUrl, defaulted automatically below) and
+# for booth-admin via port-forward, not yet for a real browser login.
+keycloak:
+  enabled: true
+  image:
+    repository: quay.io/keycloak/keycloak
+    # Pinned by digest (ADR 0087/0091's convention), not a floating tag -- confirmed reachable
+    # anonymously against quay.io's own registry API, not assumed. Corresponds to the 26.0 tag.
+    digest: sha256:09a381c715ab0b111835b70f2905955274843a219c6f27efb348e4d9f4086858
+  resources: {}
 
 postgres:
   # dsn, if set, is used verbatim as booth-core's OWN database connection string instead of

@@ -31,6 +31,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/eventbus"
 	"github.com/projectbooth/booth-core/internal/gateway"
 	"github.com/projectbooth/booth-core/internal/iframeidentity"
+	"github.com/projectbooth/booth-core/internal/keycloakprov"
 	"github.com/projectbooth/booth-core/internal/natsauth"
 	"github.com/projectbooth/booth-core/internal/registry"
 	"github.com/projectbooth/booth-core/internal/workload"
@@ -180,6 +181,22 @@ func run() error {
 			}
 		} else {
 			log.Print("BOOTH_POSTGRES_HOST is not set; module databases will not be provisioned (ADR 0053)")
+		}
+
+		// Bundled Keycloak provisioning (ADR 0106/0108): the admin-password Secret and the
+		// database credentials must both exist before its Deployment can start, same
+		// ordering rule as the bundled PostgreSQL's own admin password above.
+		if cfg.KeycloakEnabled {
+			if dbProv == nil {
+				return fmt.Errorf("keycloak.enabled is true but BOOTH_POSTGRES_HOST is not set: the bundled Keycloak needs a database to provision (ADR 0106)")
+			}
+			if _, err := keycloakprov.EnsureAdminPassword(ctx, direct, cfg.KubeNamespace); err != nil {
+				return fmt.Errorf("bootstrapping the bundled Keycloak's admin credential: %w", err)
+			}
+			if _, err := dbProv.EnsureKeycloak(ctx, cfg.KubeNamespace); err != nil {
+				return fmt.Errorf("provisioning the bundled Keycloak's database: %w", err)
+			}
+			log.Print("bundled Keycloak provisioning enabled (admin Secret and database credentials)")
 		}
 
 		// Workload identity (ADR 0056): core's own signing key, and per-module minting credentials.

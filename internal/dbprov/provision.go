@@ -27,6 +27,15 @@ const (
 	// CoreCredentialsSecretName holds core's own database credentials, in core's namespace.
 	CoreCredentialsSecretName = "booth-core-database"
 
+	// KeycloakCredentialsSecretName holds the bundled Keycloak's database credentials
+	// (ADR 0106/0108), in core's namespace — the bundled Keycloak Deployment waits on this
+	// Secret the same way the bundled PostgreSQL StatefulSet waits on AdminSecretName.
+	KeycloakCredentialsSecretName = "booth-keycloak-db"
+
+	// KeycloakDatabaseName is the bundled Keycloak's database/role name on the shared
+	// PostgreSQL server, matching core's own "booth_<name>" convention.
+	KeycloakDatabaseName = "booth_keycloak"
+
 	// AdminSecretName holds the bundled PostgreSQL server's superuser password; core creates
 	// it (see EnsureAdminPassword) and the bundled StatefulSet reads it.
 	AdminSecretName = "booth-postgres-admin"
@@ -111,6 +120,14 @@ func (p *Provisioner) Ensure(ctx context.Context, mod *boothv1alpha1.BoothModule
 func (p *Provisioner) EnsureCore(ctx context.Context, namespace string) (string, error) {
 	key := types.NamespacedName{Namespace: namespace, Name: CoreCredentialsSecretName}
 	return p.ensure(ctx, key, CoreDatabaseName, nil)
+}
+
+// EnsureKeycloak provisions the bundled Keycloak's database on the shared PostgreSQL server
+// and returns a Secret key/DSN pair the Keycloak Deployment waits on (ADR 0106/0108), the
+// identical mechanism EnsureCore already uses for core's own database.
+func (p *Provisioner) EnsureKeycloak(ctx context.Context, namespace string) (string, error) {
+	key := types.NamespacedName{Namespace: namespace, Name: KeycloakCredentialsSecretName}
+	return p.ensure(ctx, key, KeycloakDatabaseName, nil)
 }
 
 // ensure provisions database `name` and returns its DSN, keeping the credential Secret at
