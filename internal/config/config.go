@@ -86,6 +86,18 @@ type OIDCConfig struct {
 	// (ARCHITECTURE.md §6, ADR 0004, ADR 0008). Configurable because not every OIDC
 	// provider names this claim "groups".
 	GroupsClaim string
+
+	// JWKSURL, if set, overrides where signing keys are fetched from (ADR 0108):
+	// instead of discovery against IssuerURL, keys are fetched directly from this URL,
+	// while `iss` is still validated exactly against IssuerURL. This lets a deployment
+	// point every verifying service at an in-cluster, unauthenticated key endpoint (e.g.
+	// Keycloak's own Service, over plain http) while the issuer itself is a
+	// browser-facing https URL behind a self-signed-certificate Ingress — no pod needs to
+	// trust that certificate. Empty (the default, and every external-provider install)
+	// means ordinary discovery, unchanged. Security note: this fetch is unauthenticated
+	// and unencrypted, so it relies on NetworkPolicy and cluster trust, not on anything
+	// this field itself enforces.
+	JWKSURL string
 }
 
 // WorkloadConfig is the workload-identity configuration (ADR 0056).
@@ -186,6 +198,7 @@ func Load() (Config, error) {
 			IssuerURL:   os.Getenv("BOOTH_OIDC_ISSUER_URL"),
 			ClientID:    os.Getenv("BOOTH_OIDC_CLIENT_ID"),
 			GroupsClaim: getEnv("BOOTH_OIDC_GROUPS_CLAIM", "groups"),
+			JWKSURL:     os.Getenv("BOOTH_OIDC_JWKS_URL"),
 		},
 	}
 
@@ -267,6 +280,12 @@ func Load() (Config, error) {
 		if cfg.OIDC.ClientID == "" {
 			return Config{}, fmt.Errorf("BOOTH_OIDC_CLIENT_ID is required")
 		}
+	}
+	// Checked unconditionally, even in dev mode: BOOTH_OIDC_JWKS_URL names a key-fetch
+	// override for an issuer, so it is meaningless (and very likely a misconfiguration)
+	// without that issuer also being set.
+	if cfg.OIDC.JWKSURL != "" && cfg.OIDC.IssuerURL == "" {
+		return Config{}, fmt.Errorf("BOOTH_OIDC_JWKS_URL is set but BOOTH_OIDC_ISSUER_URL is empty: the issuer is still required to validate `iss`")
 	}
 
 	return cfg, nil

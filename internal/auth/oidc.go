@@ -7,6 +7,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"log"
 
 	oidc "github.com/coreos/go-oidc/v3/oidc"
 
@@ -30,19 +31,23 @@ type Claims struct {
 // independently (core-platform-api.md: "a module must independently verify the identity
 // core forwards it").
 type Verifier struct {
-	provider        *oidc.Provider
 	idTokenVerifier *oidc.IDTokenVerifier
 	groupsClaim     string
 }
 
-// NewVerifier fetches the provider's discovery document and prepares JWKS-based
-// signature verification. cfg.RequireAudience controls whether the token's `aud` must
-// match cfg.ClientID — a per-deployment policy choice per core-platform-api.md, not
-// hardcoded.
+// NewVerifier prepares JWKS-based signature verification against cfg.IssuerURL.
+// cfg.RequireAudience controls whether the token's `aud` must match cfg.ClientID — a
+// per-deployment policy choice per core-platform-api.md, not hardcoded.
+//
+// Ordinarily this fetches the provider's discovery document and uses its own
+// self-reported jwks_uri. If cfg.JWKSURL is set (ADR 0108), discovery is skipped
+// entirely and keys are fetched directly from that URL instead; `iss` is still validated
+// exactly against cfg.IssuerURL either way — only where keys are physically fetched from
+// changes. config.Load already rejects cfg.JWKSURL set without cfg.IssuerURL, but that
+// check is repeated here since this is also a usable library entry point on its own.
 func NewVerifier(ctx context.Context, cfg config.OIDCConfig) (*Verifier, error) {
-	provider, err := oidc.NewProvider(ctx, cfg.IssuerURL)
-	if err != nil {
-		return nil, fmt.Errorf("oidc discovery against %s: %w", cfg.IssuerURL, err)
+	if cfg.JWKSURL != "" && cfg.IssuerURL == "" {
+		return nil, fmt.Errorf("oidc.jwksUrl is set but oidc.issuerUrl is empty: the issuer is still required to validate `iss`")
 	}
 
 	verifierCfg := &oidc.Config{
@@ -50,9 +55,24 @@ func NewVerifier(ctx context.Context, cfg config.OIDCConfig) (*Verifier, error) 
 		ClientID:          cfg.ClientID,
 	}
 
+	var idTokenVerifier *oidc.IDTokenVerifier
+	keysFrom := "discovery (" + cfg.IssuerURL + "/.well-known/openid-configuration)"
+	if cfg.JWKSURL != "" {
+		keySet := oidc.NewRemoteKeySet(ctx, cfg.JWKSURL)
+		idTokenVerifier = oidc.NewVerifier(cfg.IssuerURL, keySet, verifierCfg)
+		keysFrom = cfg.JWKSURL
+	} else {
+		provider, err := oidc.NewProvider(ctx, cfg.IssuerURL)
+		if err != nil {
+			return nil, fmt.Errorf("oidc discovery against %s: %w", cfg.IssuerURL, err)
+		}
+		idTokenVerifier = provider.Verifier(verifierCfg)
+	}
+
+	log.Printf("oidc: verifying tokens with issuer=%s keys-from=%s", cfg.IssuerURL, keysFrom)
+
 	return &Verifier{
-		provider:        provider,
-		idTokenVerifier: provider.Verifier(verifierCfg),
+		idTokenVerifier: idTokenVerifier,
 		groupsClaim:     cfg.GroupsClaim,
 	}, nil
 }

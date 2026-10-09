@@ -93,6 +93,33 @@ func TestLoad_RejectsBadPostgresPort(t *testing.T) {
 	}
 }
 
+// ADR 0108 condition 2: oidc.jwksUrl without oidc.issuerUrl is meaningless (there would be
+// no issuer to validate `iss` against) and is rejected at startup rather than left to fail
+// confusingly later.
+func TestLoad_RejectsJWKSURLWithoutIssuerURL(t *testing.T) {
+	t.Setenv("BOOTH_OIDC_CLIENT_ID", "c")
+	t.Setenv("BOOTH_OIDC_JWKS_URL", "http://booth-core-keycloak.booth-system.svc.cluster.local:8080/realms/booth/protocol/openid-connect/certs")
+	// Dev mode would otherwise skip the ordinary issuer-required check entirely — this
+	// rejection must still fire even then.
+	t.Setenv("BOOTH_DEV_REGISTRY_PATH", "/dev/null")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error: BOOTH_OIDC_JWKS_URL set without BOOTH_OIDC_ISSUER_URL")
+	}
+}
+
+func TestLoad_JWKSURLWithIssuerURLIsAccepted(t *testing.T) {
+	t.Setenv("BOOTH_OIDC_ISSUER_URL", "https://booth.home.arpa/realms/booth")
+	t.Setenv("BOOTH_OIDC_CLIENT_ID", "c")
+	t.Setenv("BOOTH_OIDC_JWKS_URL", "http://booth-core-keycloak.booth-system.svc.cluster.local:8080/realms/booth/protocol/openid-connect/certs")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OIDC.JWKSURL == "" {
+		t.Error("JWKSURL was not populated from BOOTH_OIDC_JWKS_URL")
+	}
+}
+
 // ADR 0054: operators must not be able to assume a protection that silently isn't there.
 func TestStartupWarnings(t *testing.T) {
 	warned := func(p PostgresConfig) bool { return len(p.StartupWarnings()) > 0 }

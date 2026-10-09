@@ -35,6 +35,8 @@ spec:
               value: {{ .Values.oidc.requireAudience | quote }}
             - name: BOOTH_OIDC_GROUPS_CLAIM
               value: {{ .Values.oidc.groupsClaim | quote }}
+            - name: BOOTH_OIDC_JWKS_URL
+              value: {{ .Values.oidc.jwksUrl | quote }}
             {{- if .Values.workloadIdentity.enabled }}
             # ADR 0056: core as a second token issuer. The URL is where modules reach core (it
             # serves the JWKS and the minting endpoint); it becomes the `iss` of minted tokens.
