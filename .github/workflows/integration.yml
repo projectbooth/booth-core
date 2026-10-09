@@ -74,6 +74,7 @@ jobs:
             --set oidc.clientId=booth-core \
             --set iframeSigningKey=ci-placeholder \
             --set keycloak.enabled=false \
+            --set ingress.enabled=false \
             --wait --timeout 5m
 
       - name: Verify rollout
@@ -754,15 +755,22 @@ jobs:
         working-directory: charts/booth-core
         run: helm dependency update
 
-      - name: Install booth-core with the true bundled default
+      - name: Install booth-core with the true bundled identity-provider default
         working-directory: charts/booth-core
         run: |
+          # This job tests the identity-provider mechanics (EnsureKeycloak, the admin/database
+          # Secrets, the real starter realm, oidc.jwksUrl) in-cluster, not the Ingress/TLS
+          # machinery (ADR 0108, a separate job below with its own real IngressClass and
+          # certificate) -- ingress.enabled=false keeps this job testing exactly what it tested
+          # before PR B introduced ingress.host as a required value whenever both ingress.enabled
+          # and keycloak.enabled are true.
           helm install booth-core . \
             --namespace booth-system --create-namespace \
             --set image.repository=booth-core \
             --set image.tag=ci \
             --set image.pullPolicy=Never \
             --set iframeSigningKey=ci-placeholder \
+            --set ingress.enabled=false \
             --wait --timeout 6m
 
       - name: Verify the bundled Keycloak end to end
@@ -807,6 +815,165 @@ jobs:
           kubectl -n booth-system logs deployment/booth-core-keycloak --tail=200 || true
           kubectl -n booth-system logs deployment/booth-core --tail=200 || true
           kubectl -n booth-system logs job/bundled-keycloak-check --tail=200 || true
+
+  # ADR 0108: proves the thing the NodePort spike (booth-core PR #5, commit 3187046) found
+  # broken -- PKCE S256 needs a secure context -- now actually works, through a real Ingress
+  # (Traefik, matching k3s's default) and core's own self-signed certificate, using the real
+  # shipped "booth-design" realm client over https (no test-only client in this path, per the
+  # coordinator's explicit condition). A real Chromium drives the login; booth-core ships no
+  # frontend of its own, so scripts/testdata/https-login-shell/ is the minimal stand-in PKCE
+  # client needed to exercise the real client's redirect URI and audience-mapper configuration.
+  ingress-tls-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright==1.48.0
+          python -m playwright install --with-deps chromium
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: booth-core-ingress-ci
+          config: scripts/testdata/kind-ingress-config.yaml
+
+      - uses: azure/setup-helm@v4
+
+      - name: Install Traefik (the IngressClass k3s ships by default)
+        run: |
+          helm repo add traefik https://traefik.github.io/charts
+          helm repo update traefik
+          # hostNetwork binds Traefik directly to the node's own 80/443, which the kind config
+          # above maps straight onto this runner's loopback -- the standard kind+ingress
+          # pattern (https://kind.sigs.k8s.io/docs/user/ingress/), adapted for Traefik.
+          helm install traefik traefik/traefik \
+            --namespace traefik --create-namespace \
+            --set hostNetwork=true \
+            --set service.type=ClusterIP \
+            --set ports.web.port=80 --set ports.web.hostPort=80 \
+            --set ports.websecure.port=443 --set ports.websecure.hostPort=443 \
+            --wait --timeout 3m
+
+      - name: Build and load booth-core image
+        run: |
+          docker build -t booth-core:ci .
+          kind load docker-image booth-core:ci --name booth-core-ingress-ci
+
+      - name: helm dependency update
+        working-directory: charts/booth-core
+        run: helm dependency update
+
+      - name: Install booth-core with a real Ingress and self-signed certificate
+        working-directory: charts/booth-core
+        run: |
+          helm install booth-core . \
+            --namespace booth-system --create-namespace \
+            --set image.repository=booth-core \
+            --set image.tag=ci \
+            --set image.pullPolicy=Never \
+            --set iframeSigningKey=ci-placeholder \
+            --set ingress.host=booth-ci.test \
+            --wait --timeout 6m
+
+      - name: Deploy the stand-in shell (booth-core ships no frontend of its own)
+        run: |
+          kubectl -n booth-system create configmap https-login-shell \
+            --from-file=index.html=scripts/testdata/https-login-shell/index.html \
+            --from-file=callback.html=scripts/testdata/https-login-shell/callback.html
+          cat <<'EOF' | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata: {name: https-login-shell, namespace: booth-system}
+          spec:
+            replicas: 1
+            selector: {matchLabels: {app: https-login-shell}}
+            template:
+              metadata: {labels: {app: https-login-shell}}
+              spec:
+                containers:
+                  - name: nginx
+                    image: nginx:1.27-alpine
+                    ports: [{containerPort: 80, name: http}]
+                    volumeMounts: [{name: pages, mountPath: /usr/share/nginx/html/ci-shell}]
+                volumes:
+                  - name: pages
+                    configMap: {name: https-login-shell}
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata: {name: https-login-shell, namespace: booth-system}
+          spec:
+            selector: {app: https-login-shell}
+            ports: [{port: 80, targetPort: 80}]
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata: {name: https-login-shell, namespace: booth-system}
+          spec:
+            tls:
+              - hosts: [booth-ci.test]
+                secretName: booth-core-tls
+            rules:
+              - host: booth-ci.test
+                http:
+                  paths:
+                    - path: /ci-shell
+                      pathType: Prefix
+                      backend:
+                        service: {name: https-login-shell, port: {number: 80}}
+          EOF
+          kubectl -n booth-system rollout status deployment/https-login-shell --timeout=60s
+
+      - name: Create a real test user (scripts/booth-admin, via the ordinary port-forward path)
+        run: |
+          set -eu
+          kubectl -n booth-system port-forward svc/booth-core-keycloak 18081:8080 &
+          PF_PID=$!
+          sleep 3
+          ADMIN_PASSWORD=$(kubectl -n booth-system get secret booth-keycloak-admin -o jsonpath='{.data.password}' | base64 -d)
+          export KEYCLOAK_URL=http://localhost:18081
+          export KEYCLOAK_REALM=booth
+          export KEYCLOAK_ADMIN_USER=admin
+          export KEYCLOAK_ADMIN_PASSWORD="$ADMIN_PASSWORD"
+          python3 scripts/booth-admin create-workspace ingress-tls-check
+          python3 scripts/booth-admin create-user ingress-tls-user --email ingress-tls-user@example.test --name "Ingress TLS Check"
+          python3 scripts/booth-admin add-member ingress-tls-user ingress-tls-check owner
+
+          ADMIN_TOKEN=$(curl -sf -X POST "http://localhost:18081/realms/master/protocol/openid-connect/token" \
+            -d "grant_type=password&client_id=admin-cli&username=admin&password=$ADMIN_PASSWORD" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+          USER_ID=$(curl -sf "http://localhost:18081/admin/realms/booth/users?username=ingress-tls-user&exact=true" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
+          # booth-admin itself only ever sets a temporary password; this test has no second
+          # browser session to resolve that through, so it sets a permanent one directly here,
+          # purely as test scaffolding -- not something booth-admin does.
+          curl -sf -o /dev/null -X PUT "http://localhost:18081/admin/realms/booth/users/$USER_ID/reset-password" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+            -d '{"type":"password","value":"ingress-tls-check-password","temporary":false}'
+          kill $PF_PID 2>/dev/null || true
+
+      - name: Real-browser HTTPS login through the real shipped client
+        env:
+          INGRESS_HOST: booth-ci.test
+          TEST_USERNAME: ingress-tls-user
+          TEST_PASSWORD: ingress-tls-check-password
+          TEST_WORKSPACE: ingress-tls-check
+        run: python3 scripts/testdata/https_login_check.py
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n booth-system get all
+          kubectl -n traefik get all
+          kubectl -n booth-system get ingress -o yaml
+          kubectl -n booth-system get secret booth-core-tls -o yaml || true
+          kubectl -n booth-system logs deployment/booth-core-keycloak --tail=200 || true
+          kubectl -n booth-system logs deployment/booth-core --tail=200 || true
+          kubectl -n traefik logs deployment/traefik --tail=200 || true
 
   # scripts/booth-admin, docs/operations/accounts-and-workspaces.md: an automated check that the
   # operator script actually drives a real Keycloak correctly end to end, including the exact

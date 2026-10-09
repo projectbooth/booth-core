@@ -43,6 +43,11 @@ type Config struct {
 	// defaults — those are computed by the chart itself, not by this flag.
 	KeycloakEnabled bool
 
+	// TLS is the self-signed certificate configuration (ADR 0108 item 2(b)). Only relevant for
+	// mode (b) -- modes (a) and (c) never touch this, since an operator-supplied Secret or
+	// cert-manager already owns the certificate.
+	TLS TLSConfig
+
 	// DevRegistryPath, if set, points at a static YAML file listing BoothModule-shaped
 	// entries for local development without a real Kubernetes cluster (ADR 0019's
 	// "worth building as a convenience" fallback). Empty means "use the real CRD
@@ -131,6 +136,23 @@ type IframeIdentityConfig struct {
 	// (and starts attaching X-Booth-Identity on the iframe-proxy path); empty leaves it off,
 	// falling back to the pre-ADR-0069 workspace/role-only headers.
 	IssuerURL string
+}
+
+// TLSConfig is the self-signed certificate configuration (ADR 0108 item 2(b)).
+type TLSConfig struct {
+	// Enabled turns on core's own certificate generation/renewal (internal/tlsprov). The chart
+	// sets this true only for mode (b): ingress.enabled, ingress.host set, and
+	// ingress.tls.secretName empty with ingress.tls.selfSigned true. False for modes (a)/(c) --
+	// core must not generate or touch anything when an operator or cert-manager owns the cert.
+	Enabled bool
+
+	// Host is the certificate's SAN -- always ingress.host when Enabled.
+	Host string
+
+	// SecretName is the Secret this writes the leaf certificate into (and reads an existing
+	// one from) -- the same Secret the Ingress's own tls.secretName references, computed by
+	// the chart from the same ingress.tls.secretName-or-default logic either way.
+	SecretName string
 }
 
 // CredentialBrokerConfig is the credential-broker configuration (ADR 0080).
@@ -224,6 +246,18 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("BOOTH_KEYCLOAK_ENABLED: %w", err)
 		}
 		cfg.KeycloakEnabled = b
+	}
+
+	cfg.TLS = TLSConfig{Host: os.Getenv("BOOTH_TLS_HOST"), SecretName: os.Getenv("BOOTH_TLS_SECRET_NAME")}
+	if v := os.Getenv("BOOTH_TLS_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("BOOTH_TLS_ENABLED: %w", err)
+		}
+		cfg.TLS.Enabled = b
+	}
+	if cfg.TLS.Enabled && (cfg.TLS.Host == "" || cfg.TLS.SecretName == "") {
+		return Config{}, fmt.Errorf("BOOTH_TLS_ENABLED is set but BOOTH_TLS_HOST/BOOTH_TLS_SECRET_NAME are not both set")
 	}
 
 	if v := os.Getenv("BOOTH_EVENTBUS_AUTH"); v != "" {

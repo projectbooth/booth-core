@@ -120,6 +120,34 @@ func TestLoad_JWKSURLWithIssuerURLIsAccepted(t *testing.T) {
 	}
 }
 
+// ADR 0108 item 2(b): BOOTH_TLS_ENABLED without both BOOTH_TLS_HOST and
+// BOOTH_TLS_SECRET_NAME is a misconfiguration (core would have nothing to generate a
+// certificate for, or nowhere to put it), rejected at startup rather than failing obscurely
+// later inside tlsprov.
+func TestLoad_RejectsTLSEnabledWithoutHostAndSecretName(t *testing.T) {
+	t.Setenv("BOOTH_OIDC_ISSUER_URL", "https://booth.home.arpa/realms/booth")
+	t.Setenv("BOOTH_OIDC_CLIENT_ID", "c")
+	t.Setenv("BOOTH_TLS_ENABLED", "true")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error: BOOTH_TLS_ENABLED set without BOOTH_TLS_HOST/BOOTH_TLS_SECRET_NAME")
+	}
+}
+
+func TestLoad_TLSConfigIsPopulated(t *testing.T) {
+	t.Setenv("BOOTH_OIDC_ISSUER_URL", "https://booth.home.arpa/realms/booth")
+	t.Setenv("BOOTH_OIDC_CLIENT_ID", "c")
+	t.Setenv("BOOTH_TLS_ENABLED", "true")
+	t.Setenv("BOOTH_TLS_HOST", "booth.home.arpa")
+	t.Setenv("BOOTH_TLS_SECRET_NAME", "booth-core-tls")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.TLS.Enabled || cfg.TLS.Host != "booth.home.arpa" || cfg.TLS.SecretName != "booth-core-tls" {
+		t.Errorf("TLS config = %+v", cfg.TLS)
+	}
+}
+
 // ADR 0054: operators must not be able to assume a protection that silently isn't there.
 func TestStartupWarnings(t *testing.T) {
 	warned := func(p PostgresConfig) bool { return len(p.StartupWarnings()) > 0 }

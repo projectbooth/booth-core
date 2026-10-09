@@ -1,0 +1,52 @@
+{{- if .Values.ingress.enabled }}
+{{- $_ := include "booth-core.requireIngressHost" . }}
+{{- if .Values.ingress.host }}
+# Ingress and TLS (ADR 0108): one host, path-routed. Keycloak's login/discovery/key endpoints
+# (/realms/<realm>/*) and its login-page assets (/resources/*) go to the bundled Keycloak;
+# everything else (the shell, /api/*, /modules/*, /iframe/*) goes to core. Deliberately NOT
+# routed, by omission: /admin/* (the admin console) and /realms/master/* (the master realm) --
+# neither path is matched by either rule below, so neither is reachable here at all, only by
+# kubectl port-forward directly to the Keycloak Service.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "booth-core.fullname" . }}
+  labels:
+    {{- include "booth-core.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.ingressClassName }}
+  ingressClassName: {{ .Values.ingress.ingressClassName }}
+  {{- end }}
+  tls:
+    - hosts: [{{ .Values.ingress.host }}]
+      secretName: {{ include "booth-core.tlsSecretName" . }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          {{- if .Values.keycloak.enabled }}
+          - path: /realms/{{ include "booth-core.keycloakRealm" . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "booth-core.keycloakFullname" . }}
+                port: {number: 8080}
+          - path: /resources
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "booth-core.keycloakFullname" . }}
+                port: {number: 8080}
+          {{- end }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "booth-core.fullname" . }}
+                port: {number: {{ .Values.service.port }}}
+{{- end }}
+{{- end }}

@@ -43,6 +43,14 @@ spec:
               value: {{ include "booth-core.effectiveOidcJwksUrl" . | quote }}
             - name: BOOTH_KEYCLOAK_ENABLED
               value: {{ .Values.keycloak.enabled | quote }}
+            # ADR 0108 item 2(b): core self-generates/renews the certificate only in mode (b)
+            # (see _helpers.tpl's "tls*" templates for the other two modes).
+            - name: BOOTH_TLS_ENABLED
+              value: {{ include "booth-core.tlsProvisioningEnabled" . | quote }}
+            - name: BOOTH_TLS_HOST
+              value: {{ .Values.ingress.host | quote }}
+            - name: BOOTH_TLS_SECRET_NAME
+              value: {{ include "booth-core.tlsSecretName" . | quote }}
             {{- if .Values.workloadIdentity.enabled }}
             # ADR 0056: core as a second token issuer. The URL is where modules reach core (it
             # serves the JWKS and the minting endpoint); it becomes the `iss` of minted tokens.

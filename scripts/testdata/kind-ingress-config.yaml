@@ -1,0 +1,15 @@
+# kind config for the ADR 0108 real-browser HTTPS login check: maps the node's Ingress ports
+# (80/443) onto the CI runner's own loopback, the standard kind "ingress" pattern
+# (https://kind.sigs.k8s.io/docs/user/ingress/) -- so a browser running on the runner itself
+# can reach the cluster's Ingress directly, with no Docker-network workaround needed.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP
