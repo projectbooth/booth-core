@@ -44,6 +44,7 @@ config/crd/bases/       Generated BoothModule CRD YAML
 charts/booth-core/      Helm chart (bundles NATS, the CRD, RBAC, the core Deployment)
 docs/decisions/         Decisions this repo made on brief-flagged open questions (see below)
 docs/runbooks/          Operator runbooks (PostgreSQL backup, restore, major-version upgrade)
+docs/operations/        First-login runbook + shared module-values reference (ADR 0106/0108)
 test/contract/          Layer-2 tests: contract fixtures vs. Go types, no cluster needed
 test/integration/       Layer-3 tests: real (envtest) kube-apiserver, no Docker needed
 hack/                    Local-dev convenience files (example dev-registry.yaml, etc.)
