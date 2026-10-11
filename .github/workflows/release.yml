@@ -76,3 +76,63 @@ jobs:
         with:
           files: dist/*.tgz
           generate_release_notes: true
+
+      - name: helm registry login (ghcr.io)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username ${{ github.actor }} --password-stdin
+
+      - name: Push chart as an OCI artifact (ADR 0111)
+        run: helm push dist/booth-core-${{ needs.image.outputs.version }}.tgz oci://ghcr.io/projectbooth/charts
+
+  # ADR 0111 item 1: a repo with more than one image publishes each under the same version.
+  # The credential sidecar's own continuous publish (publish-credential-sidecar.yml) tags by
+  # commit SHA for consumers to pin by digest; this job additionally tags it with the release
+  # version so a tagged booth-core release has a matching, version-named sidecar image too.
+  credential-sidecar-image:
+    needs: image
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE: ghcr.io/projectbooth/credential-sidecar
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (not yet pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: cmd/credential-sidecar/Dockerfile
+          push: false
+          load: true
+          tags: credential-sidecar:candidate
+
+      - name: Refuse unless the image actually runs (genuinely static, correct flag validation)
+        # Same smoke test as publish-credential-sidecar.yml -- this build is independent of
+        # that workflow's, so it gets its own proof before anything is pushed.
+        run: |
+          set -eu
+          out=$(docker run --rm credential-sidecar:candidate 2>&1) && { echo "expected a non-zero exit with no flags"; exit 1; }
+          echo "$out" | grep -q -- '--kind is required' || { echo "unexpected output: $out"; exit 1; }
+
+          out=$(docker run --rm credential-sidecar:candidate --kind=s3 --scope='{}' --core-url=http://x --workspace=acme --token=t 2>&1) && { echo "expected a non-zero exit with no --credentials-file"; exit 1; }
+          echo "$out" | grep -q -- '--credentials-file is required' || { echo "unexpected output: $out"; exit 1; }
+          echo "image runs correctly under its real base"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: cmd/credential-sidecar/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:${{ needs.image.outputs.version }}
