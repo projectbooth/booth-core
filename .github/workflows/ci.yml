@@ -88,3 +88,17 @@ jobs:
             --set iframeSigningKey=ci-placeholder \
             --set ingress.host=booth.example.test \
             --include-crds > /dev/null
+
+      - name: helm package + template (catches release.yml packaging regressions, ADR 0111)
+        # release.yml's own chart job runs `helm package` then attaches/pushes the result --
+        # a chart that lints and templates from its source directory can still fail to package
+        # (Chart.yaml metadata, .helmignore, dependency lock) or to render once packaged. This
+        # exercises that exact path on every PR instead of only discovering it at tag time.
+        working-directory: charts/booth-core
+        run: |
+          helm package . --version 0.0.0-ci --app-version 0.0.0-ci --destination /tmp/dist
+          helm template booth-core /tmp/dist/booth-core-0.0.0-ci.tgz \
+            --namespace booth-system \
+            --set iframeSigningKey=ci-placeholder \
+            --set ingress.host=booth.example.test \
+            --include-crds > /dev/null
