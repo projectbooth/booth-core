@@ -1,12 +1,16 @@
 {{- if .Values.ingress.enabled }}
 {{- $_ := include "booth-core.requireIngressHost" . }}
 {{- if .Values.ingress.host }}
-# Ingress and TLS (ADR 0108): one host, path-routed. Keycloak's login/discovery/key endpoints
-# (/realms/<realm>/*) and its login-page assets (/resources/*) go to the bundled Keycloak;
-# everything else (the shell, /api/*, /modules/*, /iframe/*) goes to core. Deliberately NOT
-# routed, by omission: /admin/* (the admin console) and /realms/master/* (the master realm) --
-# neither path is matched by either rule below, so neither is reachable here at all, only by
-# kubectl port-forward directly to the Keycloak Service.
+# Ingress and TLS (ADR 0108, amended by ADR 0112): one host, path-routed. Keycloak's
+# login/discovery/key endpoints (/realms/<realm>/*) and its login-page assets (/resources/*) go
+# to the bundled Keycloak. "/" goes to the shell's own Service (booth-design -- a separate Helm
+# release; this chart does not serve it) when ingress.shell.enabled is true (the bundled
+# default); the shell's own nginx already reverse-proxies /api/*, /modules/* and /iframe/* to
+# core, so no extra path to core's Service is added here. With ingress.shell.enabled=false, "/"
+# goes to core's own Service instead, unchanged from ADR 0108, for installs that serve the shell
+# some other way. Deliberately NOT routed, by omission: /admin/* (the admin console) and
+# /realms/master/* (the master realm) -- neither path is matched by any rule below, so neither
+# is reachable here at all, only by kubectl port-forward directly to the Keycloak Service.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -46,7 +50,12 @@ spec:
             pathType: Prefix
             backend:
               service:
+                {{- if .Values.ingress.shell.enabled }}
+                name: {{ .Values.ingress.shell.serviceName }}
+                port: {number: {{ .Values.ingress.shell.port }}}
+                {{- else }}
                 name: {{ include "booth-core.fullname" . }}
                 port: {number: {{ .Values.service.port }}}
+                {{- end }}
 {{- end }}
 {{- end }}

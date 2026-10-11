@@ -18,6 +18,12 @@ ordinary port-forward path -- not this script's job), and asserts:
   3. core's own /api/me, called with that access token (not the id_token), reports the
      expected membership -- the real audience-mapper defect PR A's review caught would show up
      here as a 401, not as a client-side crash.
+
+Also checks the bundled Ingress's routing itself (ADR 0112), against the real `booth-design`
+release the CI job installs next to core (not the stand-in shell above, which exists only to
+drive the Playwright PKCE flow): "/" serves the shell's HTML and its /config.js, with
+check_api_reaches_core_not_the_shell() as that check's positive control proving /api/* still
+reaches core through the shell's own nginx proxy rather than being swallowed as a 404.
 """
 import json
 import os
@@ -106,6 +112,41 @@ def check_admin_and_master_realm_not_exposed() -> None:
     print(f"/realms/master/protocol/openid-connect/token: not a Keycloak token response (status {status})")
 
 
+def check_root_serves_the_shell() -> None:
+    """ADR 0112: '/' must route to the shell's Service, not core's -- the regression this ADR
+    fixes (ADR 0108's Ingress sent '/' to core, which doesn't serve the shell at all)."""
+    status, body = _request("GET", "/")
+    if status != 200:
+        fail(f"/ returned {status}, not 200 -- is the booth-design release installed? (ADR 0112)")
+    if b"<!doctype html" not in body[:512].lower():
+        fail(f"/ did not return an HTML document: {body[:200]!r}")
+    print(f"/: shell's HTML document served (status {status})")
+
+    status, body = _request("GET", "/config.js")
+    if status != 200:
+        fail(f"/config.js returned {status}, not 200 -- the shell's runtime-config endpoint is not reachable")
+    if b"window.__BOOTH_CONFIG__" not in body:
+        fail(f"/config.js did not contain the shell's runtime config: {body[:300]!r}")
+    want_issuer = f'"oidcIssuerUrl": "https://{HOST}/realms/booth"'.encode()
+    if want_issuer not in body:
+        fail(f"/config.js's oidcIssuerUrl doesn't match the Ingress host: {body!r}")
+    print("/config.js: OK, oidcIssuerUrl matches the Ingress host")
+
+
+def check_api_reaches_core_not_the_shell() -> None:
+    """Positive control for check_root_serves_the_shell(): proves the shell's own nginx
+    actually proxies /api/* through to core rather than swallowing it as a static 404 --
+    the same class of silent-misroute this ADR exists to catch, the other direction."""
+    status, body = _request("GET", "/api/me")
+    if status != 401:
+        fail(f"/api/me (no token) returned {status}, want 401 from core's own auth middleware")
+    if b"<!doctype html" in body[:512].lower():
+        fail(f"/api/me returned what looks like the shell's HTML, not core's response: {body[:200]!r}")
+    if b"bearer token" not in body.lower():
+        fail(f"/api/me's body doesn't look like core's own 'missing bearer token' response: {body[:200]!r}")
+    print(f"/api/me: reached core (not the shell), status {status}")
+
+
 def check_discovery_issuer_matches_ingress_host() -> None:
     status, body = _request("GET", "/realms/booth/.well-known/openid-configuration")
     if status != 200:
@@ -120,6 +161,8 @@ def check_discovery_issuer_matches_ingress_host() -> None:
 def main() -> None:
     check_admin_and_master_realm_not_exposed()
     check_discovery_issuer_matches_ingress_host()
+    check_root_serves_the_shell()
+    check_api_reaches_core_not_the_shell()
 
     with sync_playwright() as p:
         # --host-resolver-rules is the browser-scoped equivalent of the operator's own

@@ -397,6 +397,12 @@ CI, docs) is on hold pending that decision.
 The user chose HTTPS on the LAN. This section answers the seven questions the coordinator asked
 before any chart work resumes; it does not build anything.
 
+**Correction (ADR 0112, 2026-10-11):** this section's "core already serves the shell" premise
+(items 1 and 5 below) was wrong — `booth-design` is a separate Helm release and the actual front
+door; core never served the shell's static assets. Left as-written below for the historical
+record of what was assumed when this design was drafted; `charts/booth-core/templates/ingress.yaml`
+and `docs/operations/first-login-runbook.md` carry the corrected routing and install steps.
+
 ### 1) Hostnames
 
 **One hostname, path-based routing — not two.** Core already serves the shell's static assets,

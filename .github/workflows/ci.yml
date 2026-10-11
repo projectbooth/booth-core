@@ -89,6 +89,29 @@ jobs:
             --set ingress.host=booth.example.test \
             --include-crds > /dev/null
 
+      - name: helm template (ingress.shell.enabled true/false, ADR 0112)
+        # "/" must route to the shell's Service by default, and fall back to core's own Service
+        # when the operator turns shell routing off -- a regression here silently breaks every
+        # browser login (ADR 0112's root cause) without failing lint or any other render check.
+        working-directory: charts/booth-core
+        run: |
+          helm template booth-core . \
+            --namespace booth-system \
+            --set iframeSigningKey=ci-placeholder \
+            --set ingress.host=booth.example.test \
+            --show-only templates/ingress.yaml > /tmp/ingress-shell-enabled.yaml
+          grep -A4 'path: /$' /tmp/ingress-shell-enabled.yaml | grep -q 'name: booth-design' \
+            || { echo "ingress.shell.enabled=true (default): '/' did not route to booth-design"; cat /tmp/ingress-shell-enabled.yaml; exit 1; }
+
+          helm template booth-core . \
+            --namespace booth-system \
+            --set iframeSigningKey=ci-placeholder \
+            --set ingress.host=booth.example.test \
+            --set ingress.shell.enabled=false \
+            --show-only templates/ingress.yaml > /tmp/ingress-shell-disabled.yaml
+          grep -A4 'path: /$' /tmp/ingress-shell-disabled.yaml | grep -q 'name: booth-core$' \
+            || { echo "ingress.shell.enabled=false: '/' did not fall back to core's own Service"; cat /tmp/ingress-shell-disabled.yaml; exit 1; }
+
       - name: helm package + template (catches release.yml packaging regressions, ADR 0111)
         # release.yml's own chart job runs `helm package` then attaches/pushes the result --
         # a chart that lints and templates from its source directory can still fail to package
