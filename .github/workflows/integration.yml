@@ -880,6 +880,20 @@ jobs:
             --set ingress.host=booth-ci.test \
             --wait --timeout 6m
 
+      - name: Install the released booth-design chart next to core (ADR 0112)
+        # The real front door "/" routes to -- pulled anonymously from GHCR, no credentials,
+        # the same way a real operator would (docs/operations/first-login-runbook.md's own
+        # "install the shell" step). Same namespace, default release name: both match
+        # ingress.shell.serviceName's default and this chart's own oidc.issuerUrl default
+        # assumption of booth-core's gateway at release name booth-core/booth-system.
+        run: |
+          helm install booth-design oci://ghcr.io/projectbooth/charts/booth-design \
+            --version 0.1.0 \
+            --namespace booth-system \
+            --set oidc.issuerUrl=https://booth-ci.test/realms/booth \
+            --wait --timeout 3m
+          kubectl -n booth-system rollout status deployment/booth-design --timeout=60s
+
       - name: Deploy the stand-in shell (booth-core ships no frontend of its own)
         run: |
           kubectl -n booth-system create configmap https-login-shell \
@@ -973,6 +987,7 @@ jobs:
           kubectl -n booth-system get secret booth-core-tls -o yaml || true
           kubectl -n booth-system logs deployment/booth-core-keycloak --tail=200 || true
           kubectl -n booth-system logs deployment/booth-core --tail=200 || true
+          kubectl -n booth-system logs deployment/booth-design --tail=200 || true
           kubectl -n traefik logs deployment/traefik --tail=200 || true
 
   # scripts/booth-admin, docs/operations/accounts-and-workspaces.md: an automated check that the

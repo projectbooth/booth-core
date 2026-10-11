@@ -198,6 +198,17 @@ ingress:
     # name instead, driven by your own annotations above; this chart's own TLS provisioning
     # then does nothing; it never fights cert-manager for the same Secret.
     selfSigned: true
+  # ADR 0112: core does not serve the shell -- booth-design is a separate Helm release, whose
+  # own nginx reverse-proxies /api/*, /modules/* and /iframe/* to core. With this enabled (the
+  # bundled default), "/" routes to the shell's Service instead of core's, so a browser actually
+  # reaches the login screen. A missing shell Service yields a 503 at "/" until it's installed
+  # (see docs/operations/first-login-runbook.md's "install the shell" step). Set enabled: false
+  # to route "/" to core's own Service instead (ADR 0108's original behavior), for installs that
+  # serve the shell some other way.
+  shell:
+    enabled: true
+    serviceName: booth-design
+    port: 8080
 
 postgres:
   # dsn, if set, is used verbatim as booth-core's OWN database connection string instead of
