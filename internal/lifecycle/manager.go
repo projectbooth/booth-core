@@ -13,11 +13,13 @@ package lifecycle
 
 import (
 	"fmt"
+	"strings"
 
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
 	"helm.sh/helm/v3/pkg/cli"
+	"helm.sh/helm/v3/pkg/registry"
 )
 
 // ChartRef locates a module's Helm chart: either a local path (a pre-fetched tarball or
@@ -55,6 +57,19 @@ func NewManager(namespace string) (*Manager, error) {
 	if err := cfg.Init(settings.RESTClientGetter(), namespace, "secrets", logf); err != nil {
 		return nil, fmt.Errorf("initializing helm action configuration for namespace %s: %w", namespace, err)
 	}
+
+	// cfg.Init never sets this (confirmed by reading it: it's an action.Configuration field
+	// the Helm CLI itself only populates separately, in its own root command setup) — without
+	// it, action.NewInstall's own ChartPathOptions.LocateChart refuses every OCI chart with
+	// "missing registry client", the one path ADR 0028 chose for this API. No credentials
+	// file: every chart this API installs is pulled anonymously (ADR 0111's release train
+	// publishes every chart as a public OCI artifact); an operator needing a private registry
+	// is a case this constructor doesn't support yet.
+	registryClient, err := registry.NewClient()
+	if err != nil {
+		return nil, fmt.Errorf("creating OCI registry client: %w", err)
+	}
+	cfg.RegistryClient = registryClient
 
 	return &Manager{cfg: cfg, namespace: namespace}, nil
 }
@@ -126,10 +141,15 @@ func loadChart(m *Manager, ref ChartRef) (*chart.Chart, error) {
 	}
 
 	install := action.NewInstall(m.cfg)
-	install.RepoURL = ref.RepoURL
 	install.Version = ref.Version
 	settings := cli.New()
-	path, err := install.LocateChart(ref.ChartName, settings)
+
+	name, isOCI := locateChartName(ref)
+	if !isOCI {
+		install.RepoURL = ref.RepoURL
+	}
+
+	path, err := install.LocateChart(name, settings)
 	if err != nil {
 		return nil, fmt.Errorf("locating chart %s from %s: %w", ref.ChartName, ref.RepoURL, err)
 	}
@@ -138,6 +158,23 @@ func loadChart(m *Manager, ref ChartRef) (*chart.Chart, error) {
 		return nil, fmt.Errorf("loading chart from %s: %w", path, err)
 	}
 	return c, nil
+}
+
+// locateChartName returns the string to hand Helm's own ChartPathOptions.LocateChart, and
+// whether ref is an OCI reference. Helm's OCI resolution (checked by reading it) only
+// recognizes a chart as OCI when the name it's given is itself an "oci://..." reference --
+// RepoURL+ChartName's split, the classic HTTP chart-repo-index shape (an index.yaml a plain
+// RepoURL would otherwise be probed for) never applies to an OCI registry, which has no
+// index.yaml at all. ADR 0028 chose the oci://host/path/chart-name form for exactly this API,
+// so every RepoURL this package ever receives is of that shape -- passing ref.ChartName alone,
+// as an earlier version of this function did, silently fell through to the HTTP-repo path
+// instead and failed there (ADR 0113's Integration check is what first exercised this for
+// real and caught it).
+func locateChartName(ref ChartRef) (name string, isOCI bool) {
+	if strings.HasPrefix(ref.RepoURL, "oci://") {
+		return strings.TrimSuffix(ref.RepoURL, "/") + "/" + ref.ChartName, true
+	}
+	return ref.ChartName, false
 }
 
 func logf(format string, v ...any) {
