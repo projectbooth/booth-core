@@ -17,15 +17,37 @@
 #   BACKUP_DIR    (pvc)   directory backups accumulate in
 #   STAGE_DIR     (stage) scratch directory shared with the uploader
 #   RETENTION     (pvc)   how many complete backups to keep (default 7)
+#   WAIT_SECONDS  how long to wait for Postgres to accept a connection before giving up
+#                 (default 60); checked with pg_isready every 3 seconds.
 #
 # A backup only becomes visible once it is complete: it is built in a hidden directory and
 # renamed as the last step, so a crashed run can never be mistaken for a good one.
+#
+# ARCHITECTURE.md item 66 (found 2026-10-12 on the homelab): a Job retry is a brand-new pod
+# with a new IP, so it meets the bundled PostgreSQL's few-second first-connection refusal
+# window (the NetworkPolicy allow set hasn't caught up yet) just like the one before it did --
+# every retry failed the same way, and the daily backup had never once succeeded. Wait for
+# Postgres to actually accept connections before running psql/pg_dump at all, instead of
+# treating that refusal as the failure.
 set -eu
 
 : "${PGHOST:?PGHOST is required}"
 : "${PGUSER:?PGUSER is required}"
 : "${BACKUP_MODE:?BACKUP_MODE must be pvc or stage}"
 RETENTION="${RETENTION:-7}"
+WAIT_SECONDS="${WAIT_SECONDS:-60}"
+
+waited=0
+until pg_isready -h "$PGHOST" -p "${PGPORT:-5432}" -U "$PGUSER" -d postgres -q; do
+  if [ "$waited" -ge "$WAIT_SECONDS" ]; then
+    echo "backup: PostgreSQL at $PGHOST never accepted a connection after ${WAIT_SECONDS}s" >&2
+    exit 1
+  fi
+  echo "backup: waiting for PostgreSQL at $PGHOST to accept connections (waited ${waited}s)"
+  sleep 3
+  waited=$((waited + 3))
+done
+echo "backup: PostgreSQL at $PGHOST is accepting connections (waited ${waited}s)"
 
 ts=$(date -u +%Y%m%dT%H%M%SZ)
 

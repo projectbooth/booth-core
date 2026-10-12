@@ -115,6 +115,13 @@ func NewPostgresStore(ctx context.Context, dsn string) (*PostgresStore, error) {
 
 func (s *PostgresStore) Close() { s.pool.Close() }
 
+// Ping verifies the server is actually reachable, acquiring and releasing one connection.
+// Callers at startup (ARCHITECTURE.md item 66) wrap this in internal/dbwait.Retry rather than
+// treating a single refused connection as fatal.
+func (s *PostgresStore) Ping(ctx context.Context) error {
+	return s.pool.Ping(ctx)
+}
+
 func (s *PostgresStore) ready(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
