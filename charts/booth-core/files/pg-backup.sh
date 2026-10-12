@@ -13,7 +13,8 @@
 #   PGHOST PGUSER PGPASSWORD [PGPORT] [PGSSLMODE]
 #   BACKUP_MODE   pvc   write $BACKUP_DIR/<timestamp>/ and keep the newest $RETENTION
 #                 stage write $STAGE_DIR/dump/ and $STAGE_DIR/ts for an uploader to ship;
-#                       retention is then the bucket's lifecycle policy, not this script's
+#                       retention there is the uploader's job (prune-s3-backups.sh), not this
+#                       script's -- same newest-N count, ADR 0109 amendment 2
 #   BACKUP_DIR    (pvc)   directory backups accumulate in
 #   STAGE_DIR     (stage) scratch directory shared with the uploader
 #   RETENTION     (pvc)   how many complete backups to keep (default 7)

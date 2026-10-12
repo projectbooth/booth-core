@@ -131,7 +131,11 @@ postgresql:
   backup:
     enabled: true
     schedule: "0 3 * * *" # daily, 03:00 (cluster time zone, normally UTC)
-    retention: 7 # complete backups kept on the PVC; for a bucket use its lifecycle policy
+    # Complete backups kept, on the PVC and on an S3 bucket alike -- a COUNT, never an age
+    # (ADR 0109 amendment 2). A bucket lifecycle rule based on age is NOT a substitute: if
+    # backups stop arriving, every copy ages out and the last good one goes with it. On a
+    # bucket, pruning runs only after that run's own upload has already succeeded.
+    retention: 7
     persistence:
       size: 8Gi
       storageClass: ""

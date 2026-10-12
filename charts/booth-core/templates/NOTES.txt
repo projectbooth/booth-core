@@ -6,7 +6,9 @@ PostgreSQL: a bundled single-node server is running ({{ .Release.Name }}-postgre
 self-hosted and development installs and is NOT highly available.
 {{- if .Values.postgresql.backup.enabled }}
   Backups: a daily pg_dump runs at "{{ .Values.postgresql.backup.schedule }}" and writes to
-  {{- if .Values.postgresql.backup.s3.bucket }} the S3 bucket "{{ .Values.postgresql.backup.s3.bucket }}".
+  {{- if .Values.postgresql.backup.s3.bucket }} the S3 bucket "{{ .Values.postgresql.backup.s3.bucket }}",
+  keeping the newest {{ .Values.postgresql.backup.retention }} (a count, never an age -- a bucket
+  lifecycle rule based on age is not a substitute, see docs/runbooks/postgres-backup-restore.md).
   {{- else }} the PVC "{{ .Release.Name }}-postgresql-backup" (created by booth-core; kept on `helm uninstall`),
   keeping the newest {{ .Values.postgresql.backup.retention }}. That PVC does not survive losing this cluster —
   set postgresql.backup.s3.bucket, or copy it off-site, for real disaster recovery.

@@ -9,6 +9,12 @@
 # postgresql.backup.s3.bucket is set. A backup on the same cluster/storage as the database
 # doesn't survive losing that cluster — for real disaster recovery use a bucket, or copy the
 # PVC's contents off-cluster. See docs/runbooks/postgres-backup-restore.md for restore.
+#
+# Retention (postgresql.backup.retention, default 7) is a COUNT on both destinations, never an
+# age (ADR 0109 amendment 2): on the PVC it's files/pg-backup.sh's own pruning; on a bucket it's
+# the upload container running files/prune-s3-backups.sh after its upload succeeds. An
+# age-based bucket lifecycle rule was rejected — if backups stop arriving, every copy ages out
+# and the last good one is deleted with it.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -19,6 +25,8 @@ metadata:
 data:
   pg-backup.sh: |
 {{ .Files.Get "files/pg-backup.sh" | indent 4 }}
+  prune-s3-backups.sh: |
+{{ .Files.Get "files/prune-s3-backups.sh" | indent 4 }}
 # The backup PVC (PVC destination) is NOT created here. `helm install --wait` waits for every PVC
 # to be Bound, and a claim only this CronJob mounts stays Pending on a WaitForFirstConsumer
 # storage class (k3s's default) until the first scheduled run, which would fail the install.
@@ -91,6 +99,10 @@ spec:
                     aws s3 cp --recursive /stage/dump "${dest}"
                   fi
                   echo "upload complete"
+                  # ADR 0109 amendment 2: retention is a count, never an age -- only reached once
+                  # the upload above has actually succeeded ("set -ec" ordering), so a prune
+                  # failure here can never affect the backup that was just uploaded.
+                  sh /scripts/prune-s3-backups.sh
               envFrom:
                 # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (and optionally AWS_SESSION_TOKEN).
                 - secretRef:
@@ -100,7 +112,9 @@ spec:
                 - {name: BACKUP_PREFIX, value: {{ $b.s3.prefix | quote }}}
                 - {name: BACKUP_ENDPOINT, value: {{ $b.s3.endpoint | quote }}}
                 - {name: AWS_DEFAULT_REGION, value: {{ $b.s3.region | quote }}}
+                - {name: RETENTION, value: {{ $b.retention | quote }}}
               volumeMounts:
+                - {name: scripts, mountPath: /scripts, readOnly: true}
                 - {name: stage, mountPath: /stage, readOnly: true}
           volumes:
             - name: scripts

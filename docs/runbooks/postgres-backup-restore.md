@@ -32,7 +32,14 @@ any timestamp-named directory is a whole backup.
   `kubectl delete pvc`.
 - **S3-compatible bucket**: set `postgresql.backup.s3.bucket` (plus `endpoint` for MinIO/Ceph/R2,
   and `existingSecret` holding `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`). Objects land under
-  `<prefix><timestamp>/`. **Retention is your bucket's lifecycle policy**, not the chart's.
+  `<prefix><timestamp>/`. The newest `postgresql.backup.retention` (default 7) are kept, the same
+  as the PVC — **this is a count, never an age** (ADR 0109 amendment 2 in booth-architecture): a
+  bucket lifecycle rule that expires objects after N days is rejected, because if backups ever
+  stop arriving, every copy ages out and the last good backup is deleted along with the rest.
+  Pruning (`files/prune-s3-backups.sh`) runs in the upload container only after that run's own
+  upload has already succeeded, so a prune failure is loud but never touches the newly uploaded
+  backup; it only ever deletes entries matching the backup timestamp form exactly
+  (`YYYYMMDDTHHMMSSZ/`), so anything else under the prefix is left alone.
 
 > **A backup on the same cluster and storage as the database does not survive losing that
 > cluster.** For real disaster recovery use a bucket, or copy the PVC's contents off-site on a
