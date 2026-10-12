@@ -1,11 +1,23 @@
 # Design note: core supplies the shared identity settings to module installs (ADR 0113)
 
-Status: **design note — not built.** ADR 0113 decided the *direction* (core's install API
-supplies the shared identity settings; explicit request values win; no secrets in the block;
-Helm CLI installs are unchanged) and left the mechanism to this repo to propose. This note
-answers the four things the ADR asked for, grounded in the real install-path code and the real
-`values.yaml` of every chart named below (read directly, not recalled) — no chart, contract, or
-Go code changes yet.
+Status: **approved and built**, with the amendments below (ADR 0113's "Mechanism" section,
+approved 2026-10-12). ADR 0113 decided the *direction* (core's install API supplies the shared
+identity settings; explicit request values win; no secrets in the block; Helm CLI installs are
+unchanged) and left the mechanism to this repo to propose. This note answers the four things the
+ADR asked for, grounded in the real install-path code and the real `values.yaml` of every chart
+named below (read directly, not recalled).
+
+**Amendments from approval, applied throughout this note and the build:**
+- The annotation key is `booth.projectbooth.io/identity-keys` — the fleet's actual annotation
+  domain — not `booth.dev/...` as first proposed below (nothing else in the fleet uses `booth.dev`).
+- Core skips any setting it has no value for; it never writes an empty string.
+- The merge applies on upgrade and re-install, not only the first install (`Manager.Install`
+  handles both through the same code path, so this holds by construction).
+- **Correction**: the sentence below claiming the bundled realm has no audience mapper was wrong.
+  The `booth-design` client *does* have one — every verified token's `aud` is `booth-design` via
+  that mapper, not merely "whatever Keycloak happens to default to."
+- The Integration check (section d) is deferred until `booth-storage` has released with its own
+  annotation, and is not part of this build.
 
 ## a) Where each module's key mapping lives
 
@@ -23,7 +35,7 @@ Three candidates, per the ADR:
 2. **A chart annotation**, read off the chart itself. `internal/lifecycle/manager.go`'s `Install`
    already calls `loadChart(m, ref)` — which returns a real `*chart.Chart` with a
    `.Metadata.Annotations map[string]string` — *before* either `install.Run` or `upgrade.Run`.
-   Reading a `booth.dev/identity-keys` annotation there needs no new wire field anywhere: it
+   Reading a `booth.projectbooth.io/identity-keys` annotation there needs no new wire field anywhere: it
    applies to every install that goes through `Manager.Install`, regardless of whether the caller
    was the Store, an external registry, or a hand-typed `chartRef`/structured `Chart` body on the
    HTTP API directly.
@@ -44,7 +56,7 @@ shape, one JSON object mapping a shared setting name to that chart's own dotted 
 ```yaml
 # Chart.yaml
 annotations:
-  booth.dev/identity-keys: |
+  booth.projectbooth.io/identity-keys: |
     {"issuerUrl":"oidc.issuerUrl","clientId":"oidc.clientId","jwksUrl":"oidc.jwksUrl","workloadIssuerUrl":"oidc.workloadIssuerUrl","groupsClaim":"oidc.groupsClaim"}
 ```
 
@@ -71,7 +83,7 @@ Every value the ADR names is already computed once, at startup, into `booth-core
 | Shared setting | Already-resolved source | How it's computed today |
 |---|---|---|
 | issuer URL (public) | `cfg.OIDC.IssuerURL` | `BOOTH_OIDC_ISSUER_URL`, set by the chart's `effectiveOidcIssuerUrl` helper: the operator's explicit `oidc.issuerUrl`, else `https://<ingress.host>/realms/<realm>` for the bundled Keycloak (`_helpers.tpl`'s `keycloakExternalIssuerUrl`) |
-| client id | `cfg.OIDC.ClientID` | `BOOTH_OIDC_CLIENT_ID`, same explicit-or-bundled-default shape; the bundled default is the literal string `booth-design` (`_helpers.tpl`'s `keycloakClientId`) — this is a single platform-wide client, not a per-module one, confirmed by the realm having no audience mapper, so every verified token's `aud` is this one value |
+| client id | `cfg.OIDC.ClientID` | `BOOTH_OIDC_CLIENT_ID`, same explicit-or-bundled-default shape; the bundled default is the literal string `booth-design` (`_helpers.tpl`'s `keycloakClientId`) — this is a single platform-wide client, not a per-module one: the realm's `booth-design` client has its own audience mapper, so every verified token's `aud` is this one value |
 | in-cluster JWKS URL | `cfg.OIDC.JWKSURL` | `BOOTH_OIDC_JWKS_URL`, already the *in-cluster* Keycloak Service URL for a bundled install (`effectiveOidcJwksUrl`), deliberately never the external one, so a module never needs to trust core's own self-signed Ingress certificate just to fetch keys |
 | groups claim | `cfg.OIDC.GroupsClaim` | `BOOTH_OIDC_GROUPS_CLAIM`, default `"groups"` |
 | workload issuer | `cfg.Workload.IssuerURL` | `BOOTH_WORKLOAD_ISSUER_URL`, only set when `workloadIdentity.enabled`; defaults to core's own in-cluster Service URL |
@@ -158,7 +170,7 @@ first in the bundled catalog.
 
 ## Not decided here
 
-- The exact annotation key name (`booth.dev/identity-keys` above is a proposal, not a ruling) and
+- The exact annotation key name (`booth.projectbooth.io/identity-keys` above is a proposal, not a ruling) and
   whether it's a single JSON blob (as shown) or several smaller annotations — either works with
   the chokepoint in (a); picking between them is a detail, not a design question, and can be
   settled in the build PR.
