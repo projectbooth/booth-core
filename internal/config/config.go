@@ -76,6 +76,12 @@ type Config struct {
 	// KubeNamespace is the namespace booth-core itself runs in, used as the default
 	// namespace for module BoothModule watches and Secret/ConfigMap provisioning.
 	KubeNamespace string
+
+	// CoreURL is this process's own in-cluster base URL (ADR 0113 amendment 1): where a module
+	// core installs reaches it at. The chart computes it from this release's own fullname,
+	// namespace and Service port -- never hard-coded -- so it's correct under any release name
+	// or namespace; this field just reads what the chart already derived.
+	CoreURL string
 }
 
 // OIDCConfig is the pluggable-OIDC relying-party configuration (ADR 0004). Any
@@ -276,6 +282,7 @@ func Load() (Config, error) {
 		cfg.Workload.OwnerMaxAge = d
 	}
 	cfg.IframeIdentity.IssuerURL = strings.TrimRight(os.Getenv("BOOTH_IFRAME_IDENTITY_ISSUER_URL"), "/")
+	cfg.CoreURL = strings.TrimRight(os.Getenv("BOOTH_CORE_URL"), "/")
 	if v := os.Getenv("BOOTH_CREDENTIAL_BROKER_MAX_TTL"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil || d <= 0 {

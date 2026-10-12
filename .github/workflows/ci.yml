@@ -120,6 +120,23 @@ jobs:
           grep -A4 'path: /$' /tmp/ingress-shell-disabled.yaml | grep -q 'name: booth-core$' \
             || { echo "ingress.shell.enabled=false: '/' did not fall back to core's own Service"; cat /tmp/ingress-shell-disabled.yaml; exit 1; }
 
+      - name: helm template (coreUrl is derived from release/namespace, ADR 0113 amendment 1)
+        # BOOTH_CORE_URL must never be the literal "booth-core.booth-system" -- it has to track
+        # whatever release name and namespace this install actually uses, or a module annotated
+        # to receive coreUrl would get a wrong, unreachable address the moment core is installed
+        # under a different name (a second environment, a renamed release, a non-default
+        # namespace). Rendering with both non-default here is what actually proves that, not
+        # just that the helper exists.
+        working-directory: charts/booth-core
+        run: |
+          helm template my-core-release . \
+            --namespace my-core-namespace \
+            --set iframeSigningKey=ci-placeholder \
+            --set ingress.host=booth.example.test \
+            --show-only templates/deployment.yaml > /tmp/coreurl-rendered.yaml
+          grep -A1 'name: BOOTH_CORE_URL' /tmp/coreurl-rendered.yaml | grep -q 'value: "http://my-core-release-booth-core.my-core-namespace.svc.cluster.local:8080"' \
+            || { echo "BOOTH_CORE_URL was not derived from the release name and namespace"; cat /tmp/coreurl-rendered.yaml; exit 1; }
+
       - name: helm template (backup CronJob waits for Postgres, ARCHITECTURE.md item 66)
         # A Job retry is a brand-new pod with a new IP, so it meets the bundled PostgreSQL's
         # few-second first-connection refusal window just like the attempt before it did --

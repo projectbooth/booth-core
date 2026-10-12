@@ -351,6 +351,13 @@ func handleInstallModule(identity lifecycle.IdentitySettings) http.HandlerFunc {
 
 		merged, err := mgr.Install(moduleID, ref, req.Values, identity)
 		if err != nil {
+			// Found on the homelab: chi's middleware.Logger only ever logs the status code and
+			// the response size, never the body -- so the one place that actually explains a
+			// 500 from this route (Helm's own install/upgrade error) went unlogged entirely,
+			// visible only to whoever happened to be looking at the HTTP response right then.
+			// Log it here, with the module id, same text the caller already gets in the
+			// response body -- no values, no secrets, nothing new exposed.
+			log.Printf("lifecycle: installing %s in namespace %s failed: %v", moduleID, req.Namespace, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
