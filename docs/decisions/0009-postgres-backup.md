@@ -19,9 +19,12 @@ choices made in building them.
 - **Destination: PVC by default, S3-compatible bucket when `postgresql.backup.s3.bucket` is set**
   (the two options ADR 0054 named). The bucket path stages the dump in an `emptyDir` in an
   init container (same image as the server) and uploads it from a second container with the AWS
-  CLI, which works against MinIO/Ceph/R2 via `endpoint`. Retention on a PVC is the script's
-  (newest N); on a bucket it's the bucket's lifecycle policy — the chart can't tell a bucket to
-  expire objects portably, and pretending to would be worse than saying so.
+  CLI, which works against MinIO/Ceph/R2 via `endpoint`. Retention is the same newest-N count on
+  both destinations (ADR 0109 amendment 2, 2026-10-12): the PVC path has always pruned its own
+  files, and the bucket path now runs `files/prune-s3-backups.sh` in the upload container after
+  its upload succeeds, superseding the original "use the bucket's lifecycle policy" answer here
+  — an age-based rule was rejected once a homelab actually depended on it, since it deletes the
+  last good backup along with the rest if backups ever stop arriving.
 - **The backup PVC is created by booth-core, not by Helm.** The first version rendered it as a
   chart resource, and the kind CI job caught that it breaks `helm install --wait`: Helm waits for
   every PVC to be `Bound`, and a claim only the CronJob mounts stays `Pending` on a
@@ -47,10 +50,14 @@ choices made in building them.
 The kind CI job runs the real CronJob on the real bundled server and checks: the backup is
 complete and contains the roles and every database; a module's database restores into a scratch
 database with its data intact; the exact in-place restore command from the runbook rolls a
-drifted database back and leaves objects owned by the module's role; retention prunes to N with
-no incomplete runs left behind; and, after switching the chart to a MinIO in the cluster, the
-same backup arrives in the bucket. The embedded PostgreSQL used by the Go tests ships no
-`pg_dump`, so the script has no local unit test — CI is where it's proven.
+drifted database back and leaves objects owned by the module's role; PVC retention prunes to N
+with no incomplete runs left behind; and, after switching the chart to a MinIO in the cluster,
+the same backup arrives in the bucket. The embedded PostgreSQL used by the Go tests ships no
+`pg_dump`, so the dump/restore script has no local unit test — CI is where it's proven. The
+bucket's own retention logic (`files/prune-s3-backups.sh`) needs neither Postgres nor a real
+bucket to test, so it isn't in that position: `test/scripts/prune-s3-backups_test.sh` runs it for
+real against a fake `aws` and a local directory fixture, in the fast CI layer (`ci.yml`), not the
+kind cluster.
 
 **Not verified end to end:** the major-version upgrade path in the runbook (its pieces are each
 covered — backup, restore, and core re-provisioning a wiped server — but the sequence isn't run).

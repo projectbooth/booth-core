@@ -49,6 +49,14 @@ jobs:
         # don't need one (set-password, harden-master).
         run: python3 scripts/testdata/test_booth_admin.py -v
 
+      - name: prune-s3-backups.sh unit tests (ADR 0109 amendment 2, count-based S3 retention)
+        # No Postgres and no real bucket needed to test the prune logic itself -- runs the real
+        # script against test/scripts/fake-aws.sh and a local directory fixture. Covers fewer
+        # than retention, exactly retention, more than retention, a non-timestamp prefix (must
+        # survive), an empty bucket, a bad RETENTION value, and a failed upload or a failed
+        # prune (neither may touch the newly uploaded backup).
+        run: sh test/scripts/prune-s3-backups_test.sh
+
   helm-lint:
     runs-on: ubuntu-24.04
     steps:
@@ -129,6 +137,26 @@ jobs:
             || { echo "rendered backup script has no pg_isready wait loop"; cat /tmp/backup-rendered.yaml; exit 1; }
           grep -q 'WAIT_SECONDS' /tmp/backup-rendered.yaml \
             || { echo "rendered backup script has no bounded wait"; cat /tmp/backup-rendered.yaml; exit 1; }
+
+      - name: helm template (S3 backup retention is a count, ADR 0109 amendment 2)
+        # A rendered chart missing the RETENTION env var, or the call to prune-s3-backups.sh, or
+        # that script's own integer guard, would silently ship with no pruning at all, or with
+        # pruning that accepts a bad RETENTION value instead of refusing it.
+        working-directory: charts/booth-core
+        run: |
+          helm template booth-core . \
+            --namespace booth-system \
+            --set iframeSigningKey=ci-placeholder \
+            --set ingress.host=booth.example.test \
+            --set postgresql.backup.s3.bucket=ci-bucket \
+            --set postgresql.backup.s3.existingSecret=ci-s3-secret \
+            --show-only templates/postgresql-backup.yaml > /tmp/backup-s3-rendered.yaml
+          grep -q 'name: RETENTION' /tmp/backup-s3-rendered.yaml \
+            || { echo "rendered S3 upload container has no RETENTION env var"; cat /tmp/backup-s3-rendered.yaml; exit 1; }
+          grep -q 'prune-s3-backups.sh' /tmp/backup-s3-rendered.yaml \
+            || { echo "rendered S3 upload container never calls prune-s3-backups.sh"; cat /tmp/backup-s3-rendered.yaml; exit 1; }
+          grep -q 'RETENTION must be an integer' /tmp/backup-s3-rendered.yaml \
+            || { echo "rendered prune script has no RETENTION guard"; cat /tmp/backup-s3-rendered.yaml; exit 1; }
 
       - name: helm package + template (catches release.yml packaging regressions, ADR 0111)
         # release.yml's own chart job runs `helm package` then attaches/pushes the result --
