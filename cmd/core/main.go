@@ -26,6 +26,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/config"
 	"github.com/projectbooth/booth-core/internal/credentialbroker"
 	"github.com/projectbooth/booth-core/internal/dbprov"
+	"github.com/projectbooth/booth-core/internal/dbwait"
 	"github.com/projectbooth/booth-core/internal/devregistry"
 	"github.com/projectbooth/booth-core/internal/directory"
 	"github.com/projectbooth/booth-core/internal/eventbus"
@@ -166,6 +167,17 @@ func run() error {
 				return fmt.Errorf("configuring database provisioning: %w", err)
 			}
 			defer admin.Close()
+
+			// ARCHITECTURE.md item 66: a freshly-scheduled pod's first connection to the bundled
+			// PostgreSQL can be refused for a few seconds while the NetworkPolicy allow set
+			// catches up. Wait it out here, once, before any provisioning (core's own database,
+			// the bundled Keycloak's, or a module's) depends on this same admin connection.
+			if err := dbwait.Retry(ctx, fmt.Sprintf("connecting to PostgreSQL at %s:%d", cfg.Postgres.Host, cfg.Postgres.Port), dbwait.DefaultMaxElapsed, func() error {
+				return admin.Ping(ctx)
+			}); err != nil {
+				return fmt.Errorf("waiting for PostgreSQL to accept connections: %w", err)
+			}
+
 			for _, w := range cfg.Postgres.StartupWarnings() {
 				log.Print("WARNING: " + w)
 			}
@@ -195,7 +207,11 @@ func run() error {
 			if _, err := keycloakprov.EnsureAdminPassword(ctx, direct, cfg.KubeNamespace); err != nil {
 				return fmt.Errorf("bootstrapping the bundled Keycloak's admin credential: %w", err)
 			}
-			if _, err := dbProv.EnsureKeycloak(ctx, cfg.KubeNamespace); err != nil {
+			// ARCHITECTURE.md item 66: retry rather than exit on the first refused connection.
+			if err := dbwait.Retry(ctx, "provisioning the bundled Keycloak's database", dbwait.DefaultMaxElapsed, func() error {
+				_, err := dbProv.EnsureKeycloak(ctx, cfg.KubeNamespace)
+				return err
+			}); err != nil {
 				return fmt.Errorf("provisioning the bundled Keycloak's database: %w", err)
 			}
 			log.Print("bundled Keycloak provisioning enabled (admin Secret and database credentials)")
@@ -299,12 +315,25 @@ func run() error {
 			return fmt.Errorf("configuring user directory: %w", err)
 		}
 		defer pg.Close()
+		// ARCHITECTURE.md item 66: the main pool's construction is lazy (it would otherwise
+		// only discover a refused connection on some later request), so verify it eagerly here
+		// with the same bounded retry rather than exiting on the first refusal.
+		if err := dbwait.Retry(ctx, "connecting to the user-directory database", dbwait.DefaultMaxElapsed, func() error {
+			return pg.Ping(ctx)
+		}); err != nil {
+			return fmt.Errorf("connecting to the user-directory database: %w", err)
+		}
 		users.Swap(pg)
 		auditPg, err := credentialbroker.NewPostgresStore(ctx, cfg.PostgresDSN)
 		if err != nil {
 			return fmt.Errorf("configuring credential-broker audit trail: %w", err)
 		}
 		defer auditPg.Close()
+		if err := dbwait.Retry(ctx, "connecting to the credential-broker audit database", dbwait.DefaultMaxElapsed, func() error {
+			return auditPg.Ping(ctx)
+		}); err != nil {
+			return fmt.Errorf("connecting to the credential-broker audit database: %w", err)
+		}
 		audit.Swap(auditPg)
 		log.Print("user directory and credential-broker audit trail: using the database from BOOTH_POSTGRES_DSN")
 	case dbProv != nil:

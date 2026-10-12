@@ -152,6 +152,13 @@ func NewAdmin(ctx context.Context, cfg Config) (*Admin, error) {
 // Close releases the admin connection pool.
 func (a *Admin) Close() { a.pool.Close() }
 
+// Ping verifies the server is actually reachable, acquiring and releasing one connection.
+// Callers at startup (ARCHITECTURE.md item 66) wrap this in internal/dbwait.Retry rather than
+// treating a single refused connection as fatal.
+func (a *Admin) Ping(ctx context.Context) error {
+	return a.pool.Ping(ctx)
+}
+
 // DSN builds the connection string a module (or core) uses for its own database, as seen
 // from another namespace.
 func (a *Admin) DSN(name, password string) string {

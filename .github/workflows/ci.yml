@@ -112,6 +112,24 @@ jobs:
           grep -A4 'path: /$' /tmp/ingress-shell-disabled.yaml | grep -q 'name: booth-core$' \
             || { echo "ingress.shell.enabled=false: '/' did not fall back to core's own Service"; cat /tmp/ingress-shell-disabled.yaml; exit 1; }
 
+      - name: helm template (backup CronJob waits for Postgres, ARCHITECTURE.md item 66)
+        # A Job retry is a brand-new pod with a new IP, so it meets the bundled PostgreSQL's
+        # few-second first-connection refusal window just like the attempt before it did --
+        # the daily backup had never once succeeded on the homelab until this wait was added.
+        # Renders the ConfigMap holding files/pg-backup.sh (both the pvc and s3 CronJob
+        # variants mount this same script) and checks the wait loop is actually in it.
+        working-directory: charts/booth-core
+        run: |
+          helm template booth-core . \
+            --namespace booth-system \
+            --set iframeSigningKey=ci-placeholder \
+            --set ingress.host=booth.example.test \
+            --show-only templates/postgresql-backup.yaml > /tmp/backup-rendered.yaml
+          grep -q 'pg_isready' /tmp/backup-rendered.yaml \
+            || { echo "rendered backup script has no pg_isready wait loop"; cat /tmp/backup-rendered.yaml; exit 1; }
+          grep -q 'WAIT_SECONDS' /tmp/backup-rendered.yaml \
+            || { echo "rendered backup script has no bounded wait"; cat /tmp/backup-rendered.yaml; exit 1; }
+
       - name: helm package + template (catches release.yml packaging regressions, ADR 0111)
         # release.yml's own chart job runs `helm package` then attaches/pushes the result --
         # a chart that lints and templates from its source directory can still fail to package
