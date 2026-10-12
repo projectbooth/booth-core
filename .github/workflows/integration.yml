@@ -978,6 +978,87 @@ jobs:
           TEST_WORKSPACE: ingress-tls-check
         run: python3 scripts/testdata/https_login_check.py
 
+      - name: Install booth-storage through core's install API with no identity values (ADR 0113)
+        # The Integration check ADR 0113 asked for: a module installed through the install API,
+        # not a Helm CLI install, and no oidc.* in the request's own values at all -- only
+        # namespace, which is all this chart's defaults need to come up (postgres.provisionedByCore
+        # defaults true, so core's own dbprov provisions its database; nothing else is required).
+        # booth-storage 0.1.1 is the first published chart carrying the
+        # booth.projectbooth.io/identity-keys annotation (booth-storage PR #5, 4039dc0) -- this
+        # step is the reason this check could not land before that release existed.
+        env:
+          ACCESS_TOKEN: ${{ env.ACCESS_TOKEN }}
+        run: |
+          set -eu
+          # --resolve, not a /etc/hosts edit: booth-ci.test only resolves inside the earlier
+          # Python/Chromium steps' own patched DNS (socket.getaddrinfo, --host-resolver-rules),
+          # neither of which reaches this separate shell step.
+          #
+          # No -f: a non-2xx response's body is the whole point of looking -- it says why the
+          # install was refused, and swallowing it (curl -f's own behavior) would hide that
+          # from this log, the one place to find out before re-running anything.
+          STATUS=$(curl -sk --resolve booth-ci.test:443:127.0.0.1 -o /tmp/install-resp.json -w '%{http_code}' -X POST "https://booth-ci.test/api/modules/storage/install" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "X-Workspace: ingress-tls-check" \
+            -H "Content-Type: application/json" \
+            -d '{"namespace":"storage","chartRef":"oci://ghcr.io/projectbooth/charts/booth-storage","chartVersion":"0.1.1"}')
+          echo "install response status: $STATUS"
+          RESP=$(cat /tmp/install-resp.json)
+          echo "$RESP"
+          if [ "$STATUS" != "202" ]; then echo "expected 202 Accepted, got $STATUS"; exit 1; fi
+          echo "$RESP" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          got = sorted(d.get('identitySettingsSupplied') or [])
+          want = sorted(['issuerUrl', 'clientId', 'jwksUrl', 'workloadIssuerUrl', 'groupsClaim'])
+          assert got == want, f'identitySettingsSupplied = {got!r}, want exactly {want!r}'
+          print('identitySettingsSupplied OK:', got)
+          "
+          kubectl -n storage rollout status deployment/storage-booth-storage --timeout=3m
+
+      - name: Confirm booth-storage verified the real token with no hand-typed values (ADR 0113)
+        # Hits booth-storage's own Service directly -- not through core's gateway -- so this
+        # proves booth-storage itself verified the token using the oidc.* settings core supplied
+        # at install time, not that the gateway (already proven elsewhere) did the work. Each
+        # negative control changes exactly one thing (no token; a token that doesn't verify)
+        # against the identical route, so a false pass can't hide behind a wrong URL or method.
+        env:
+          ACCESS_TOKEN: ${{ env.ACCESS_TOKEN }}
+        run: |
+          set -eu
+          kubectl -n storage port-forward svc/storage-booth-storage 18090:8080 &
+          PF_PID=$!
+          sleep 3
+
+          STATUS=$(curl -s -o /tmp/kinds-real-token.json -w '%{http_code}' \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "X-Booth-Workspace: ingress-tls-check" \
+            http://localhost:18090/api/kinds)
+          echo "GET /api/kinds with the real token: $STATUS"
+          cat /tmp/kinds-real-token.json
+          if [ "$STATUS" != "200" ]; then echo "expected 200, got $STATUS"; kill $PF_PID 2>/dev/null; exit 1; fi
+          python3 -c "
+          import json
+          d = json.load(open('/tmp/kinds-real-token.json'))
+          assert 'kinds' in d, f'response does not look like /api/kinds: {d!r}'
+          print('booth-storage accepted the real token OK:', d)
+          "
+
+          STATUS_NO_TOKEN=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "X-Booth-Workspace: ingress-tls-check" \
+            http://localhost:18090/api/kinds)
+          echo "GET /api/kinds with no token (negative control): $STATUS_NO_TOKEN"
+          if [ "$STATUS_NO_TOKEN" != "401" ]; then echo "expected 401 with no token, got $STATUS_NO_TOKEN"; kill $PF_PID 2>/dev/null; exit 1; fi
+
+          STATUS_BAD_TOKEN=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer not-a-real-token" \
+            -H "X-Booth-Workspace: ingress-tls-check" \
+            http://localhost:18090/api/kinds)
+          echo "GET /api/kinds with a bad token (negative control): $STATUS_BAD_TOKEN"
+          if [ "$STATUS_BAD_TOKEN" != "401" ]; then echo "expected 401 with a bad token, got $STATUS_BAD_TOKEN"; kill $PF_PID 2>/dev/null; exit 1; fi
+
+          kill $PF_PID 2>/dev/null || true
+
       - name: Dump diagnostics on failure
         if: failure()
         run: |
@@ -989,6 +1070,8 @@ jobs:
           kubectl -n booth-system logs deployment/booth-core --tail=200 || true
           kubectl -n booth-system logs deployment/booth-design --tail=200 || true
           kubectl -n traefik logs deployment/traefik --tail=200 || true
+          kubectl -n storage get all || true
+          kubectl -n storage logs deployment/storage-booth-storage --tail=200 || true
 
   # scripts/booth-admin, docs/operations/accounts-and-workspaces.md: an automated check that the
   # operator script actually drives a real Keycloak correctly end to end, including the exact

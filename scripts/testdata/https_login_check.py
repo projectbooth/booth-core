@@ -24,6 +24,12 @@ release the CI job installs next to core (not the stand-in shell above, which ex
 drive the Playwright PKCE flow): "/" serves the shell's HTML and its /config.js, with
 check_api_reaches_core_not_the_shell() as that check's positive control proving /api/* still
 reaches core through the shell's own nginx proxy rather than being swallowed as a 404.
+
+On success, writes the real access token this login flow obtained to $GITHUB_ENV as
+ACCESS_TOKEN (observed off the callback page's own Authorization header to core's /api/me,
+never exposed by that page itself) -- for the ADR 0113 Integration check, a later job step in
+integration.yml that presents this same real, bundled-Keycloak-issued token to a freshly
+installed module's own authenticated route.
 """
 import json
 import os
@@ -180,6 +186,21 @@ def main() -> None:
         asset_requests: list[tuple[str, int]] = []
         page.on("response", lambda resp: asset_requests.append((resp.url, resp.status)) if "/resources/" in resp.url else None)
 
+        # Captured for the ADR 0113 Integration check (a later job step, not this script): the
+        # callback page (scripts/testdata/https-login-shell/callback.html) never exposes the
+        # real access token itself, only core's /api/me response -- it calls /api/me with
+        # "Authorization: Bearer " + the token, so that request's own header is the one place
+        # to observe the real value this script's login flow obtained, without changing the
+        # callback page just to leak it.
+        captured_token: dict[str, str] = {}
+
+        def _capture_access_token(request) -> None:
+            auth = request.headers.get("authorization", "")
+            if request.url == f"https://{HOST}/api/me" and auth.lower().startswith("bearer "):
+                captured_token["value"] = auth[len("Bearer "):]
+
+        page.on("request", _capture_access_token)
+
         print(f"navigating to {SHELL_URL} ...")
         page.goto(SHELL_URL)
         page.click("#login")
@@ -217,6 +238,13 @@ def main() -> None:
             {"workspace": m["workspace"], "role": m["role"]} for m in me.get("memberships", [])
         ]:
             fail(f"core's /api/me memberships = {me.get('memberships')!r}, want {want!r} present")
+
+        if "value" not in captured_token:
+            fail("did not observe the shell's own Authorization header on its /api/me call -- nothing to hand to the ADR 0113 Integration check")
+        print(f"captured the real access token the login flow obtained (length={len(captured_token['value'])})")
+        if gh_env := os.environ.get("GITHUB_ENV"):
+            with open(gh_env, "a", encoding="utf-8") as f:
+                f.write(f"ACCESS_TOKEN={captured_token['value']}\n")
 
         browser.close()
         print("RESULT: PASSED - real shipped-client HTTPS login through a real Ingress; core accepted the access token")

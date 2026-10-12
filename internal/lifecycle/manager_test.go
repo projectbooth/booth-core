@@ -24,6 +24,41 @@ func TestLoadChart_FromLocalPath(t *testing.T) {
 	}
 }
 
+// TestLocateChartName_OCI pins the actual bug ADR 0113's Integration check first caught: an
+// OCI RepoURL ("oci://ghcr.io/projectbooth/charts") with ChartName "booth-storage" must
+// produce the single combined "oci://.../booth-storage" string Helm's own LocateChart
+// recognizes as OCI -- passing ChartName alone there silently falls through to the classic
+// HTTP chart-repo-index path and fails against a real OCI registry.
+func TestLocateChartName_OCI(t *testing.T) {
+	name, isOCI := locateChartName(ChartRef{RepoURL: "oci://ghcr.io/projectbooth/charts", ChartName: "booth-storage"})
+	if !isOCI {
+		t.Error("isOCI = false, want true for an oci:// RepoURL")
+	}
+	if want := "oci://ghcr.io/projectbooth/charts/booth-storage"; name != want {
+		t.Errorf("name = %q, want %q", name, want)
+	}
+}
+
+func TestLocateChartName_OCI_TrailingSlashOnRepoURL(t *testing.T) {
+	name, isOCI := locateChartName(ChartRef{RepoURL: "oci://ghcr.io/projectbooth/charts/", ChartName: "booth-storage"})
+	if !isOCI {
+		t.Error("isOCI = false, want true for an oci:// RepoURL")
+	}
+	if want := "oci://ghcr.io/projectbooth/charts/booth-storage"; name != want {
+		t.Errorf("name = %q, want %q (no double slash)", name, want)
+	}
+}
+
+func TestLocateChartName_ClassicHTTPRepoIsUnchanged(t *testing.T) {
+	name, isOCI := locateChartName(ChartRef{RepoURL: "https://charts.example.com", ChartName: "booth-storage"})
+	if isOCI {
+		t.Error("isOCI = true, want false for an https:// RepoURL")
+	}
+	if name != "booth-storage" {
+		t.Errorf("name = %q, want the bare chart name unchanged", name)
+	}
+}
+
 func writeFixtureChart(t *testing.T, dir string) {
 	t.Helper()
 
