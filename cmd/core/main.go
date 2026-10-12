@@ -32,6 +32,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/gateway"
 	"github.com/projectbooth/booth-core/internal/iframeidentity"
 	"github.com/projectbooth/booth-core/internal/keycloakprov"
+	"github.com/projectbooth/booth-core/internal/lifecycle"
 	"github.com/projectbooth/booth-core/internal/natsauth"
 	"github.com/projectbooth/booth-core/internal/registry"
 	"github.com/projectbooth/booth-core/internal/tlsprov"
@@ -371,6 +372,18 @@ func run() error {
 		Workload:          workloadSvc,
 		IframeIdentity:    iframeIdentitySvc,
 		CredentialBroker:  credentialBrokerSvc,
+
+		// ADR 0113: every module installed through the install API gets these as defaults,
+		// per its own identity-keys annotation. Derived straight from this same process's
+		// resolved config — nothing new to compute.
+		IdentityKeys: lifecycle.IdentitySettings{
+			IssuerURL:         cfg.OIDC.IssuerURL,
+			ClientID:          cfg.OIDC.ClientID,
+			JWKSURL:           cfg.OIDC.JWKSURL,
+			WorkloadIssuerURL: cfg.Workload.IssuerURL,
+			GroupsClaim:       cfg.OIDC.GroupsClaim,
+			IframeIssuerURL:   cfg.IframeIdentity.IssuerURL,
+		},
 	})
 
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: router}

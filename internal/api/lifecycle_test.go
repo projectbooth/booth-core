@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/projectbooth/booth-core/internal/auth"
+	"github.com/projectbooth/booth-core/internal/lifecycle"
 )
 
 func TestRequireAdmin_RejectsNonOwner(t *testing.T) {
@@ -51,7 +52,7 @@ func TestHandleInstallModule_RequiresNamespace(t *testing.T) {
 	body := strings.NewReader(`{"chart":{"path":"/tmp/whatever"}}`)
 	req := withTestIdentity(httptest.NewRequest(http.MethodPost, "/api/modules/storage/install", body), auth.RoleOwner)
 	rec := httptest.NewRecorder()
-	handleInstallModule(rec, req)
+	handleInstallModule(lifecycle.IdentitySettings{})(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
@@ -75,7 +76,7 @@ func TestHandleInstallModule_RejectsWhenNeitherChartNorChartRefGiven(t *testing.
 	body := strings.NewReader(`{"namespace":"booth-storage"}`)
 	req := withTestIdentity(httptest.NewRequest(http.MethodPost, "/api/modules/storage/install", body), auth.RoleOwner)
 	rec := httptest.NewRecorder()
-	handleInstallModule(rec, req)
+	handleInstallModule(lifecycle.IdentitySettings{})(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
@@ -88,7 +89,7 @@ func TestHandleInstallModule_RejectsMalformedChartRef(t *testing.T) {
 	body := strings.NewReader(`{"namespace":"booth-storage","chartRef":"https://not-oci.example.com/chart"}`)
 	req := withTestIdentity(httptest.NewRequest(http.MethodPost, "/api/modules/storage/install", body), auth.RoleOwner)
 	rec := httptest.NewRecorder()
-	handleInstallModule(rec, req)
+	handleInstallModule(lifecycle.IdentitySettings{})(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
