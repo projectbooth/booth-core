@@ -990,7 +990,10 @@ jobs:
           ACCESS_TOKEN: ${{ env.ACCESS_TOKEN }}
         run: |
           set -eu
-          RESP=$(curl -sfk -X POST "https://booth-ci.test/api/modules/storage/install" \
+          # --resolve, not a /etc/hosts edit: booth-ci.test only resolves inside the earlier
+          # Python/Chromium steps' own patched DNS (socket.getaddrinfo, --host-resolver-rules),
+          # neither of which reaches this separate shell step.
+          RESP=$(curl -sfk --resolve booth-ci.test:443:127.0.0.1 -X POST "https://booth-ci.test/api/modules/storage/install" \
             -H "Authorization: Bearer $ACCESS_TOKEN" \
             -H "X-Workspace: ingress-tls-check" \
             -H "Content-Type: application/json" \
