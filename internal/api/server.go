@@ -6,6 +6,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -49,6 +50,13 @@ type Deps struct {
 	// unregistered. Its router group trusts workload tokens the same way the gateway route does
 	// (see workloadTrustingOpts) — its callers are tasks/modules, not only people.
 	CredentialBroker *credentialbroker.Service
+
+	// IdentityKeys is the platform's own shared identity settings (ADR 0113), derived by the
+	// caller (cmd/core) from this same process's resolved config.Config and supplied as defaults
+	// to every module install goes through, per that chart's own identity-keys annotation. A
+	// zero-value IdentitySettings merges nothing in — every field empty is a valid, if unusual,
+	// deployment state (e.g. no OIDC configured yet), not an error.
+	IdentityKeys lifecycle.IdentitySettings
 }
 
 // NewRouter builds booth-core's full HTTP router.
@@ -100,7 +108,7 @@ func NewRouter(deps Deps) http.Handler {
 			r.Get("/api/users/{sub}", handleGetUser(deps.Directory))
 		}
 		r.Get("/api/modules/{id}/iframe-url", handleIframeURL(deps.IframeURLs))
-		r.Post("/api/modules/{id}/install", requireAdmin(handleInstallModule))
+		r.Post("/api/modules/{id}/install", requireAdmin(handleInstallModule(deps.IdentityKeys)))
 		r.Delete("/api/modules/{id}", requireAdmin(handleUninstallModule))
 	})
 
@@ -306,37 +314,50 @@ type chartRefBody struct {
 	Version   string `json:"version,omitempty"`
 }
 
-func handleInstallModule(w http.ResponseWriter, r *http.Request) {
-	moduleID := chi.URLParam(r, "id")
+// installResponse reports which of the platform's shared identity settings (ADR 0113) core
+// actually supplied for this install, so a caller (the Module Store's UI, an operator reading
+// the response) can see it rather than only inferring it from the chart coming up working. Empty
+// when the chart has no booth.projectbooth.io/identity-keys annotation, or the request's own
+// values already set everything it names.
+type installResponse struct {
+	IdentitySettingsSupplied []string `json:"identitySettingsSupplied"`
+}
 
-	var req installRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if req.Namespace == "" {
-		http.Error(w, "namespace is required", http.StatusBadRequest)
-		return
-	}
+func handleInstallModule(identity lifecycle.IdentitySettings) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		moduleID := chi.URLParam(r, "id")
 
-	ref, err := resolveChartRef(req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+		var req installRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Namespace == "" {
+			http.Error(w, "namespace is required", http.StatusBadRequest)
+			return
+		}
 
-	mgr, err := lifecycle.NewManager(req.Namespace)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+		ref, err := resolveChartRef(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 
-	if err := mgr.Install(moduleID, ref, req.Values); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+		mgr, err := lifecycle.NewManager(req.Namespace)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-	w.WriteHeader(http.StatusAccepted)
+		merged, err := mgr.Install(moduleID, ref, req.Values, identity)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("lifecycle: installed %s in namespace %s, identity settings supplied: %v", moduleID, req.Namespace, merged)
+		writeJSON(w, http.StatusAccepted, installResponse{IdentitySettingsSupplied: merged})
+	}
 }
 
 // resolveChartRef implements ADR 0028's either/or: a ChartRef string takes precedence

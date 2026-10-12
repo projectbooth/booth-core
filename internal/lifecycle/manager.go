@@ -63,29 +63,37 @@ func NewManager(namespace string) (*Manager, error) {
 // already installed — the same "install or upgrade" semantics the Module Store's
 // "install"/"update version" actions both need, since a module version bump is just a
 // re-install of a newer chart version.
-func (m *Manager) Install(releaseName string, ref ChartRef, values map[string]any) error {
-	chart, err := loadChart(m, ref)
+//
+// identity's settings are merged into values (ADR 0113) before either branch runs, so install,
+// upgrade, and re-install all get the same treatment — not just the first install. The merge
+// happens once, here, regardless of which branch follows, by construction rather than by each
+// branch remembering to call it. Returns the shared setting names actually merged in (for the
+// caller to log/report), even when the subsequent install/upgrade itself fails.
+func (m *Manager) Install(releaseName string, ref ChartRef, values map[string]any, identity IdentitySettings) ([]string, error) {
+	c, err := loadChart(m, ref)
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	values, merged := mergeIdentitySettings(c, identity, values)
 
 	if m.releaseExists(releaseName) {
 		upgrade := action.NewUpgrade(m.cfg)
 		upgrade.Namespace = m.namespace
-		if _, err := upgrade.Run(releaseName, chart, values); err != nil {
-			return fmt.Errorf("upgrading release %s: %w", releaseName, err)
+		if _, err := upgrade.Run(releaseName, c, values); err != nil {
+			return merged, fmt.Errorf("upgrading release %s: %w", releaseName, err)
 		}
-		return nil
+		return merged, nil
 	}
 
 	install := action.NewInstall(m.cfg)
 	install.ReleaseName = releaseName
 	install.Namespace = m.namespace
 	install.CreateNamespace = true
-	if _, err := install.Run(chart, values); err != nil {
-		return fmt.Errorf("installing release %s: %w", releaseName, err)
+	if _, err := install.Run(c, values); err != nil {
+		return merged, fmt.Errorf("installing release %s: %w", releaseName, err)
 	}
-	return nil
+	return merged, nil
 }
 
 // Uninstall removes releaseName. Not finding it is treated as success — uninstalling
