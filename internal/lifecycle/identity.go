@@ -25,6 +25,14 @@ type IdentitySettings struct {
 	WorkloadIssuerURL string
 	GroupsClaim       string
 	IframeIssuerURL   string
+
+	// CoreURL is core's own in-cluster base URL (ADR 0113 amendment 1): scheme, core's own
+	// Service name, its namespace, and port -- http://<service>.<namespace>.svc:<port>. Derived
+	// by the chart from its own release and namespace (BOOTH_CORE_URL), never hard-coded, so a
+	// module installed alongside a core running under a different release name or namespace
+	// still gets the right address. Empty only if the chart didn't set BOOTH_CORE_URL, which
+	// the bundled chart always does.
+	CoreURL string
 }
 
 // sharedSettingNames are the only names contracts/module-manifest.md's annotation recognizes.
@@ -38,6 +46,7 @@ var sharedSettingNames = map[string]bool{
 	"workloadIssuerUrl": true,
 	"groupsClaim":       true,
 	"iframeIssuerUrl":   true,
+	"coreUrl":           true,
 }
 
 // asMap exposes the shared setting names exactly as contracts/module-manifest.md's annotation
@@ -55,6 +64,7 @@ func (s IdentitySettings) asMap() map[string]string {
 	add("workloadIssuerUrl", s.WorkloadIssuerURL)
 	add("groupsClaim", s.GroupsClaim)
 	add("iframeIssuerUrl", s.IframeIssuerURL)
+	add("coreUrl", s.CoreURL)
 	return m
 }
 

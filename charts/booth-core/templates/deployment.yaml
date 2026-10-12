@@ -27,6 +27,11 @@ spec:
               value: ":8080"
             - name: BOOTH_NAMESPACE
               value: {{ .Release.Namespace | quote }}
+            # ADR 0113 amendment 1: core's own in-cluster address, supplied as the shared
+            # "coreUrl" setting to every annotated module install -- always derived from this
+            # release's own fullname/namespace/port, never a hard-coded "booth-core.booth-system".
+            - name: BOOTH_CORE_URL
+              value: {{ include "booth-core.inClusterBaseUrl" . | quote }}
             # ADR 0106/0108: an explicit oidc.* value always wins; only an empty one defaults to
             # the bundled Keycloak (keycloak.enabled) — see _helpers.tpl's "effectiveOidc*"
             # templates, the one place issuerUrl/clientId/jwksUrl and Keycloak's own KC_HOSTNAME

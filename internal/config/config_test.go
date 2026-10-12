@@ -246,3 +246,29 @@ func TestLoad_WorkloadIdentity(t *testing.T) {
 		}
 	}
 }
+
+// TestLoad_CoreURL covers ADR 0113 amendment 1's CoreURL field: empty unless the chart set
+// BOOTH_CORE_URL (this package never derives a default itself -- only the chart knows its own
+// release name and namespace), and a trailing slash is trimmed the same way the other
+// chart-derived in-cluster URLs (BOOTH_WORKLOAD_ISSUER_URL, BOOTH_IFRAME_IDENTITY_ISSUER_URL) are.
+func TestLoad_CoreURL(t *testing.T) {
+	t.Setenv("BOOTH_OIDC_ISSUER_URL", "https://idp")
+	t.Setenv("BOOTH_OIDC_CLIENT_ID", "c")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CoreURL != "" {
+		t.Errorf("CoreURL = %q, want empty when BOOTH_CORE_URL is unset", cfg.CoreURL)
+	}
+
+	t.Setenv("BOOTH_CORE_URL", "http://my-release.my-namespace.svc.cluster.local:8080/")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "http://my-release.my-namespace.svc.cluster.local:8080"; cfg.CoreURL != want {
+		t.Errorf("CoreURL = %q, want %q (trailing slash trimmed)", cfg.CoreURL, want)
+	}
+}

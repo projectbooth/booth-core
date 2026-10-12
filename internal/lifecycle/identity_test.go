@@ -23,9 +23,10 @@ var fullIdentity = IdentitySettings{
 	WorkloadIssuerURL: "http://booth-core.booth-system.svc.cluster.local:8080",
 	GroupsClaim:       "groups",
 	IframeIssuerURL:   "http://booth-core.booth-system.svc.cluster.local:8080/iframe-identity",
+	CoreURL:           "http://booth-core.booth-system.svc.cluster.local:8080",
 }
 
-const fullMapping = `{"issuerUrl":"oidc.issuerUrl","clientId":"oidc.clientId","jwksUrl":"oidc.jwksUrl","workloadIssuerUrl":"oidc.workloadIssuerUrl","groupsClaim":"oidc.groupsClaim","iframeIssuerUrl":"identity.issuerUrl"}`
+const fullMapping = `{"issuerUrl":"oidc.issuerUrl","clientId":"oidc.clientId","jwksUrl":"oidc.jwksUrl","workloadIssuerUrl":"oidc.workloadIssuerUrl","groupsClaim":"oidc.groupsClaim","iframeIssuerUrl":"identity.issuerUrl","coreUrl":"core.url"}`
 
 // captureLog redirects the standard logger for the duration of fn and returns what it wrote,
 // so a test can assert the "ignored, logged" cases actually log something, not just skip
@@ -61,13 +62,17 @@ func TestMergeIdentitySettings_PerLeafNotPerBlock(t *testing.T) {
 	if oidc["groupsClaim"] != fullIdentity.GroupsClaim {
 		t.Errorf("oidc.groupsClaim = %v, want core's value filled in", oidc["groupsClaim"])
 	}
+	core := got["core"].(map[string]any)
+	if core["url"] != fullIdentity.CoreURL {
+		t.Errorf("core.url = %v, want core's own in-cluster address filled in", core["url"])
+	}
 
 	for _, name := range merged {
 		if name == "clientId" {
 			t.Errorf("merged = %v, clientId should not be reported as supplied by core since the caller already set it", merged)
 		}
 	}
-	wantMerged := map[string]bool{"issuerUrl": true, "jwksUrl": true, "workloadIssuerUrl": true, "groupsClaim": true, "iframeIssuerUrl": true}
+	wantMerged := map[string]bool{"issuerUrl": true, "jwksUrl": true, "workloadIssuerUrl": true, "groupsClaim": true, "iframeIssuerUrl": true, "coreUrl": true}
 	if len(merged) != len(wantMerged) {
 		t.Errorf("merged = %v, want exactly %v", merged, wantMerged)
 	}
@@ -112,6 +117,63 @@ func TestMergeIdentitySettings_UnsetSettingIsSkippedNotWrittenEmpty(t *testing.T
 	for _, name := range merged {
 		if name == "workloadIssuerUrl" {
 			t.Error("merged reports workloadIssuerUrl as supplied, but core has no value for it")
+		}
+	}
+}
+
+// TestMergeIdentitySettings_CoreURLSupplied is ADR 0113 amendment 1's own case: a chart that
+// annotates coreUrl gets core's own in-cluster address filled in, reported in merged, exactly
+// like every other shared setting.
+func TestMergeIdentitySettings_CoreURLSupplied(t *testing.T) {
+	c := fixtureChart(`{"coreUrl":"core.url"}`)
+	got, merged := mergeIdentitySettings(c, fullIdentity, map[string]any{})
+
+	core := got["core"].(map[string]any)
+	if core["url"] != fullIdentity.CoreURL {
+		t.Errorf("core.url = %v, want %v", core["url"], fullIdentity.CoreURL)
+	}
+	if len(merged) != 1 || merged[0] != "coreUrl" {
+		t.Errorf("merged = %v, want exactly [coreUrl]", merged)
+	}
+}
+
+// TestMergeIdentitySettings_CoreURLExplicitValueIsPreservedExactly mirrors
+// TestMergeIdentitySettings_ExplicitValueIsPreservedExactly for coreUrl specifically: a caller
+// who already points at a different core address (or any other value) keeps it untouched.
+func TestMergeIdentitySettings_CoreURLExplicitValueIsPreservedExactly(t *testing.T) {
+	c := fixtureChart(`{"coreUrl":"core.url"}`)
+	values := map[string]any{
+		"core": map[string]any{"url": "http://my-other-core.other-namespace.svc.cluster.local:8080"},
+	}
+
+	got, merged := mergeIdentitySettings(c, fullIdentity, values)
+
+	core := got["core"].(map[string]any)
+	if core["url"] != "http://my-other-core.other-namespace.svc.cluster.local:8080" {
+		t.Errorf("core.url = %v, want the caller's explicit value untouched", core["url"])
+	}
+	if len(merged) != 0 {
+		t.Errorf("merged = %v, want nothing merged since coreUrl was already explicit", merged)
+	}
+}
+
+// TestMergeIdentitySettings_CoreURLSkippedWhenCoreHasNoValue mirrors
+// TestMergeIdentitySettings_UnsetSettingIsSkippedNotWrittenEmpty for coreUrl: a build that
+// somehow has no value for its own address (the chart didn't set BOOTH_CORE_URL) skips the
+// setting rather than writing an empty string, the same as every other unset shared setting.
+func TestMergeIdentitySettings_CoreURLSkippedWhenCoreHasNoValue(t *testing.T) {
+	identity := fullIdentity
+	identity.CoreURL = ""
+
+	c := fixtureChart(`{"issuerUrl":"oidc.issuerUrl","coreUrl":"core.url"}`)
+	got, merged := mergeIdentitySettings(c, identity, map[string]any{})
+
+	if _, present := got["core"]; present {
+		t.Errorf("core = %v, want the key absent entirely, never an empty string", got["core"])
+	}
+	for _, name := range merged {
+		if name == "coreUrl" {
+			t.Error("merged reports coreUrl as supplied, but core has no value for it")
 		}
 	}
 }

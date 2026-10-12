@@ -111,6 +111,16 @@ https://{{ .Values.ingress.host }}
 {{ include "booth-core.keycloakExternalBaseUrl" . }}/realms/{{ include "booth-core.keycloakRealm" . }}
 {{- end -}}
 
+{{/* core's own in-cluster base URL (ADR 0113 amendment 1) -- always this Service's in-cluster
+address, regardless of Ingress or release name/namespace, since this is what OTHER in-cluster
+callers (a module core installs) reach it at, not a browser. Deliberately distinct from
+shellOrigin below: that one follows ingress.host when set, this one never does -- a module
+annotated to receive coreUrl must always get the in-cluster address, the same reasoning
+keycloakInClusterBaseUrl above applies to jwksUrl. */}}
+{{- define "booth-core.inClusterBaseUrl" -}}
+http://{{ include "booth-core.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+{{- end -}}
+
 {{/* core's own externally-reachable address — the shell's origin, since core serves the shell.
 Same ingress.host-or-fallback shape as keycloakExternalBaseUrl, and deliberately the same host
 (one Ingress, one hostname, path-routed — ADR 0108) so a certificate covering ingress.host

@@ -412,6 +412,7 @@ func run() error {
 			WorkloadIssuerURL: cfg.Workload.IssuerURL,
 			GroupsClaim:       cfg.OIDC.GroupsClaim,
 			IframeIssuerURL:   cfg.IframeIdentity.IssuerURL,
+			CoreURL:           cfg.CoreURL,
 		},
 	})
 

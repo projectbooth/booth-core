@@ -1,14 +1,52 @@
 package api
 
 import (
+	"bytes"
+	"context"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/go-chi/chi/v5"
 
 	"github.com/projectbooth/booth-core/internal/auth"
 	"github.com/projectbooth/booth-core/internal/lifecycle"
 )
+
+// captureLog redirects the standard logger for the duration of fn and returns what it wrote, the
+// same helper internal/lifecycle/identity_test.go and internal/dbwait/retry_test.go already use
+// for this exact purpose.
+func captureLog(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(orig)
+	fn()
+	return buf.String()
+}
+
+// writeMinimalChart writes a trivial but valid Helm chart to dir, just enough that loadChart
+// succeeds and mgr.Install actually reaches Helm's own install action -- internal/lifecycle's
+// own writeFixtureChart is unexported and this package can't call it.
+func writeMinimalChart(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "Chart.yaml"), []byte("apiVersion: v2\nname: probe\nversion: 0.1.0\n"), 0o644); err != nil {
+		t.Fatalf("writing Chart.yaml: %v", err)
+	}
+	templatesDir := filepath.Join(dir, "templates")
+	if err := os.MkdirAll(templatesDir, 0o755); err != nil {
+		t.Fatalf("creating templates dir: %v", err)
+	}
+	cm := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: probe\ndata:\n  key: value\n"
+	if err := os.WriteFile(filepath.Join(templatesDir, "configmap.yaml"), []byte(cm), 0o644); err != nil {
+		t.Fatalf("writing template: %v", err)
+	}
+}
 
 func TestRequireAdmin_RejectsNonOwner(t *testing.T) {
 	called := false
@@ -93,6 +131,39 @@ func TestHandleInstallModule_RejectsMalformedChartRef(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+// TestHandleInstallModule_500LogsTheErrorWithModuleID is the gap found on the homelab: chi's
+// middleware.Logger only ever logs the status code and the response size, never the body, so a
+// 500 from this route previously left no trace of *why* anywhere in core's own logs -- only in
+// the HTTP response, which nothing captures after the fact. A missing kubeconfig/cluster makes
+// mgr.Install fail fast and deterministically (Helm's own "Kubernetes cluster unreachable"), with
+// no real cluster needed -- exactly the Helm/chart error text this fix must get into the log.
+func TestHandleInstallModule_500LogsTheErrorWithModuleID(t *testing.T) {
+	t.Setenv("KUBECONFIG", filepath.Join(t.TempDir(), "does-not-exist"))
+	dir := t.TempDir()
+	writeMinimalChart(t, dir)
+
+	body := strings.NewReader(`{"namespace":"probe-ns","chart":{"path":"` + filepath.ToSlash(dir) + `"}}`)
+	req := withTestIdentity(httptest.NewRequest(http.MethodPost, "/api/modules/probe-mod/install", body), auth.RoleOwner)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "probe-mod")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rec := httptest.NewRecorder()
+
+	logged := captureLog(t, func() {
+		handleInstallModule(lifecycle.IdentitySettings{})(rec, req)
+	})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(logged, "probe-mod") {
+		t.Errorf("log output = %q, want it to mention the module id %q", logged, "probe-mod")
+	}
+	if !strings.Contains(logged, rec.Body.String()) {
+		t.Errorf("log output = %q, want it to contain the same Helm/chart error text sent in the response (%q)", logged, rec.Body.String())
 	}
 }
 
