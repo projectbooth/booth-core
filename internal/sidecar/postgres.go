@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -45,6 +46,13 @@ type PostgresProxy struct {
 
 	current atomic.Pointer[PostgresCredential]
 
+	// revoked distinguishes "access was granted and then taken away" from "never granted yet" —
+	// ADR 0117 "Reconciled design" item 4: a renewal that comes back with credential: null (the
+	// documented answer to booth-database's revoke request) means the lease is gone, not that
+	// this response was malformed. Reset to false by the next renewal that supplies a real
+	// credential, so a proxy that somehow outlives a revoke-then-regrant behaves correctly too.
+	revoked atomic.Bool
+
 	// Dial is overridden in tests to connect to a fixture upstream without a real network.
 	Dial func(network, address string) (net.Conn, error)
 }
@@ -61,12 +69,34 @@ func NewPostgresProxy(renewer *Renewer) *PostgresProxy {
 }
 
 func (p *PostgresProxy) setCredential(resp credentialbroker.Response) {
+	if isNullOrAbsentCredential(resp.Credential) {
+		// Access was revoked out from under this lease (ADR 0117 "Reconciled design" item 4) —
+		// decoding "null" into PostgresCredential would succeed and silently produce an
+		// all-empty credential (zero-value Host/Port/User/Password), which dialAndAuthenticate
+		// would then try to use for real, failing with a confusing dial/auth error instead of a
+		// clear one. Clear the credential explicitly instead, so the next connection gets a
+		// clean refusal (handleConn below) rather than a garbage one.
+		log.Printf("sidecar: lease %s was revoked (credential is null); refusing new connections", resp.LeaseID)
+		p.current.Store(nil)
+		p.revoked.Store(true)
+		return
+	}
+
 	var cred PostgresCredential
 	if err := decodeStrict(resp.Credential, &cred); err != nil {
 		log.Printf("sidecar: postgres credential from lease %s is unparseable, keeping the previous one: %v", resp.LeaseID, err)
 		return
 	}
 	p.current.Store(&cred)
+	p.revoked.Store(false)
+}
+
+// isNullOrAbsentCredential mirrors credentialbroker's own isNullOrAbsent (unexported there, so
+// duplicated rather than creating a cross-package dependency for four lines) — true for a JSON
+// null or a genuinely missing credential field.
+func isNullOrAbsentCredential(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || string(trimmed) == "null"
 }
 
 // Listen accepts connections on addr until ctx is canceled. addr must be a loopback address or a
@@ -136,7 +166,11 @@ func (p *PostgresProxy) handleConn(client net.Conn) {
 
 	cred := p.current.Load()
 	if cred == nil {
-		_ = pgwire.WriteErrorResponse(client, "FATAL", "no credential lease obtained yet")
+		msg := "no credential lease obtained yet"
+		if p.revoked.Load() {
+			msg = "access has been revoked"
+		}
+		_ = pgwire.WriteErrorResponse(client, "FATAL", msg)
 		return
 	}
 

@@ -179,6 +179,41 @@ func TestMint_ModuleThatNeverDeclaredWorkloadIdentityIsRejected(t *testing.T) {
 	})
 }
 
+// --- ADR 0117 "Reconciled design" item 3/4: apiwrite: is reserved to booth-api's module id. -----
+
+// The credential broker's authorize() refuses a readwrite/read request from an apiwrite:-subject
+// token (internal/credentialbroker.authorize) — but only if nothing else holding
+// workloadIdentity.mint can mint that subject shape for itself. Confirm a module other than "api"
+// is refused even though it is otherwise fully entitled to mint (coordinator review of PR #22).
+func TestMint_ApiWriteSubjectIsReservedToTheApiModule(t *testing.T) {
+	f := newFixture(t)
+	f.reg.Put(registry.Module{Namespace: "ns", Spec: moduleSpec("api", mints)})
+	f.seen(t, "u-alice", "acme", auth.RoleOwner)
+
+	apiWriteReq := Request{Workspace: "acme", Subject: "apiwrite:finance-api", RoleCeiling: "editor", Owner: "u-alice"}
+
+	if _, err := f.mint("pipeline", apiWriteReq); !errors.Is(err, ErrNotEntitled) {
+		t.Fatalf("Mint by pipeline = %v, want ErrNotEntitled (pipeline has workloadIdentity.mint but must never mint apiwrite:)", err)
+	}
+	if _, err := f.mint("api", apiWriteReq); err != nil {
+		t.Fatalf("Mint by api = %v, want success (api is the one module apiwrite: is reserved for)", err)
+	}
+}
+
+// Every subject kind not in reservedSubjectKinds is completely unaffected — any entitled module
+// keeps minting whatever kind it already does today (job:, apikeys:, streamlit:, ...).
+func TestMint_UnreservedSubjectKindsAreUnaffected(t *testing.T) {
+	f := newFixture(t)
+	f.seen(t, "u-alice", "acme", auth.RoleOwner)
+
+	for _, subject := range []string{"job:42", "apikeys:acme", "streamlit:acme:finance-dashboard"} {
+		req := Request{Workspace: "acme", Subject: subject, RoleCeiling: "editor", Owner: "u-alice"}
+		if _, err := f.mint("pipeline", req); err != nil {
+			t.Errorf("Mint(pipeline, %q) = %v, want success", subject, err)
+		}
+	}
+}
+
 // --- Regression: the role never exceeds what the owner currently holds. ----------------------
 
 func TestMint_RoleIsTheLesserOfCeilingAndOwnersCurrentRole(t *testing.T) {
