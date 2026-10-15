@@ -205,6 +205,200 @@ func TestIssue_ReadIsAllowedForAnyRealRole(t *testing.T) {
 	}
 }
 
+// --- ADR 0117 "Reconciled design" item 4: a new, distinct access value. -------------------------
+
+func TestIssue_TableWriteRequiresEditorOrOwner(t *testing.T) {
+	provider := newRealProvider(t)
+	svc, _, _ := newFixture(t, provider, "postgres")
+
+	for _, tc := range []struct {
+		role  auth.Role
+		allow bool
+	}{
+		{auth.RoleViewer, false}, {auth.RoleEditor, true}, {auth.RoleOwner, true},
+	} {
+		t.Run(string(tc.role), func(t *testing.T) {
+			provider.received = nil
+			_, err := svc.Issue(context.Background(), "u-x", "acme", tc.role, req("postgres", AccessTableWrite))
+			if tc.allow && err != nil {
+				t.Fatalf("role %s should be allowed tablewrite: %v", tc.role, err)
+			}
+			if !tc.allow {
+				if !errors.Is(err, ErrForbidden) {
+					t.Fatalf("role %s: err = %v, want ErrForbidden", tc.role, err)
+				}
+				if len(provider.received) != 0 {
+					t.Errorf("role %s: a forbidden tablewrite request still reached the provider", tc.role)
+				}
+			}
+		})
+	}
+}
+
+// tablewrite must reach the provider exactly as it was asked for — never rewritten into
+// readwrite, which the provider would read as "give this lease the whole-database _rw".
+func TestIssue_TableWriteForwardedVerbatimNeverTranslatedToReadWrite(t *testing.T) {
+	provider := newRealProvider(t)
+	svc, _, _ := newFixture(t, provider, "postgres")
+
+	if _, err := svc.Issue(context.Background(), "u-x", "acme", auth.RoleOwner, req("postgres", AccessTableWrite)); err != nil {
+		t.Fatal(err)
+	}
+	if got := provider.received[0].body.Access; got != AccessTableWrite {
+		t.Errorf("provider received access = %q, want %q", got, AccessTableWrite)
+	}
+}
+
+// A token whose subject is apiwrite:<id> (ADR 0117 reconciled design item 3: booth-api's own
+// write sidecar) may request only tablewrite — a readwrite request from it is refused even at an
+// owner-ranked role, because this subject shape exists for exactly one narrow purpose and must
+// never be able to leverage its capped role for anything broader.
+func TestIssue_ApiWriteSubjectCanOnlyRequestTableWrite(t *testing.T) {
+	provider := newRealProvider(t)
+	svc, _, _ := newFixture(t, provider, "postgres")
+
+	for _, tc := range []struct {
+		access string
+		allow  bool
+	}{
+		{AccessRead, false}, {AccessReadWrite, false}, {AccessTableWrite, true},
+	} {
+		t.Run(tc.access, func(t *testing.T) {
+			provider.received = nil
+			_, err := svc.Issue(context.Background(), "apiwrite:finance-api", "acme", auth.RoleOwner, req("postgres", tc.access))
+			if tc.allow && err != nil {
+				t.Fatalf("access %s should be allowed for an apiwrite: subject: %v", tc.access, err)
+			}
+			if !tc.allow {
+				if !errors.Is(err, ErrForbidden) {
+					t.Fatalf("access %s: err = %v, want ErrForbidden", tc.access, err)
+				}
+				if len(provider.received) != 0 {
+					t.Errorf("access %s: a forbidden apiwrite: request still reached the provider", tc.access)
+				}
+			}
+		})
+	}
+}
+
+// Every other subject shape is unaffected by the apiwrite: restriction — an ordinary subject
+// (e.g. a human's own sub, or any other workload token) keeps exactly today's readwrite/tablewrite
+// rule: role alone decides it.
+func TestIssue_OrdinarySubjectsUnaffectedByApiWriteRestriction(t *testing.T) {
+	provider := newRealProvider(t)
+	svc, _, _ := newFixture(t, provider, "postgres")
+
+	for _, access := range []string{AccessRead, AccessReadWrite, AccessTableWrite} {
+		if _, err := svc.Issue(context.Background(), "u-alice", "acme", auth.RoleOwner, req("postgres", access)); err != nil {
+			t.Errorf("access %s: owner should be allowed: %v", access, err)
+		}
+	}
+}
+
+// --- ADR 0117 "Reconciled design" item 4: onBehalfOf, audit-only. --------------------------------
+
+func TestIssue_OnBehalfOfReachesProviderRequesterVerbatim(t *testing.T) {
+	provider := newRealProvider(t)
+	svc, _, _ := newFixture(t, provider, "postgres")
+
+	r := req("postgres", AccessTableWrite)
+	r.OnBehalfOf = "app:finance-dashboard"
+	if _, err := svc.Issue(context.Background(), "apiwrite:finance-api", "acme", auth.RoleOwner, r); err != nil {
+		t.Fatal(err)
+	}
+	if got := provider.received[0].body.Requester.OnBehalfOf; got != "app:finance-dashboard" {
+		t.Errorf("provider requester.onBehalfOf = %q, want %q", got, "app:finance-dashboard")
+	}
+}
+
+// onBehalfOf must never factor into the authorization decision — a viewer-ranked caller is
+// refused readwrite/tablewrite exactly as before, whether or not it names an onBehalfOf subject.
+func TestIssue_OnBehalfOfNeverAffectsAuthorization(t *testing.T) {
+	provider := newRealProvider(t)
+	svc, _, _ := newFixture(t, provider, "postgres")
+
+	r := req("postgres", AccessTableWrite)
+	r.OnBehalfOf = "app:finance-dashboard"
+	if _, err := svc.Issue(context.Background(), "u-x", "acme", auth.RoleViewer, r); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("err = %v, want ErrForbidden (a viewer naming onBehalfOf must still be refused)", err)
+	}
+	if len(provider.received) != 0 {
+		t.Error("a forbidden request carrying onBehalfOf still reached the provider")
+	}
+}
+
+// Omitting onBehalfOf is the common case and must behave exactly as before — every existing
+// caller that never sets it is unaffected.
+func TestIssue_OnBehalfOfOmittedIsFine(t *testing.T) {
+	provider := newRealProvider(t)
+	svc, _, _ := newFixture(t, provider, "postgres")
+
+	if _, err := svc.Issue(context.Background(), "u-x", "acme", auth.RoleOwner, req("postgres", AccessTableWrite)); err != nil {
+		t.Fatal(err)
+	}
+	if got := provider.received[0].body.Requester.OnBehalfOf; got != "" {
+		t.Errorf("requester.onBehalfOf = %q, want empty when the request never set it", got)
+	}
+}
+
+// --- ADR 0117 "Reconciled design" item 4: the revoke request's null-credential response. ---------
+
+// booth-database's documented revoke shape (tablewrite, options.revoke=true, tables: []) answers
+// 201 with credential: null — a genuine success that must reach the caller as one, not be turned
+// into an error the way a provider that merely forgot to include a credential would be.
+func TestIssue_RelaysNullCredentialForRevokeRequest(t *testing.T) {
+	provider := newRealProvider(t)
+	provider.respond = func(body providerRequest) (int, any) {
+		return http.StatusCreated, map[string]any{
+			"leaseId": "lease-revoked", "kind": "postgres", "expiresAt": time.Now().Add(time.Minute),
+			"scope": body.Scope, "credential": nil,
+		}
+	}
+	svc, audit, _ := newFixture(t, provider, "postgres")
+
+	revokeReq := Request{
+		Kind: "postgres", Access: AccessTableWrite,
+		Scope:   json.RawMessage(`{"workspace":"acme","write":{"grant":"api:finance-api","tables":[]}}`),
+		Options: json.RawMessage(`{"revoke":true}`),
+	}
+	resp, err := svc.Issue(context.Background(), "apiwrite:finance-api", "acme", auth.RoleOwner, revokeReq)
+	if err != nil {
+		t.Fatalf("Issue: %v, want the null-credential 201 relayed as success", err)
+	}
+	if resp.LeaseID != "lease-revoked" {
+		t.Errorf("LeaseID = %q", resp.LeaseID)
+	}
+	if !isNullOrAbsent(resp.Credential) {
+		t.Errorf("Credential = %q, want null", resp.Credential)
+	}
+	if len(audit.Entries()) != 1 {
+		t.Errorf("audit entries = %d, want 1 (a revoke is still a genuine issuance to record)", len(audit.Entries()))
+	}
+}
+
+// A null credential is only ever legitimate for the documented revoke shape. Anywhere else, it
+// still means exactly what it meant before this change: the provider forgot to include one.
+func TestIssue_NullCredentialWithoutRevokeIsStillIncomplete(t *testing.T) {
+	provider := newRealProvider(t)
+	provider.respond = func(body providerRequest) (int, any) {
+		return http.StatusCreated, Response{
+			LeaseID: "lease-x", Kind: "postgres", ExpiresAt: time.Now().Add(time.Minute),
+			Scope: body.Scope, Credential: json.RawMessage("null"),
+		}
+	}
+	svc, audit, _ := newFixture(t, provider, "postgres")
+
+	// Same access value (tablewrite), but no options.revoke=true -- a real request for a real
+	// table-scoped lease, which must always come back with a real credential.
+	_, err := svc.Issue(context.Background(), "u-x", "acme", auth.RoleOwner, req("postgres", AccessTableWrite))
+	if !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("err = %v, want ErrProviderUnavailable", err)
+	}
+	if len(audit.Entries()) != 0 {
+		t.Error("recorded an issuance for an incomplete (null-credential, non-revoke) response")
+	}
+}
+
 func TestIssue_UnknownRoleIsForbidden(t *testing.T) {
 	provider := newRealProvider(t)
 	svc, _, _ := newFixture(t, provider, "s3")

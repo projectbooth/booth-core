@@ -103,6 +103,19 @@ func (c *coreIssuer) mustMint(t *testing.T, owner, ceiling string) string {
 	return got.body.Token
 }
 
+// mustMintSubject is mustMint with a caller-chosen subject, for a test that needs a specific
+// real-world subject shape (e.g. ADR 0117's "app:<id>") rather than mintBody's fixed "job:42".
+func (c *coreIssuer) mustMintSubject(t *testing.T, subject, owner, ceiling string) string {
+	t.Helper()
+	got := c.mint(t, c.keys.Credential("pipeline"), map[string]string{
+		"workspace": "acme", "subject": subject, "roleCeiling": ceiling, "owner": owner,
+	})
+	if got.status != http.StatusOK {
+		t.Fatalf("mint: %d %s", got.status, got.raw)
+	}
+	return got.body.Token
+}
+
 // --- ADR 0059: a workload token reaches a module through the gateway. -------------------------
 
 func TestGateway_WorkloadTokenReachesModuleWithCorrectForwardedIdentity(t *testing.T) {
@@ -125,6 +138,35 @@ func TestGateway_WorkloadTokenReachesModuleWithCorrectForwardedIdentity(t *testi
 	// The module re-verifies the token itself (defense in depth); it must receive the same one.
 	if got := h.Get("Authorization"); got != "Bearer "+token {
 		t.Errorf("forwarded Authorization = %q, want the workload token unchanged", got)
+	}
+}
+
+// ADR 0117 "Reconciled design" item 2: the app's own viewer-capped workload token is forwarded
+// through the gateway to booth-api's generated route unchanged — the exact same mechanism
+// TestGateway_WorkloadTokenReachesModuleWithCorrectForwardedIdentity already proves generically,
+// pinned here against ADR 0117's actual subject ("app:<id>") and route shape
+// ("/modules/api/app/v1/..."), so booth-api's own CI has a concrete, reusable example of minting
+// and presenting this exact token against a real core instance. No gateway code change was needed
+// for this — internal/gateway/proxy.go's Handler never branches on subject shape (confirmed by
+// reading it): this test exists to pin that fact for this specific ADR, not to fix anything.
+func TestGateway_AppWorkloadTokenReachesBoothApiUnchanged(t *testing.T) {
+	c := newCoreIssuer(t)
+	api := c.addBackend(t, "api")
+	c.signIn(t, "u-household-owner", "/workspaces/acme/owner")
+	token := c.mustMintSubject(t, "app:finance-dashboard", "u-household-owner", "viewer") // ADR 0104/0107: an app's own token is always roleCeiling: viewer
+
+	status, body := c.viaGateway(t, token, "acme", "api/app/v1/finance-dashboard/transactions", nil)
+	if status != http.StatusOK || body != "reached /app/v1/finance-dashboard/transactions" {
+		t.Fatalf("status %d body %q; want booth-api's response", status, body)
+	}
+	h, _ := api.last()
+	if got := h.Get(auth.HeaderBoothRole); got != "viewer" {
+		t.Errorf("X-Booth-Role = %q, want viewer (an app token is never upgraded)", got)
+	}
+	// booth-api verifies this itself against core's workload issuer (ADR 0056/0058's discovery
+	// document) — it must receive the identical bearer, not a re-signed or re-derived one.
+	if got := h.Get("Authorization"); got != "Bearer "+token {
+		t.Errorf("forwarded Authorization = %q, want the app workload token unchanged", got)
 	}
 }
 

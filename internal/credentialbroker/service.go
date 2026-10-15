@@ -16,6 +16,18 @@ import (
 	"github.com/projectbooth/booth-core/internal/registry"
 )
 
+// apiWriteSubjectPrefix marks a workload token minted for exactly one purpose: booth-api's
+// per-(API, granting owner) write sidecar (ADR 0117 reconciled design item 3, subject
+// "apiwrite:<api-id>"). The prefix alone is the signal, needing no new stored state — ADR 0056's
+// subject grammar already makes a "<kind>:<id>" prefix structurally meaningful (see
+// internal/workload/service.go's subjectPattern), and this token's one job is a table-scoped
+// write lease, never anything broader, even though its role is capped at "editor" (ADR 0117:
+// "an apiwrite: token can request only tablewrite; a readwrite request from it is refused" —
+// without this, an editor-capped apiwrite token could ask the broker for a whole-database
+// readwrite, exactly the hole ADR 0117's "Reconciled design" overruled booth-core's first design
+// note for).
+const apiWriteSubjectPrefix = "apiwrite:"
+
 const (
 	// DefaultMaxTTL is the ceiling on ttlSeconds a caller may request — ADR 0080's "mandatory
 	// short TTL... a stricter default ceiling than an HTTP grant() token's" (workload.DefaultTokenTTL
@@ -37,11 +49,21 @@ const (
 	// the broker route indefinitely.
 	providerCallTimeout = 10 * time.Second
 
-	// AccessRead / AccessReadWrite are the two values Request.Access accepts. Shared, broker-level
-	// vocabulary (unlike Scope, which is opaque per kind) specifically because the broker's own
-	// authorization decision needs to read it regardless of kind — see docs/decisions/0014.
+	// AccessRead / AccessReadWrite / AccessTableWrite are the values Request.Access accepts.
+	// Shared, broker-level vocabulary (unlike Scope, which is opaque per kind) specifically
+	// because the broker's own authorization decision needs to read it regardless of kind — see
+	// docs/decisions/0014.
 	AccessRead      = "read"
 	AccessReadWrite = "readwrite"
+
+	// AccessTableWrite is a distinct top-level value (ADR 0117 "Reconciled design" item 4), never
+	// translated to/from AccessReadWrite anywhere in this package. readwrite still means a lease
+	// in the whole-database _rw group; tablewrite means a lease in a per-grant write group scoped
+	// to the named tables in scope.write, and nothing else. Keeping them distinct, rather than
+	// letting readwrite's existing meaning stretch to cover "sometimes narrower," is what lets
+	// booth-database's provider refuse a tablewrite request with no scope.write (and a
+	// read/readwrite request that carries one) rather than silently guessing which was meant.
+	AccessTableWrite = "tablewrite"
 )
 
 var (
@@ -98,6 +120,13 @@ type Request struct {
 	Access     string          `json:"access"`
 	Scope      json.RawMessage `json:"scope"`
 	Options    json.RawMessage `json:"options,omitempty"`
+
+	// OnBehalfOf names the identity booth-api is acting for (ADR 0117 reconciled design item 4),
+	// e.g. the app subject a declared write came from. Passed through to the provider's
+	// Requester.OnBehalfOf verbatim, for that provider's own audit record only — authorize()
+	// never reads it, and it never widens or narrows what the already-resolved (subject,
+	// workspace, role) may do. Optional; every existing caller that omits it is unaffected.
+	OnBehalfOf string `json:"onBehalfOf,omitempty"`
 }
 
 // Response is what's returned to the requester — the provider's own minted response, relayed
@@ -125,9 +154,10 @@ type providerRequest struct {
 }
 
 type providerRequester struct {
-	Subject   string `json:"subject"`
-	Workspace string `json:"workspace"`
-	Role      string `json:"role"`
+	Subject    string `json:"subject"`
+	Workspace  string `json:"workspace"`
+	Role       string `json:"role"`
+	OnBehalfOf string `json:"onBehalfOf,omitempty"`
 }
 
 // Modules is the slice of the registry the broker needs: every installed module, to find whoever
@@ -177,7 +207,7 @@ func (s *Service) Issue(ctx context.Context, subject, workspace string, role aut
 	if err := validate(req); err != nil {
 		return Response{}, err
 	}
-	if !authorize(role, req.Access) {
+	if !authorize(subject, role, req.Access) {
 		return Response{}, ErrForbidden
 	}
 
@@ -193,13 +223,17 @@ func (s *Service) Issue(ctx context.Context, subject, workspace string, role aut
 
 	body, err := json.Marshal(providerRequest{
 		Kind: req.Kind, TTLSeconds: ttl, Access: req.Access, Scope: req.Scope, Options: req.Options,
-		Requester: providerRequester{Subject: subject, Workspace: workspace, Role: string(role)},
+		Requester: providerRequester{Subject: subject, Workspace: workspace, Role: string(role), OnBehalfOf: req.OnBehalfOf},
 	})
 	if err != nil {
 		return Response{}, fmt.Errorf("%w: encoding provider request: %v", ErrProviderUnavailable, err)
 	}
 
-	resp, err := s.callProvider(ctx, mod, body)
+	// ADR 0117 "Reconciled design" item 4: booth-database's revoke request (tablewrite,
+	// options.revoke=true, tables: []) answers 201 with credential: null — a genuine success,
+	// not an incomplete response, and the one case this layer must not reject the way it rejects
+	// every other provider that forgets to include a credential.
+	resp, err := s.callProvider(ctx, mod, body, isRevokeRequest(req))
 	if err != nil {
 		return Response{}, err
 	}
@@ -225,8 +259,8 @@ func validate(req Request) error {
 	switch {
 	case !kindPattern.MatchString(req.Kind):
 		return fmt.Errorf("%w: kind must match %s", ErrInvalidRequest, kindPattern)
-	case req.Access != AccessRead && req.Access != AccessReadWrite:
-		return fmt.Errorf("%w: access must be %q or %q", ErrInvalidRequest, AccessRead, AccessReadWrite)
+	case req.Access != AccessRead && req.Access != AccessReadWrite && req.Access != AccessTableWrite:
+		return fmt.Errorf("%w: access must be %q, %q or %q", ErrInvalidRequest, AccessRead, AccessReadWrite, AccessTableWrite)
 	case len(req.Scope) == 0 || string(req.Scope) == "null":
 		return fmt.Errorf("%w: scope is required", ErrInvalidRequest)
 	case req.TTLSeconds < 0:
@@ -237,12 +271,25 @@ func validate(req Request) error {
 
 // authorize applies ADR 0048's already-established precedent (editor/owner write, viewer reads)
 // to the broker's one shared, cross-kind field: a viewer may request read-scoped credentials, but
-// never readwrite ones, regardless of kind.
-func authorize(role auth.Role, access string) bool {
-	if access == AccessReadWrite {
-		return auth.RoleRank(role) >= auth.RoleRank(auth.RoleEditor)
+// never readwrite or tablewrite ones, regardless of kind. read and readwrite's own rules are
+// exactly as they were before tablewrite existed — unaffected by the subject-prefix branch below.
+//
+// An apiwrite:-subject token (ADR 0117 reconciled design item 4) is further restricted to
+// tablewrite alone, even though its role is capped at editor: that token exists for exactly one
+// purpose (booth-api's write sidecar requesting its own table-scoped lease), and nothing about
+// holding an editor-capped role should let it also ask for a whole-database readwrite, or widen
+// into read. This is a stricter rule for one subject shape, layered on top of the role check, not
+// a replacement for it — the role check still applies within that one allowed access value.
+func authorize(subject string, role auth.Role, access string) bool {
+	if strings.HasPrefix(subject, apiWriteSubjectPrefix) {
+		return access == AccessTableWrite && auth.RoleRank(role) >= auth.RoleRank(auth.RoleEditor)
 	}
-	return auth.RoleRank(role) > 0
+	switch access {
+	case AccessReadWrite, AccessTableWrite:
+		return auth.RoleRank(role) >= auth.RoleRank(auth.RoleEditor)
+	default:
+		return auth.RoleRank(role) > 0
+	}
 }
 
 func (s *Service) findProvider(kind string) (registry.Module, error) {
@@ -268,7 +315,33 @@ func (s *Service) findProvider(kind string) (registry.Module, error) {
 	}
 }
 
-func (s *Service) callProvider(ctx context.Context, mod registry.Module, body []byte) (Response, error) {
+// isRevokeRequest reports whether req is booth-database's documented revoke shape (ADR 0117
+// "Reconciled design" item 4 / docs/design-app-writes.md §3 in booth-database: access
+// "tablewrite", options: {"revoke": true}) — the one request shape a provider's 201 may legally
+// answer with credential: null. req.Options is opaque to the broker beyond this one check; a
+// malformed or absent options value simply means "not a revoke," never an error here — validate()
+// already rejected anything else wrong with the request before this is reached.
+func isRevokeRequest(req Request) bool {
+	if req.Access != AccessTableWrite || len(req.Options) == 0 {
+		return false
+	}
+	var opts struct {
+		Revoke bool `json:"revoke"`
+	}
+	if err := json.Unmarshal(req.Options, &opts); err != nil {
+		return false
+	}
+	return opts.Revoke
+}
+
+// isNullOrAbsent reports whether raw is JSON null or simply wasn't sent at all — the two shapes
+// that mean "no credential" rather than "a credential the broker should pass through unread."
+func isNullOrAbsent(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) == 0 || string(trimmed) == "null"
+}
+
+func (s *Service) callProvider(ctx context.Context, mod registry.Module, body []byte, allowNullCredential bool) (Response, error) {
 	callCtx, cancel := context.WithTimeout(ctx, providerCallTimeout)
 	defer cancel()
 
@@ -299,8 +372,11 @@ func (s *Service) callProvider(ctx context.Context, mod registry.Module, body []
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return Response{}, fmt.Errorf("%w: %s returned an unparseable response: %v", ErrProviderUnavailable, mod.Spec.ID, err)
 	}
-	if resp.LeaseID == "" || resp.ExpiresAt.IsZero() || len(resp.Credential) == 0 {
-		return Response{}, fmt.Errorf("%w: %s returned an incomplete response (missing leaseId/expiresAt/credential)", ErrProviderUnavailable, mod.Spec.ID)
+	if resp.LeaseID == "" || resp.ExpiresAt.IsZero() {
+		return Response{}, fmt.Errorf("%w: %s returned an incomplete response (missing leaseId/expiresAt)", ErrProviderUnavailable, mod.Spec.ID)
+	}
+	if isNullOrAbsent(resp.Credential) && !allowNullCredential {
+		return Response{}, fmt.Errorf("%w: %s returned an incomplete response (missing credential)", ErrProviderUnavailable, mod.Spec.ID)
 	}
 	return resp, nil
 }

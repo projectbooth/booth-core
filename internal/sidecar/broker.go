@@ -151,8 +151,15 @@ func (c *BrokerClient) Issue(ctx context.Context, req credentialbroker.Request) 
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return credentialbroker.Response{}, fmt.Errorf("unparseable broker response: %w", err)
 	}
-	if out.LeaseID == "" || out.ExpiresAt.IsZero() || len(out.Credential) == 0 {
-		return credentialbroker.Response{}, errors.New("broker response missing leaseId/expiresAt/credential")
+	if out.LeaseID == "" || out.ExpiresAt.IsZero() {
+		return credentialbroker.Response{}, errors.New("broker response missing leaseId/expiresAt")
 	}
+	// Credential is deliberately not required here. The broker itself already refuses an
+	// incomplete provider response (internal/credentialbroker.Service.callProvider) for every
+	// request except booth-database's documented revoke shape (ADR 0117 "Reconciled design" item
+	// 4: tablewrite, options.revoke=true), where a null credential is the genuine, successful
+	// answer, not a malformed one. This client trusts that gate rather than re-deriving a
+	// parallel, less precise copy of it — a mode-specific handler (e.g. PostgresProxy.setCredential)
+	// decides what a null credential means for its own kind.
 	return out, nil
 }

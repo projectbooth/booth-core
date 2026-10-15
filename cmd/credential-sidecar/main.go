@@ -33,7 +33,7 @@ func run() error {
 		kind              = flag.String("kind", "", "credential kind to request (postgres, s3)")
 		scope             = flag.String("scope", "", "raw JSON passed through to the broker's scope field")
 		options           = flag.String("options", "", "raw JSON passed through to the broker's options field")
-		access            = flag.String("access", credentialbroker.AccessReadWrite, "read or readwrite, forwarded to the broker")
+		access            = flag.String("access", credentialbroker.AccessReadWrite, "read, readwrite or tablewrite, forwarded to the broker verbatim")
 		listen            = flag.String("listen", "127.0.0.1:5432", "postgres mode: address (or unix socket path prefixed unix://) the wire-protocol proxy binds")
 		credentialsFile   = flag.String("credentials-file", "", "s3 mode: path the refreshed AWS shared-credentials-file is written to")
 		healthListen      = flag.String("health-listen", "127.0.0.1:8080", "s3 mode: address the standalone /healthz listener binds (postgres mode serves /healthz on --listen itself)")
@@ -147,8 +147,14 @@ func validateFlags(kind, scope, access, credentialsFile string) error {
 	if scope == "" {
 		return errors.New("--scope is required")
 	}
-	if access != credentialbroker.AccessRead && access != credentialbroker.AccessReadWrite {
-		return fmt.Errorf("--access must be %q or %q, got %q", credentialbroker.AccessRead, credentialbroker.AccessReadWrite, access)
+	if access != credentialbroker.AccessRead && access != credentialbroker.AccessReadWrite && access != credentialbroker.AccessTableWrite {
+		return fmt.Errorf("--access must be %q, %q or %q, got %q",
+			credentialbroker.AccessRead, credentialbroker.AccessReadWrite, credentialbroker.AccessTableWrite, access)
+	}
+	// tablewrite names Postgres tables (ADR 0117); it has no meaning for an s3-kind lease, so
+	// refuse the combination here rather than letting a provider discover it's nonsensical.
+	if access == credentialbroker.AccessTableWrite && kind != "postgres" {
+		return fmt.Errorf("--access=tablewrite is only valid with --kind=postgres, got --kind=%q", kind)
 	}
 	return nil
 }

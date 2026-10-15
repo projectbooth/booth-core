@@ -1,6 +1,7 @@
 package sidecar
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/projectbooth/booth-core/internal/credentialbroker"
+	"github.com/projectbooth/booth-core/internal/sidecar/pgwire"
 	"github.com/projectbooth/booth-core/internal/testpg"
 )
 
@@ -315,6 +317,66 @@ func TestPostgresProxy_HalfLifetimeRenewalGuaranteesHalfALeaseForAnExistingConne
 	if currentUser != "sidecar_half_user_b" {
 		t.Errorf("new connection authenticated as %q, want sidecar_half_user_b (the renewed lease)", currentUser)
 	}
+}
+
+// --- ADR 0117 "Reconciled design" item 4: a revoked (credential: null) lease. --------------------
+
+// assertConnectionRefused dials addr, sends a real Postgres StartupMessage, and asserts the
+// proxy's response is a FATAL ErrorResponse carrying wantMessage — the same wire shape a real
+// client (pgx, psql) would see.
+func assertConnectionRefused(t *testing.T, addr, wantMessage string) {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if err := pgwire.WriteStartupMessage(conn, pgwire.StartupParams{"user": "u", "database": "d"}); err != nil {
+		t.Fatalf("writing startup message: %v", err)
+	}
+	msg, err := pgwire.ReadMessage(bufio.NewReader(conn))
+	if err != nil {
+		t.Fatalf("reading response: %v", err)
+	}
+	if msg.Type != 'E' {
+		t.Fatalf("message type = %q, want E (ErrorResponse)", msg.Type)
+	}
+	if got := errorResponseMessage(msg.Payload); got != wantMessage {
+		t.Errorf("error message = %q, want %q", got, wantMessage)
+	}
+}
+
+// Before any lease, the long-standing message. After a lease is obtained and then revoked
+// (credential: null, booth-database's documented revoke response), a distinct message — proving
+// the proxy tells the two states apart rather than silently trying to dial with an empty,
+// zero-valued credential (which would fail with a confusing dial error instead of a clean one).
+func TestPostgresProxy_NullCredentialRefusesNewConnectionsAsRevoked(t *testing.T) {
+	setCredential, addr := newProxyFixture(t)
+
+	assertConnectionRefused(t, addr, "no credential lease obtained yet")
+
+	setCredential(credentialbroker.Response{
+		LeaseID: "lease-1", ExpiresAt: time.Now().Add(time.Hour),
+		Credential: json.RawMessage(`{"host":"127.0.0.1","port":5432,"database":"d","username":"u","password":"p"}`),
+	})
+
+	setCredential(credentialbroker.Response{
+		LeaseID: "lease-1", ExpiresAt: time.Now().Add(time.Hour), Credential: json.RawMessage("null"),
+	})
+	assertConnectionRefused(t, addr, "access has been revoked")
+}
+
+// An absent credential field (as opposed to an explicit JSON null) is treated identically — both
+// mean "no credential," per isNullOrAbsentCredential.
+func TestPostgresProxy_AbsentCredentialFieldAlsoCountsAsRevoked(t *testing.T) {
+	setCredential, addr := newProxyFixture(t)
+
+	setCredential(credentialbroker.Response{
+		LeaseID: "lease-1", ExpiresAt: time.Now().Add(time.Hour),
+		Credential: json.RawMessage(`{"host":"127.0.0.1","port":5432,"database":"d","username":"u","password":"p"}`),
+	})
+	setCredential(credentialbroker.Response{LeaseID: "lease-1", ExpiresAt: time.Now().Add(time.Hour)}) // Credential omitted
+	assertConnectionRefused(t, addr, "access has been revoked")
 }
 
 // --- Health: 503 before any lease, 200 once one has been obtained, served on the same listener. ----
