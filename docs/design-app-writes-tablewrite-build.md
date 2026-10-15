@@ -1,14 +1,19 @@
 # Build note: the `tablewrite` broker change (ADR 0117 "Reconciled design" item 4)
 
-Status: **built**, this branch. Supersedes this repo's earlier `docs/design-app-writes.md`
-(kept, unedited, on its own branch `design-app-writes-broker-rule-adr0117`, per the ADR's own
-instruction) wherever the two disagree — ADR 0117's "Reconciled design" overruled that note's
-"no broker change" conclusion: without a distinct `access` value, `booth-database`'s provider
-cannot tell a table-scoped request from a whole-database `readwrite`, and an editor-ceiling
-`apiwrite:` app token could ask for `_rw`.
+Status: **superseded as a to-do, kept as a record.** The coordinator has already applied this
+diff to `booth-architecture`'s real `contracts/credential-broker.md`, with one correction this
+note got wrong below: the `tablewrite` 201 echo nests under `scope.write` (`scope.write: {grant,
+tables, revoked?}`), matching `booth-database` PR #15 (`docs/decisions/0008-table-scoped-
+write-leases.md`) — **not** the flat `{grant, tables}` siblings-of-`workspace` shape this note
+originally showed. That flat form is corrected below; the real contract text in
+`booth-architecture` is authoritative over this file for any future disagreement.
 
-This is the `contracts/credential-broker.md` diff this build needs (booth-core cannot edit
-`booth-architecture` directly — this is handed to the coordinator to apply there).
+Supersedes this repo's earlier `docs/design-app-writes.md` (kept, unedited, on its own branch
+`design-app-writes-broker-rule-adr0117`, per the ADR's own instruction) wherever the two
+disagree — ADR 0117's "Reconciled design" overruled that note's "no broker change" conclusion:
+without a distinct `access` value, `booth-database`'s provider cannot tell a table-scoped
+request from a whole-database `readwrite`, and an editor-ceiling `apiwrite:` app token could ask
+for `_rw`.
 
 ## Diff
 
@@ -83,19 +88,21 @@ logging, never for any further authorization decision").
  field above. No shared vocabulary is imposed across kinds; `s3` and `postgres` are free to
  define their own scope shapes independently, and a future kind does the same.
 +
-+**`postgres`'s `tablewrite` scope shape** (from `booth-database`'s own design note,
-+`docs/design-app-writes.md` §2, verified against its real provider code):
++**`postgres`'s `tablewrite` scope shape** (from `booth-database` PR #15 / `docs/decisions/
++0008-table-scoped-write-leases.md` §1 — the authoritative, as-built shape; this corrects an
++earlier draft of this note that nested `scope.write` in the request but wrongly echoed it back
++flat, as siblings of `workspace`/`database`/`access`, in the response):
 +
 +```
 +access: "tablewrite"
 +scope: {"workspace": "<slug>",                    # optional, as for every other kind
-+        "write": {"grant": "<opaque id, 1-128 chars, e.g. api:<api uuid>>",
++        "write": {"grant": "<id, 1-128 chars, no control characters, e.g. api:<api uuid>>",
 +                  "tables": [{"schema": "finance_input", "name": "transactions",
 +                              "operations": ["insert", "update", "delete"],
 +                              "columns": ["amount", "booked_on", "entered_by"]}]}}
 +options: none
-+201 scope echo: {workspace, database, access, grant,
-+                 tables: [{schema, name, operations, columns, sequences}]}
++201 scope echo: {workspace, database, access,
++                  "write": {grant, tables: [{schema, name, operations, columns, sequences}]}}
 +```
 +
 +`tablewrite` without `scope.write` is refused by the provider (422); so is a `read` or
@@ -106,13 +113,20 @@ logging, never for any further authorization decision").
 +
 +**Revocation shape, and its `credential: null` response.** Turning writes off is one more
 +`tablewrite` request with `scope.write.tables: []`, allowed only together with
-+`options: {"revoke": true}`. The provider answers **201 with `credential: null`** — a genuine
-+success (every live lease for that grant is ended, its privileges revoked), not an incomplete
-+response. The broker relays this exact shape to the caller rather than rejecting it: `callProvider`
-+accepts a null/absent credential only when the request matches this documented revoke shape;
-+every other request (including a non-revoke `tablewrite`) still requires a real credential and
-+still fails loudly (`503`) if a provider omits one — this is a narrow, named exception, not a
-+general relaxation.
++`options: {"revoke": true}`. The provider answers **201** with:
++- `credential: null`;
++- `scope.write.revoked: true` (added to the echo above, so a caller can tell a revoke
++  acknowledgement apart from an ordinary grant echo by shape, not only by having sent the
++  request);
++- a fresh `leaseId`;
++- `expiresAt` set to now, since nothing was actually issued.
++
++This is a genuine success (every live lease for that grant is ended, its privileges revoked),
++not an incomplete response. The broker relays this exact shape to the caller rather than
++rejecting it: `callProvider` accepts a null/absent credential only when the request matches this
++documented revoke shape; every other request (including a non-revoke `tablewrite`) still
++requires a real credential and still fails loudly (`503`) if a provider omits one — this is a
++narrow, named exception, not a general relaxation.
 +
 +**What a caller sees for a `credential: null` 201:** a one-off caller (e.g. `booth-api` turning
 +writes off) simply stops using the lease; there is nothing further to tear down on its side

@@ -68,6 +68,20 @@ var subjectPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9._:-]{1
 // workspacePattern is ADR 0025's workspace slug grammar.
 var workspacePattern = regexp.MustCompile(`^[a-z0-9-]+$`)
 
+// reservedSubjectKinds maps a subject "kind" (the part of "<kind>:<id>" before the colon) to the
+// one module id allowed to mint it, for a kind whose existence alone grants trust some other
+// component relies on. Most subject kinds (job, apikeys, streamlit, ...) are not here at all —
+// any entitled module may still mint any kind absent from this map, exactly as before this was
+// added; this is a targeted restriction for the one kind that currently needs it, not a general
+// subject-namespace scheme every module must now register into.
+var reservedSubjectKinds = map[string]string{
+	// credentialbroker.authorize() lets an apiwrite:-subject token request a table-scoped
+	// write lease a viewer/editor-ranked caller could never otherwise get to (ADR 0117
+	// "Reconciled design" item 3/4) — reserved to booth-api's own module id so a different
+	// module with workloadIdentity.mint can't mint itself the same privilege.
+	"apiwrite": "api",
+}
+
 // Request is the body of POST /api/internal/workload-tokens.
 //
 // Owner is a contract addition to ADR 0056's `{workspace, subject, roleCeiling}`: the ADR says
@@ -193,6 +207,18 @@ func (s *Service) Mint(ctx context.Context, moduleID string, req Request) (Token
 	// AuthenticateModule: cheap, and it keeps this method safe to call on its own.
 	if m, ok := s.modules.Get(moduleID); !ok || m.Spec.WorkloadIdentity == nil || !m.Spec.WorkloadIdentity.Mint {
 		return Token{}, ErrNotEntitled
+	}
+
+	// subjectPattern already confirmed req.Subject is "<kind>:<id>" — reservedSubjectKinds binds
+	// a kind whose very existence grants elevated trust *elsewhere* (today: credentialbroker's
+	// apiwrite: restriction, ADR 0117 reconciled design item 3 — a workload token with that
+	// prefix may request a tablewrite lease the broker would refuse to anyone else) to the one
+	// module id allowed to mint it. Without this, workloadIdentity.mint alone (any entitled
+	// module, with no restriction on which subject *kinds* it mints) would let any other module
+	// holding a minting credential mint its own apiwrite: token and get the same privilege —
+	// the broker's restriction would then be checking a prefix that no longer meant anything.
+	if kind, _, _ := strings.Cut(req.Subject, ":"); reservedSubjectKinds[kind] != "" && reservedSubjectKinds[kind] != moduleID {
+		return Token{}, fmt.Errorf("%w: subject kind %q is reserved for module %q", ErrNotEntitled, kind, reservedSubjectKinds[kind])
 	}
 
 	ownerRole, err := s.ownerRole(ctx, req.Owner, req.Workspace)
