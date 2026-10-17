@@ -380,6 +380,59 @@ func TestMint_GroupsClaimIsShapedLikeAHumanTokens(t *testing.T) {
 	}
 }
 
+// --- ADR 0119: the booth_owner claim. ----------------------------------------------------------
+
+func TestMint_CarriesTheOwnerClaimForAuditAndSparksDataAccessMint(t *testing.T) {
+	f := newFixture(t)
+	f.seen(t, "u-alice", "acme", auth.RoleEditor)
+	tok, err := f.mint("pipeline", req("u-alice", "owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := f.claimsOf(t, tok)
+	if claims[OwnerClaim] != "u-alice" {
+		t.Errorf("%s = %v, want the verified owner %q", OwnerClaim, claims[OwnerClaim], "u-alice")
+	}
+}
+
+// Forward-looking: ADR 0120 lets Owner be a service-account id (`svc:<workspace>:<name>`), not
+// only a person's sub. Mint/the claim must not assume either shape — they already don't, since
+// Owner is carried through as an opaque string — this pins that the claim's value is always
+// exactly req.Owner, whatever it looks like, so ADR 0120's build doesn't have to touch this path.
+func TestMint_OwnerClaimIsOpaqueToItsShape(t *testing.T) {
+	f := newFixture(t)
+	f.seen(t, "svc:acme:nfl-bot", "acme", auth.RoleEditor)
+	tok, err := f.mint("pipeline", req("svc:acme:nfl-bot", "owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := f.claimsOf(t, tok)
+	if claims[OwnerClaim] != "svc:acme:nfl-bot" {
+		t.Errorf("%s = %v, want %q", OwnerClaim, claims[OwnerClaim], "svc:acme:nfl-bot")
+	}
+}
+
+// A human token never passes through Mint at all — it comes from the deployment's own OIDC
+// provider — so there is structurally nothing to gate for "absent on human tokens". What's worth
+// pinning instead is that Verify, the one place a workload token's claims become auth.Claims for
+// core's own use, never surfaces the owner as anything resembling an identity: auth.Claims has no
+// field for it, and Subject stays the run.
+func TestVerify_NeverTreatsTheOwnerClaimAsTheCallersIdentity(t *testing.T) {
+	f := newFixture(t)
+	f.seen(t, "u-alice", "acme", auth.RoleOwner)
+	tok, err := f.mint("pipeline", req("u-alice", "owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims, err := f.svc.Verify(context.Background(), tok.JWT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.Subject != "job:42" {
+		t.Errorf("Subject = %q, want the run, not the owner", claims.Subject)
+	}
+}
+
 func TestMint_HonoursTheConfiguredGroupsClaimName(t *testing.T) {
 	f := newFixture(t)
 	f.svc = NewService(f.keys, f.reg, f.users, Options{Issuer: issuer, GroupsClaim: "roles", Now: func() time.Time { return f.now }})
