@@ -4,6 +4,15 @@ No code in this note — every claim below is grounded in the real files named, 
 `master` (`a562691`). Sent for review before building, per both ADRs' "do not implement
 until the user has accepted" gate (both are now **accepted**, 2026-10-16).
 
+**Status update, 2026-10-16 (post-build):** Part A shipped and released (`v0.3.6`, merge
+`b415e56`) exactly as designed below. Part B is built against the five coordinator rulings
+(workspace check required; no in-memory fallback; owner-only assignment is Pipeline's own check;
+shell UI is booth-design's; no usage registry — disable-before-delete instead), superseding B6's
+two-option framing below. A further round, booth-pipeline's design-note asks with coordinator
+rulings (ADR 0119 amendment 3), changed B2's error shape and B4's read ACL again — see the
+**Addendum, 2026-10-16: pipeline's asks** at the end, which is authoritative over the body text it
+touches. The body below is kept as the original pre-build proposal, for the reasoning trail.
+
 ## Part A — `booth_owner` claim on workload tokens (ADR 0119 item 1)
 
 This is a small, contained change. `workload.Service.Mint` (`internal/workload/service.go:201-268`)
@@ -303,3 +312,118 @@ exist. The shell UI (B5) is out of this repo's scope and can proceed in parallel
 are confirmed.
 
 Not building anything until you say which of the B1/B6 options to take.
+
+---
+
+## Addendum, 2026-10-16: pipeline's asks (ADR 0119 amendment 3) and route shapes
+
+Read `agent-briefs/core.md`'s "Pipeline's asks, with rulings (ADR 0119 amendment 3)" entry and
+ADR 0119 amendment 3 in full. This supersedes B2's error shape, B4's read routes, and B6 below
+(the usage registry is dropped, confirmed). Everything else in Parts A/B stands as built.
+
+### C5 — `booth_module` confirmed, exact string for booth-pipeline
+
+`Mint` (`internal/workload/service.go`) sets `ModuleClaim: moduleID` unconditionally in the one
+`extra` claims map every mint builds — there is no branch, person-owned or service-account-owned,
+that can skip it. Confirmed by reading the code (no change needed) and pinned by a new test,
+`TestMint_ModuleClaimIsSetRegardlessOfOwnerKind`, covering the service-account-owner path the
+original tests didn't exercise.
+
+**booth-pipeline's exact module id is `pipeline`** — read directly from
+`booth-pipeline/charts/booth-pipeline/templates/boothmodule.yaml:16` (`spec.id: pipeline`), the
+only thing core's registry reads to know a module's identity (ADR 0019). Spark should trust
+`booth_module == "pipeline"`, not any subject-kind prefix, per amendment 3 point 1.
+
+Also confirmed, not a core concern to act on: booth-pipeline's new subject form
+`pipeline:<workspace>:<runId>` (amendment 3 point 1) already matches `subjectPattern`
+(`^[a-z][a-z0-9-]{0,31}:[A-Za-z0-9._:-]{1,200}$`) — the kind is `pipeline`, and the id half
+(`<workspace>:<runId>`) is free to contain colons. No core change needed for this move.
+
+### C2 — Machine-readable refusal codes, exactly two causes
+
+Built. New sentinel `ErrServiceAccountNotFound` (distinct from `ErrOwnerNoAccess`) covers every
+svc:-owner resolution failure that isn't "disabled" — unknown name, malformed owner string, or a
+mismatched embedded workspace all collapse into it, since (per amendment 3 point 5) there's
+nothing left to probe: any workspace member can already see the account list. `ErrOwnerNoAccess`
+is now documented as person-owner-only; module-not-entitled (`ErrNotEntitled`) is unaffected and
+stays the same indistinguishable 403.
+
+A new `workload.RefusalCode(err) (code string, ok bool)` is the single place that decides which
+two causes get a code; `internal/api/workload.go`'s `mintError` calls it and only switches to a
+JSON body when `ok`:
+
+```
+403 { "error": "the named service account is disabled", "code": "service_account_disabled" }
+403 { "error": "no such service account in that workspace", "code": "service_account_not_found" }
+```
+
+Every other refusal (`ErrOwnerNoAccess`, `ErrNotEntitled`, `ErrInvalidRequest`, `ErrUnavailable`)
+is unchanged: plain `http.Error` text, no `code` field, no change in status code.
+
+### C3 — Read shapes through core's existing API, no gateway change
+
+"Readable through the gateway" doesn't need any gateway code: it's the same path `GET /api/users`
+already uses today for a module needing to resolve a display name — a module's own frontend or
+backend presents whatever bearer token it already holds (the human's, forwarded) straight to
+core's `/api/*` surface, no proxy hop, no new trust mechanism. Built:
+
+- **`GET /api/service-accounts`** — now **owner-only** (`requireAdmin`, changed from the original
+  B4 draft's "any member"). Full detail: `{id, name, role, description, disabled, createdBy,
+  createdAt}` per account, array body. This is the picker a workspace owner uses to assign an
+  account to a pipeline.
+- **`GET /api/service-accounts/{name}`** — any workspace member, **unchanged ACL**, but now
+  returns a trimmed badge instead of the full view: `{name, role, disabled}`. Enough for
+  booth-pipeline to render an "owner disabled" state without exposing `description`/`createdBy`/
+  `createdAt` to every member.
+- `POST`/`PATCH`/`DELETE` are unchanged from the original B4 draft (owner-only, same bodies).
+
+### C4 — usage registry dropped, confirmed
+
+B6's two-option framing is moot: no usage registry, no bulk replace, no delete-in-use refusal.
+Disable-before-delete (already built, `serviceaccount.ErrMustDisableBeforeDelete`) is the whole
+mechanism. Pipeline shows which of its own pipelines name each account in its own UI — core holds
+no record of that relationship at all, by design.
+
+### Route shapes, for booth-design and booth-pipeline
+
+```
+GET  /api/service-accounts                 owner-only
+     -> 200 [ { "id": "svc:acme:nfl-bot", "name": "nfl-bot", "role": "editor",
+                "description": "...", "disabled": false,
+                "createdBy": "<sub>", "createdAt": "2026-10-16T00:00:00Z" }, ... ]
+
+GET  /api/service-accounts/{name}          any member
+     -> 200 { "name": "nfl-bot", "role": "editor", "disabled": false }
+     -> 404 if no such account in the caller's workspace
+
+POST /api/service-accounts                 owner-only
+     body { "name": "nfl-bot", "role": "editor", "description": "..." }
+     -> 201 (full view, same shape as the list's array entries)
+     -> 400 invalid name/role (role must be "viewer" or "editor", never "owner")
+     -> 409 { "error": "..." } plain text, name already taken in this workspace
+
+PATCH /api/service-accounts/{name}         owner-only
+     body { "role"?, "description"?, "disabled"? }  -- all optional, omit to leave unchanged
+     -> 200 (full view)
+     -> 404 no such account
+
+DELETE /api/service-accounts/{name}        owner-only
+     -> 204
+     -> 404 no such account
+     -> 409 plain text, must be disabled first (PATCH disabled:true, then DELETE)
+```
+
+```
+POST /api/internal/workload-tokens          booth-pipeline's existing mint call, unchanged shape
+     body { workspace, subject, roleCeiling, owner }
+     owner is a person's sub OR "svc:<workspace>:<name>" — opaque to Pipeline either way
+     -> 200 { token, tokenType, expiresAt, role }
+     -> 403 plain text — person owner has no access, or module not entitled (unchanged, no code)
+     -> 403 { "error": "...", "code": "service_account_disabled" }
+     -> 403 { "error": "...", "code": "service_account_not_found" }
+     -> 400 / 503 unchanged
+```
+
+Pipeline's refusal-message text (amendment 3 point 5, "one corrected text pointing to Take over or
+a service account") is Pipeline's own job from the plain-403 case — core deliberately gives it
+nothing more specific than the two codes above to key off of.
