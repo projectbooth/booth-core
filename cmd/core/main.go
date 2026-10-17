@@ -36,6 +36,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/lifecycle"
 	"github.com/projectbooth/booth-core/internal/natsauth"
 	"github.com/projectbooth/booth-core/internal/registry"
+	"github.com/projectbooth/booth-core/internal/serviceaccount"
 	"github.com/projectbooth/booth-core/internal/tlsprov"
 	"github.com/projectbooth/booth-core/internal/workload"
 )
@@ -308,6 +309,14 @@ func run() error {
 	// has for the user directory).
 	audit := credentialbroker.NewSwitchable(credentialbroker.NewMemoryStore())
 
+	// Service accounts (ADR 0120): unlike the two Switchables above, this one starts on
+	// serviceaccount.Unavailable{}, never an in-memory store — a service account is an explicit,
+	// owner-authored role grant, not an opportunistic cache entry, so losing one (or having one
+	// reappear un-disabled) across a later swap would be a real bug, not a degraded mode. Every
+	// service-account route and every `svc:`-owner mint 503s until this is swapped to a real,
+	// persistent store below. See internal/serviceaccount's package doc comment.
+	serviceAccounts := serviceaccount.NewSwitchable(serviceaccount.Unavailable{})
+
 	switch {
 	case cfg.PostgresDSN != "":
 		pg, err := directory.NewPostgresStore(ctx, cfg.PostgresDSN)
@@ -335,12 +344,24 @@ func run() error {
 			return fmt.Errorf("connecting to the credential-broker audit database: %w", err)
 		}
 		audit.Swap(auditPg)
-		log.Print("user directory and credential-broker audit trail: using the database from BOOTH_POSTGRES_DSN")
+		svcAcctPg, err := serviceaccount.NewPostgresStore(ctx, cfg.PostgresDSN)
+		if err != nil {
+			return fmt.Errorf("configuring service accounts: %w", err)
+		}
+		defer svcAcctPg.Close()
+		if err := dbwait.Retry(ctx, "connecting to the service-accounts database", dbwait.DefaultMaxElapsed, func() error {
+			return svcAcctPg.Ping(ctx)
+		}); err != nil {
+			return fmt.Errorf("connecting to the service-accounts database: %w", err)
+		}
+		serviceAccounts.Swap(svcAcctPg)
+		log.Print("user directory, credential-broker audit trail and service accounts: using the database from BOOTH_POSTGRES_DSN")
 	case dbProv != nil:
-		go persistCoreDatabase(ctx, dbProv, cfg.KubeNamespace, users, recorder, audit)
+		go persistCoreDatabase(ctx, dbProv, cfg.KubeNamespace, users, recorder, audit, serviceAccounts)
 	default:
 		log.Print("no database is configured (BOOTH_POSTGRES_DSN / BOOTH_POSTGRES_HOST); the user directory and the " +
-			"credential-broker audit trail are in-memory and will be empty after a restart (ADR 0047, ADR 0080)")
+			"credential-broker audit trail are in-memory and will be empty after a restart (ADR 0047, ADR 0080); " +
+			"service accounts (ADR 0120) are unavailable (503) for as long as this is true")
 	}
 
 	// Event bus: NATS/JetStream (ADR 0021). Connected in the background: NATS may not be
@@ -357,7 +378,7 @@ func run() error {
 
 	var workloadSvc *workload.Service
 	if workloadKeys != nil {
-		workloadSvc = workload.NewService(workloadKeys, reg, users, workload.Options{
+		workloadSvc = workload.NewService(workloadKeys, reg, users, serviceAccounts, workload.Options{
 			Issuer:      cfg.Workload.IssuerURL,
 			Audience:    cfg.OIDC.ClientID,
 			GroupsClaim: cfg.OIDC.GroupsClaim,
@@ -401,6 +422,7 @@ func run() error {
 		Workload:          workloadSvc,
 		IframeIdentity:    iframeIdentitySvc,
 		CredentialBroker:  credentialBrokerSvc,
+		ServiceAccounts:   serviceAccounts,
 
 		// ADR 0113: every module installed through the install API gets these as defaults,
 		// per its own identity-keys annotation. Derived straight from this same process's
@@ -575,10 +597,12 @@ func newScheme() (*runtime.Scheme, error) {
 	return scheme, nil
 }
 
-// persistCoreDatabase provisions core's own database and switches both the user directory and
-// the credential-broker audit trail onto it, retrying with backoff until the server is reachable
-// (the bundled one may still be starting).
-func persistCoreDatabase(ctx context.Context, p *dbprov.Provisioner, namespace string, users *directory.Switchable, recorder *directory.Recorder, audit *credentialbroker.Switchable) {
+// persistCoreDatabase provisions core's own database and switches the user directory, the
+// credential-broker audit trail and the service-accounts store onto it, retrying with backoff
+// until the server is reachable (the bundled one may still be starting). Service accounts (ADR
+// 0120) 503 on every call until this succeeds — see serviceAccounts' construction above for why
+// there is no in-memory stand-in for them the way there is for the other two.
+func persistCoreDatabase(ctx context.Context, p *dbprov.Provisioner, namespace string, users *directory.Switchable, recorder *directory.Recorder, audit *credentialbroker.Switchable, serviceAccounts *serviceaccount.Switchable) {
 	const maxBackoff = 30 * time.Second
 	backoff := time.Second
 	for {
@@ -586,16 +610,22 @@ func persistCoreDatabase(ctx context.Context, p *dbprov.Provisioner, namespace s
 		if err == nil {
 			var pg *directory.PostgresStore
 			var auditPg *credentialbroker.PostgresStore
+			var svcAcctPg *serviceaccount.PostgresStore
 			if pg, err = directory.NewPostgresStore(ctx, dsn); err == nil {
 				if auditPg, err = credentialbroker.NewPostgresStore(ctx, dsn); err == nil {
-					users.Swap(pg)
-					recorder.Reset() // the new store is empty; re-record users on their next request
-					audit.Swap(auditPg)
-					log.Print("user directory and credential-broker audit trail are now persistent (core database provisioned)")
-					<-ctx.Done()
-					pg.Close()
+					if svcAcctPg, err = serviceaccount.NewPostgresStore(ctx, dsn); err == nil {
+						users.Swap(pg)
+						recorder.Reset() // the new store is empty; re-record users on their next request
+						audit.Swap(auditPg)
+						serviceAccounts.Swap(svcAcctPg)
+						log.Print("user directory, credential-broker audit trail and service accounts are now persistent (core database provisioned)")
+						<-ctx.Done()
+						pg.Close()
+						auditPg.Close()
+						svcAcctPg.Close()
+						return
+					}
 					auditPg.Close()
-					return
 				}
 				pg.Close()
 			}

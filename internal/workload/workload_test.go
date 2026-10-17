@@ -26,6 +26,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/auth"
 	"github.com/projectbooth/booth-core/internal/directory"
 	"github.com/projectbooth/booth-core/internal/registry"
+	"github.com/projectbooth/booth-core/internal/serviceaccount"
 )
 
 const issuer = "http://booth-core.booth-system.svc.cluster.local:8080"
@@ -65,14 +66,64 @@ func (a *agingStore) Get(ctx context.Context, sub, workspace string) (directory.
 	return u, ok, err
 }
 
+// fakeServiceAccounts is a minimal map-backed serviceaccount.Store for tests. It is not a
+// production in-memory fallback (internal/serviceaccount deliberately has none — see its package
+// doc comment); it exists only so this package's own tests can exercise ownerRole's `svc:` branch
+// without a real Postgres.
+type fakeServiceAccounts struct {
+	accounts map[string]serviceaccount.Account // key: workspace + "\x00" + name
+}
+
+func newFakeServiceAccounts() *fakeServiceAccounts {
+	return &fakeServiceAccounts{accounts: map[string]serviceaccount.Account{}}
+}
+
+func (f *fakeServiceAccounts) key(workspace, name string) string { return workspace + "\x00" + name }
+
+func (f *fakeServiceAccounts) put(a serviceaccount.Account) {
+	f.accounts[f.key(a.Workspace, a.Name)] = a
+}
+
+func (f *fakeServiceAccounts) Create(_ context.Context, a serviceaccount.Account) error {
+	f.put(a)
+	return nil
+}
+
+func (f *fakeServiceAccounts) Get(_ context.Context, workspace, name string) (serviceaccount.Account, bool, error) {
+	a, ok := f.accounts[f.key(workspace, name)]
+	return a, ok, nil
+}
+
+func (f *fakeServiceAccounts) List(context.Context, string) ([]serviceaccount.Account, error) {
+	return nil, nil
+}
+
+func (f *fakeServiceAccounts) Update(_ context.Context, workspace, name string, patch serviceaccount.Patch) (serviceaccount.Account, error) {
+	a, ok := f.accounts[f.key(workspace, name)]
+	if !ok {
+		return serviceaccount.Account{}, serviceaccount.ErrNotFound
+	}
+	if patch.Disabled != nil {
+		a.Disabled = *patch.Disabled
+	}
+	f.put(a)
+	return a, nil
+}
+
+func (f *fakeServiceAccounts) Delete(_ context.Context, workspace, name string) error {
+	delete(f.accounts, f.key(workspace, name))
+	return nil
+}
+
 // fixture is a Service over a real registry and a real (memory) directory, with a movable clock.
 type fixture struct {
-	svc   *Service
-	keys  *Keys
-	reg   *registry.Registry
-	users *directory.MemoryStore
-	aged  *agingStore
-	now   time.Time
+	svc             *Service
+	keys            *Keys
+	reg             *registry.Registry
+	users           *directory.MemoryStore
+	aged            *agingStore
+	serviceAccounts *fakeServiceAccounts
+	now             time.Time
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -81,9 +132,12 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fixture{keys: keys, reg: registry.New(), users: directory.NewMemoryStore(), now: time.Now()}
+	f := &fixture{
+		keys: keys, reg: registry.New(), users: directory.NewMemoryStore(),
+		serviceAccounts: newFakeServiceAccounts(), now: time.Now(),
+	}
 	f.aged = &agingStore{Store: f.users}
-	f.svc = NewService(keys, f.reg, f.aged, Options{
+	f.svc = NewService(keys, f.reg, f.aged, f.serviceAccounts, Options{
 		Issuer: issuer, Audience: "booth-ui", GroupsClaim: "groups",
 		Now: func() time.Time { return f.now },
 	})
@@ -334,6 +388,147 @@ func TestMint_OwnerNotSeenWithinMaxAgeLosesTheirRole(t *testing.T) {
 	}
 }
 
+// --- ADR 0120: owner = a service account (svc:<workspace>:<name>). -----------------------------
+
+func TestMint_ServiceAccountOwnerGrantsItsStoredRoleWithNoRecencyWindow(t *testing.T) {
+	f := newFixture(t)
+	f.serviceAccounts.put(serviceaccount.Account{Workspace: "acme", Name: "nfl-bot", Role: auth.RoleEditor})
+
+	// No f.seen call at all — a service account has no "last seen" and consults no MaxOwnerAge
+	// window (ADR 0120 #2), unlike every person-owner test above.
+	tok, err := f.mint("pipeline", req("svc:acme:nfl-bot", "owner"))
+	if err != nil {
+		t.Fatalf("mint with a service-account owner: %v", err)
+	}
+	if tok.Role != auth.RoleEditor {
+		t.Errorf("Role = %q, want the account's own role %q", tok.Role, auth.RoleEditor)
+	}
+}
+
+// booth-pipeline's design note (ADR 0119 amendment 3, point 1) has Spark trust the signed
+// booth_module claim, not any subject prefix, to tell a pipeline-submitted run apart from a run's
+// own token acting on its own behalf. That only works if the claim is unconditionally present on
+// every mint, person-owned or service-account-owned alike — pinned here for the latter, since the
+// pre-ADR-0120 tests above already cover a person owner.
+func TestMint_ModuleClaimIsSetRegardlessOfOwnerKind(t *testing.T) {
+	f := newFixture(t)
+	f.serviceAccounts.put(serviceaccount.Account{Workspace: "acme", Name: "nfl-bot", Role: auth.RoleEditor})
+	tok, err := f.mint("pipeline", req("svc:acme:nfl-bot", "owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claims := f.claimsOf(t, tok)
+	if claims[ModuleClaim] != "pipeline" {
+		t.Errorf("%s = %v, want %q", ModuleClaim, claims[ModuleClaim], "pipeline")
+	}
+}
+
+func TestMint_ServiceAccountOwnerIsStillCappedByTheRoleCeiling(t *testing.T) {
+	f := newFixture(t)
+	f.serviceAccounts.put(serviceaccount.Account{Workspace: "acme", Name: "nfl-bot", Role: auth.RoleEditor})
+	tok, err := f.mint("pipeline", req("svc:acme:nfl-bot", "viewer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok.Role != auth.RoleViewer {
+		t.Errorf("Role = %q, want the lesser of the ceiling and the account's role (%q)", tok.Role, auth.RoleViewer)
+	}
+}
+
+func TestMint_DisabledServiceAccountRefusesWithASpecificError(t *testing.T) {
+	f := newFixture(t)
+	f.serviceAccounts.put(serviceaccount.Account{Workspace: "acme", Name: "nfl-bot", Role: auth.RoleEditor, Disabled: true})
+	_, err := f.mint("pipeline", req("svc:acme:nfl-bot", "owner"))
+	if !errors.Is(err, ErrServiceAccountDisabled) {
+		t.Fatalf("mint for a disabled service account = %v, want ErrServiceAccountDisabled", err)
+	}
+	// Deliberately distinct from the vague ErrOwnerNoAccess (ADR 0120 addendum point 5: a module
+	// like booth-pipeline needs to surface *why* in its own run status, not just refuse silently).
+	if errors.Is(err, ErrOwnerNoAccess) {
+		t.Errorf("ErrServiceAccountDisabled must not also satisfy errors.Is(_, ErrOwnerNoAccess): %v", err)
+	}
+	if code, ok := RefusalCode(err); !ok || code != "service_account_disabled" {
+		t.Errorf("RefusalCode(err) = %q, %v, want %q, true", code, ok, "service_account_disabled")
+	}
+}
+
+// Unlike an unknown *person* owner (ErrOwnerNoAccess, deliberately vague), an unknown service
+// account gets its own distinct, machine-readable cause (ADR 0119 amendment 3 point 5): any
+// workspace member can already see the account list, so there is nothing left to probe by being
+// specific here.
+func TestMint_UnknownServiceAccountRefusesWithASpecificError(t *testing.T) {
+	f := newFixture(t)
+	_, err := f.mint("pipeline", req("svc:acme:nope", "owner"))
+	if !errors.Is(err, ErrServiceAccountNotFound) {
+		t.Fatalf("mint for an unknown service account = %v, want ErrServiceAccountNotFound", err)
+	}
+	if code, ok := RefusalCode(err); !ok || code != "service_account_not_found" {
+		t.Errorf("RefusalCode(err) = %q, %v, want %q, true", code, ok, "service_account_not_found")
+	}
+}
+
+// A service account is workspace-scoped (ADR 0120 #6). The lookup is always keyed on the mint
+// request's own workspace, never on the owner string's embedded one, so an owner string naming a
+// different workspace can never actually be resolved against that other workspace's account
+// either way (see serviceAccountRole's comment) — but it must still be refused explicitly, as a
+// clear "this owner string is inconsistent" rather than an accidental "lookup happened to miss".
+func TestMint_ServiceAccountOwnerStringNamingAnotherWorkspaceIsRefused(t *testing.T) {
+	f := newFixture(t)
+	f.serviceAccounts.put(serviceaccount.Account{Workspace: "labs", Name: "nfl-bot", Role: auth.RoleEditor})
+	_, err := f.mint("pipeline", req("svc:labs:nfl-bot", "owner")) // req()'s workspace is "acme"
+	if !errors.Is(err, ErrServiceAccountNotFound) {
+		t.Fatalf("mint naming another workspace's account = %v, want ErrServiceAccountNotFound", err)
+	}
+}
+
+func TestMint_MalformedServiceAccountOwnerRefusesRatherThanPanics(t *testing.T) {
+	f := newFixture(t)
+	for _, owner := range []string{"svc:", "svc:acme", "svc::nfl-bot", "svc:acme:"} {
+		if _, err := f.mint("pipeline", req(owner, "owner")); !errors.Is(err, ErrServiceAccountNotFound) {
+			t.Errorf("owner %q: mint = %v, want ErrServiceAccountNotFound", owner, err)
+		}
+	}
+}
+
+// RefusalCode must stay silent (no code at all) for every refusal that isn't one of the two
+// service-account causes — the anti-probing rule (ADR 0058) for a person owner and for module
+// entitlement is unchanged by any of this.
+func TestRefusalCode_OnlyTheTwoServiceAccountCausesGetOne(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code string
+		ok   bool
+	}{
+		{"disabled service account", ErrServiceAccountDisabled, "service_account_disabled", true},
+		{"unknown service account", ErrServiceAccountNotFound, "service_account_not_found", true},
+		{"person owner, no access", ErrOwnerNoAccess, "", false},
+		{"module not entitled", ErrNotEntitled, "", false},
+		{"unavailable", ErrUnavailable, "", false},
+		{"nil", nil, "", false},
+	}
+	for _, c := range cases {
+		code, ok := RefusalCode(c.err)
+		if code != c.code || ok != c.ok {
+			t.Errorf("%s: RefusalCode = %q, %v, want %q, %v", c.name, code, ok, c.code, c.ok)
+		}
+	}
+}
+
+// When no real store exists yet (no database, or core's own database still provisioning — ADR
+// 0120 addendum point 2), every `svc:`-owner mint 503s rather than ever answering 403 from an
+// empty store (which would be indistinguishable from "that account doesn't exist").
+func TestMint_ServiceAccountMintIsUnavailableNotRefusedWhenTheStoreIsNotReady(t *testing.T) {
+	f := newFixture(t)
+	f.svc = NewService(f.keys, f.reg, f.aged, serviceaccount.Unavailable{}, Options{
+		Issuer: issuer, Audience: "booth-ui", GroupsClaim: "groups", Now: func() time.Time { return f.now },
+	})
+	_, err := f.svc.Mint(context.Background(), "pipeline", req("svc:acme:nfl-bot", "owner"))
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("mint against an unready store = %v, want ErrUnavailable", err)
+	}
+}
+
 // --- Token shape. -----------------------------------------------------------------------------
 
 // The groups claim is the whole reason no other module needs new authorization code: it must
@@ -401,7 +596,7 @@ func TestMint_CarriesTheOwnerClaimForAuditAndSparksDataAccessMint(t *testing.T) 
 // exactly req.Owner, whatever it looks like, so ADR 0120's build doesn't have to touch this path.
 func TestMint_OwnerClaimIsOpaqueToItsShape(t *testing.T) {
 	f := newFixture(t)
-	f.seen(t, "svc:acme:nfl-bot", "acme", auth.RoleEditor)
+	f.serviceAccounts.put(serviceaccount.Account{Workspace: "acme", Name: "nfl-bot", Role: auth.RoleEditor})
 	tok, err := f.mint("pipeline", req("svc:acme:nfl-bot", "owner"))
 	if err != nil {
 		t.Fatal(err)
@@ -435,7 +630,7 @@ func TestVerify_NeverTreatsTheOwnerClaimAsTheCallersIdentity(t *testing.T) {
 
 func TestMint_HonoursTheConfiguredGroupsClaimName(t *testing.T) {
 	f := newFixture(t)
-	f.svc = NewService(f.keys, f.reg, f.users, Options{Issuer: issuer, GroupsClaim: "roles", Now: func() time.Time { return f.now }})
+	f.svc = NewService(f.keys, f.reg, f.users, f.serviceAccounts, Options{Issuer: issuer, GroupsClaim: "roles", Now: func() time.Time { return f.now }})
 	f.seen(t, "u-alice", "acme", auth.RoleViewer)
 	tok, err := f.mint("pipeline", req("u-alice", "viewer"))
 	if err != nil {

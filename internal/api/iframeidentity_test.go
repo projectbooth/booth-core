@@ -9,6 +9,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/directory"
 	"github.com/projectbooth/booth-core/internal/iframeidentity"
 	"github.com/projectbooth/booth-core/internal/registry"
+	"github.com/projectbooth/booth-core/internal/serviceaccount"
 	"github.com/projectbooth/booth-core/internal/workload"
 )
 
@@ -77,7 +78,7 @@ func TestIframeIdentityAndWorkloadIssuersAreIndependent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workloadSvc := workload.NewService(workloadKeys, registry.New(), directory.NewMemoryStore(), workload.Options{Issuer: base, Audience: "c", GroupsClaim: "groups"})
+	workloadSvc := workload.NewService(workloadKeys, registry.New(), directory.NewMemoryStore(), serviceaccount.Unavailable{}, workload.Options{Issuer: base, Audience: "c", GroupsClaim: "groups"})
 	iframeSvc := newIframeIdentityService(t, base+iframeidentity.RoutePrefix)
 
 	router := routerWith(t, idp, func(d *Deps) { d.Workload = workloadSvc; d.IframeIdentity = iframeSvc })
