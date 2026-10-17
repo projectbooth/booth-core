@@ -40,6 +40,16 @@ const (
 	// ModuleClaim names, in the minted token, the module that requested it. Audit only: it lets a
 	// downstream log say "pipeline's run job:42", not just "job:42".
 	ModuleClaim = "booth_module"
+
+	// OwnerClaim carries the run's owner (a person's `sub`, or, once ADR 0120 ships, a service
+	// account id `svc:<workspace>:<name>`) on a minted workload token — the same value Mint just
+	// verified in Request.Owner (ADR 0119). It exists for audit and for one documented consumer
+	// (booth-spark, which mints its own data-access token with this as the owner, ADR 0119 item
+	// 2): every other module must ignore it. `sub` still names only the run — this claim is never
+	// an identity, never checked by Mint or Verify, and is not present on any token this package
+	// didn't mint (a human's token comes from the deployment's OIDC provider and never passes
+	// through Mint at all, so there is nothing here to gate for that case).
+	OwnerClaim = "booth_owner"
 )
 
 var (
@@ -254,6 +264,7 @@ func (s *Service) Mint(ctx context.Context, moduleID string, req Request) (Token
 	extra := map[string]any{
 		s.opts.GroupsClaim: []string{fmt.Sprintf("/workspaces/%s/%s", req.Workspace, role)},
 		ModuleClaim:        moduleID,
+		OwnerClaim:         req.Owner,
 	}
 	raw, err := jwt.Signed(signer).Claims(claims).Claims(extra).Serialize()
 	if err != nil {
