@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -19,6 +20,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/iframeidentity"
 	"github.com/projectbooth/booth-core/internal/lifecycle"
 	"github.com/projectbooth/booth-core/internal/registry"
+	"github.com/projectbooth/booth-core/internal/serviceaccount"
 	"github.com/projectbooth/booth-core/internal/workload"
 )
 
@@ -57,6 +59,12 @@ type Deps struct {
 	// zero-value IdentitySettings merges nothing in — every field empty is a valid, if unusual,
 	// deployment state (e.g. no OIDC configured yet), not an error.
 	IdentityKeys lifecycle.IdentitySettings
+
+	// ServiceAccounts serves /api/service-accounts (ADR 0120). Optional: nil disables the routes.
+	// cmd/core always supplies one — serviceaccount.Unavailable{} (via a Switchable) while no real,
+	// persistent store exists yet, so the routes exist and 503 rather than 404 in that window; see
+	// internal/serviceaccount's package doc comment for why there is no in-memory stand-in.
+	ServiceAccounts serviceaccount.Store
 }
 
 // NewRouter builds booth-core's full HTTP router.
@@ -110,6 +118,20 @@ func NewRouter(deps Deps) http.Handler {
 		r.Get("/api/modules/{id}/iframe-url", handleIframeURL(deps.IframeURLs))
 		r.Post("/api/modules/{id}/install", requireAdmin(handleInstallModule(deps.IdentityKeys)))
 		r.Delete("/api/modules/{id}", requireAdmin(handleUninstallModule))
+
+		// Service accounts (ADR 0120, shapes per ADR 0119 amendment 3 point 5). The full list
+		// (role, description, disabled, ...) is owner-only — the picker a workspace owner uses to
+		// assign an account to a pipeline. A single account's trimmed {name, role, disabled}
+		// badge is open to any member, e.g. for booth-pipeline to show "owner disabled" without
+		// exposing the rest to every member. Create/edit/disable/delete stay owner-only, same as
+		// install/uninstall above.
+		if deps.ServiceAccounts != nil {
+			r.Get("/api/service-accounts", requireAdmin(handleListServiceAccounts(deps.ServiceAccounts)))
+			r.Get("/api/service-accounts/{name}", handleGetServiceAccount(deps.ServiceAccounts))
+			r.Post("/api/service-accounts", requireAdmin(handleCreateServiceAccount(deps.ServiceAccounts, time.Now)))
+			r.Patch("/api/service-accounts/{name}", requireAdmin(handlePatchServiceAccount(deps.ServiceAccounts)))
+			r.Delete("/api/service-accounts/{name}", requireAdmin(handleDeleteServiceAccount(deps.ServiceAccounts)))
+		}
 	})
 
 	// ADR 0101: a module's own declared public route prefixes, proxied with NO authentication at

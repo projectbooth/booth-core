@@ -18,6 +18,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/directory"
 	"github.com/projectbooth/booth-core/internal/gateway"
 	"github.com/projectbooth/booth-core/internal/registry"
+	"github.com/projectbooth/booth-core/internal/serviceaccount"
 	"github.com/projectbooth/booth-core/internal/workload"
 )
 
@@ -56,7 +57,7 @@ func newCoreIssuer(t *testing.T) *coreIssuer {
 
 	// The same wiring cmd/core does: the recorder feeds the directory from verified tokens.
 	recorder := directory.NewRecorder(c.users)
-	svc := workload.NewService(keys, c.reg, c.users, workload.Options{
+	svc := workload.NewService(keys, c.reg, c.users, serviceaccount.Unavailable{}, workload.Options{
 		Issuer: c.url, Audience: "c", GroupsClaim: "groups", Now: func() time.Time { return c.now() },
 	})
 	c.svc = svc
@@ -386,5 +387,72 @@ func TestRouter_WithoutWorkloadIdentityExposesNothing(t *testing.T) {
 				t.Errorf("%s %s = 200 with workload identity off", method, path)
 			}
 		}
+	}
+}
+
+// --- mintError: machine-readable codes only for the two service-account causes (ADR 0119
+// amendment 3 point 5). ------------------------------------------------------------------------
+
+func TestMintError_ServiceAccountCausesCarryAMachineReadableCode(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code string
+	}{
+		{"disabled", workload.ErrServiceAccountDisabled, "service_account_disabled"},
+		{"not found", workload.ErrServiceAccountNotFound, "service_account_not_found"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			mintError(rec, c.err)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403", rec.Code)
+			}
+			var body struct {
+				Error string `json:"error"`
+				Code  string `json:"code"`
+			}
+			if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+				t.Fatalf("body not JSON (%q): %v", rec.Body.String(), err)
+			}
+			if body.Code != c.code {
+				t.Errorf("code = %q, want %q", body.Code, c.code)
+			}
+			if body.Error == "" {
+				t.Error("error text is empty")
+			}
+		})
+	}
+}
+
+// Every other refusal stays a plain-text 403/other status with no `code` field at all — the
+// anti-probing rule for a person owner and for module entitlement is unchanged.
+func TestMintError_EveryOtherCauseStaysPlainText(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{"owner no access", workload.ErrOwnerNoAccess, http.StatusForbidden},
+		{"not entitled", workload.ErrNotEntitled, http.StatusForbidden},
+		{"invalid request", workload.ErrInvalidRequest, http.StatusBadRequest},
+		{"unavailable", workload.ErrUnavailable, http.StatusServiceUnavailable},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			mintError(rec, c.err)
+			if rec.Code != c.status {
+				t.Fatalf("status = %d, want %d", rec.Code, c.status)
+			}
+			if ct := rec.Header().Get("Content-Type"); ct == "application/json" {
+				t.Errorf("Content-Type = %q, want plain text (no machine-readable code for this cause)", ct)
+			}
+			var probe map[string]any
+			if json.Unmarshal(rec.Body.Bytes(), &probe) == nil {
+				t.Errorf("body parses as JSON (%q), want plain text", rec.Body.String())
+			}
+		})
 	}
 }

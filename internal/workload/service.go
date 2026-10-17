@@ -17,6 +17,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/auth"
 	"github.com/projectbooth/booth-core/internal/directory"
 	"github.com/projectbooth/booth-core/internal/registry"
+	"github.com/projectbooth/booth-core/internal/serviceaccount"
 )
 
 const (
@@ -60,14 +61,52 @@ var (
 	// workloadIdentity.mint (HTTP 403).
 	ErrNotEntitled = errors.New("module is not entitled to mint workload tokens")
 
-	// ErrOwnerNoAccess means the run's owning user holds no usable role in the workspace right
-	// now — never seen there, removed, or too long since core last saw them (HTTP 403). The
-	// message deliberately doesn't say which, so a caller can't probe membership with it.
+	// ErrOwnerNoAccess means a *person* owner holds no usable role in the workspace right now —
+	// never seen there, removed, demoted, or too long since core last saw them (HTTP 403). The
+	// message deliberately doesn't say which, so a caller can't probe membership with it (ADR
+	// 0058's anti-probing rule) — module-not-entitled (ErrNotEntitled) gets the same treatment.
+	// This is person-owner-only: a service account's two refusal causes are deliberately *not*
+	// folded into this vague error — see ErrServiceAccountDisabled and
+	// ErrServiceAccountNotFound, and RefusalCode below. ADR 0119 amendment 3 point 5: anti-probing
+	// doesn't apply to those two, because any workspace member can already see the account list.
 	ErrOwnerNoAccess = errors.New("the run's owner has no current access to that workspace")
+
+	// ErrServiceAccountDisabled means `owner` names a real service account (ADR 0120) that has
+	// been disabled (HTTP 403, machine-readable code "service_account_disabled" — see
+	// RefusalCode). The coordinator's ruling for ADR 0120 (decisions addendum, point 5) asks for a
+	// clear message a module can surface in its own run status — "why" a run stopped, not just
+	// "no" — and ADR 0119 amendment 3 point 5 confirms this stays a *distinct* machine-readable
+	// cause rather than folding into ErrOwnerNoAccess.
+	ErrServiceAccountDisabled = errors.New("the named service account is disabled")
+
+	// ErrServiceAccountNotFound means `owner` has the `svc:` prefix but does not resolve to a
+	// real, enabled service account in the request's workspace — unknown name, malformed id, or
+	// naming a different workspace's account (HTTP 403, machine-readable code
+	// "service_account_not_found" — see RefusalCode). ADR 0119 amendment 3 point 5: unlike a
+	// person owner's ErrOwnerNoAccess, this is allowed to be specific, because any workspace
+	// member can already see which accounts exist via GET /api/service-accounts — there is
+	// nothing left to probe by confirming one doesn't.
+	ErrServiceAccountNotFound = errors.New("no such service account in that workspace")
 
 	// ErrUnavailable means core can't currently answer (the directory is down) (HTTP 503).
 	ErrUnavailable = errors.New("workload identity is temporarily unavailable")
 )
+
+// RefusalCode returns the machine-readable code for a Mint refusal, and whether err is one of
+// the two causes that gets one at all (ADR 0119 amendment 3 point 5). Every other refusal —
+// ErrOwnerNoAccess, ErrNotEntitled, a malformed request — stays a single indistinguishable 403
+// with no code; only these two service-account causes are specific, because the account list
+// itself is already visible to any workspace member, so there is nothing left to probe.
+func RefusalCode(err error) (code string, ok bool) {
+	switch {
+	case errors.Is(err, ErrServiceAccountDisabled):
+		return "service_account_disabled", true
+	case errors.Is(err, ErrServiceAccountNotFound):
+		return "service_account_not_found", true
+	default:
+		return "", false
+	}
+}
 
 // subjectPattern is the required shape of a run identifier: `<kind>:<id>`, e.g. `job:7f3a`.
 // ADR 0056 says the subject "must identify the run, e.g. job:<job-id>, never a person"; a
@@ -138,15 +177,20 @@ type Options struct {
 // Service mints workload tokens. It holds no state beyond its inputs: every mint re-derives the
 // role from the directory at that moment, so nothing cached can outlive a demotion.
 type Service struct {
-	keys    *Keys
-	modules Modules
-	users   directory.Store
-	opts    Options
+	keys            *Keys
+	modules         Modules
+	users           directory.Store
+	serviceAccounts serviceaccount.Store
+	opts            Options
 }
 
 // NewService builds a Service. Defaults: 10-minute tokens, 7-day owner-recency bound, the
 // system clock, and a groups claim named "groups".
-func NewService(keys *Keys, modules Modules, users directory.Store, opts Options) *Service {
+//
+// serviceAccounts resolves an `owner` of the form `svc:<workspace>:<name>` (ADR 0120); pass
+// serviceaccount.Unavailable{} where no real, persistent store exists yet (never a
+// deployment-wide default — see that type's doc comment for why there is no in-memory fallback).
+func NewService(keys *Keys, modules Modules, users directory.Store, serviceAccounts serviceaccount.Store, opts Options) *Service {
 	opts.Issuer = strings.TrimRight(opts.Issuer, "/")
 	if opts.TTL <= 0 {
 		opts.TTL = DefaultTokenTTL
@@ -160,7 +204,7 @@ func NewService(keys *Keys, modules Modules, users directory.Store, opts Options
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	return &Service{keys: keys, modules: modules, users: users, opts: opts}
+	return &Service{keys: keys, modules: modules, users: users, serviceAccounts: serviceAccounts, opts: opts}
 }
 
 // Issuer returns core's issuer URL (no trailing slash).
@@ -284,6 +328,10 @@ func (s *Service) Mint(ctx context.Context, moduleID string, req Request) (Token
 // usable role, which is what stops a user who was removed and never signed in again from
 // keeping their scheduled jobs privileged forever.
 func (s *Service) ownerRole(ctx context.Context, owner, workspace string) (auth.Role, error) {
+	if rest, ok := strings.CutPrefix(owner, "svc:"); ok {
+		return s.serviceAccountRole(ctx, rest, workspace)
+	}
+
 	u, found, err := s.users.Get(ctx, owner, workspace)
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrUnavailable, err)
@@ -299,6 +347,33 @@ func (s *Service) ownerRole(ctx context.Context, owner, workspace string) (auth.
 		return "", ErrOwnerNoAccess
 	}
 	return role, nil
+}
+
+// serviceAccountRole resolves an owner of the form `svc:<workspace>:<name>` (ADR 0120). Unlike a
+// person's role, this is read live from the stored record with no MaxOwnerAge window (ADR 0120
+// #2) — a service account has no "last seen", so staleness doesn't apply to it at all.
+func (s *Service) serviceAccountRole(ctx context.Context, rest, workspace string) (auth.Role, error) {
+	ws, name, ok := strings.Cut(rest, ":")
+	if !ok || ws != workspace {
+		// Malformed, or the owner string's embedded workspace doesn't match the mint request's
+		// own workspace. Note this check is belt-and-suspenders, not the actual boundary: the
+		// lookup below is always scoped to `workspace` (the request's own), never to `ws`, so a
+		// caller naming another workspace's account can never actually be resolved against it
+		// either way — rejecting it explicitly here just turns an inconsistent owner string into
+		// a clear, fast refusal instead of a lookup that happens to miss.
+		return "", ErrServiceAccountNotFound
+	}
+	acc, found, err := s.serviceAccounts.Get(ctx, workspace, name)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	if !found {
+		return "", ErrServiceAccountNotFound
+	}
+	if acc.Disabled {
+		return "", ErrServiceAccountDisabled
+	}
+	return acc.Role, nil
 }
 
 func validate(req Request) error {

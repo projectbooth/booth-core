@@ -76,22 +76,40 @@ func handleMintWorkloadToken(svc *workload.Service) http.HandlerFunc {
 	}
 }
 
+// mintErrorResponse is the body for a mint refusal that has a machine-readable code (ADR 0119
+// amendment 3 point 5) — only the two causes workload.RefusalCode recognizes get one; every
+// other refusal below stays a plain-text body with no code (ADR 0058's anti-probing rule).
+type mintErrorResponse struct {
+	Error string `json:"error"`
+	Code  string `json:"code"`
+}
+
 func mintError(w http.ResponseWriter, err error) {
 	switch {
 	case workload.IsInvalidCredential(err):
 		w.Header().Set("WWW-Authenticate", `Bearer realm="booth-workload-minting"`)
 		http.Error(w, "invalid minting credential", http.StatusUnauthorized)
-	case errors.Is(err, workload.ErrNotEntitled):
-		http.Error(w, err.Error(), http.StatusForbidden)
-	case errors.Is(err, workload.ErrOwnerNoAccess):
-		http.Error(w, err.Error(), http.StatusForbidden)
+		return
 	case errors.Is(err, workload.ErrInvalidRequest):
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	case errors.Is(err, workload.ErrUnavailable):
 		log.Printf("workload identity: %v", err)
 		http.Error(w, "workload identity is temporarily unavailable", http.StatusServiceUnavailable)
-	default:
-		log.Printf("workload identity: minting failed: %v", err)
-		http.Error(w, "minting failed", http.StatusInternalServerError)
+		return
 	}
+
+	// Everything left refuses with 403. Only the two service-account causes get a
+	// machine-readable `code` in a JSON body — a person owner's lack of access and a module's
+	// lost entitlement stay one indistinguishable plain-text 403, same as before this ADR.
+	if code, ok := workload.RefusalCode(err); ok {
+		writeJSON(w, http.StatusForbidden, mintErrorResponse{Error: err.Error(), Code: code})
+		return
+	}
+	if errors.Is(err, workload.ErrNotEntitled) || errors.Is(err, workload.ErrOwnerNoAccess) {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	log.Printf("workload identity: minting failed: %v", err)
+	http.Error(w, "minting failed", http.StatusInternalServerError)
 }
