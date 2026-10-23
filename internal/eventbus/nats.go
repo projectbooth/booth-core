@@ -40,6 +40,14 @@ func Connect(ctx context.Context, url string, opts ...nats.Option) (*Bus, error)
 		Retention: jetstream.LimitsPolicy,
 		MaxAge:    7 * 24 * time.Hour,
 		Storage:   jetstream.FileStorage,
+		// Pinned explicitly (ADR 0123) rather than left to the server's own default: a
+		// publisher that sets a stable Nats-Msg-Id (booth-api's outbox relay, retrying
+		// the same outbox row's message id after a crash between the publish ack and
+		// marking the row done) is deduplicated by the server for this long, so a slow
+		// restart doesn't turn one committed write into two stream entries. Consumers
+		// must still tolerate duplicates regardless (ADR 0123 point 1) — this only
+		// trims the common case, it isn't load-bearing for correctness.
+		Duplicates: 2 * time.Hour,
 	}); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("ensuring stream %s: %w", StreamName, err)
