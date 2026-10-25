@@ -205,6 +205,9 @@ func TestCreateProject_RecordsCreatedByAndValidatesSlug(t *testing.T) {
 	if view.Archived {
 		t.Error("a newly created project must not be archived")
 	}
+	if view.Parent != nil {
+		t.Errorf("Parent = %v, want nil (JSON null) for a top-level project", view.Parent)
+	}
 
 	for _, slug := range []string{"Finance", "finance!", ""} {
 		body := strings.NewReader(`{"slug":"` + slug + `","name":"x"}`)
@@ -214,6 +217,31 @@ func TestCreateProject_RecordsCreatedByAndValidatesSlug(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("slug %q: status = %d, want 400", slug, rec.Code)
 		}
+	}
+}
+
+// TestProjectView_ParentIsJSONNullNotEmptyStringWhenTopLevel pins the exact wire bytes the
+// merged contract specifies: "parent (slug or null)" — unlike description/color/icon, which it
+// leaves unannotated and so stay plain, always-present strings.
+func TestProjectView_ParentIsJSONNullNotEmptyStringWhenTopLevel(t *testing.T) {
+	store := newFakeProjectStore()
+	now := time.Now
+	body := strings.NewReader(`{"slug":"finance","name":"Finance"}`)
+	req := withTestIdentity(httptest.NewRequest(http.MethodPost, "/api/projects", body), auth.RoleOwner)
+	rec := httptest.NewRecorder()
+	handleCreateProject(store, now)(rec, req)
+
+	if !strings.Contains(rec.Body.String(), `"parent":null`) {
+		t.Errorf("body = %s, want it to contain \"parent\":null", rec.Body.String())
+	}
+
+	childBody := strings.NewReader(`{"slug":"finance-dev","name":"Finance (dev)","parent":"finance"}`)
+	childReq := withTestIdentity(httptest.NewRequest(http.MethodPost, "/api/projects", childBody), auth.RoleOwner)
+	childRec := httptest.NewRecorder()
+	handleCreateProject(store, now)(childRec, childReq)
+
+	if !strings.Contains(childRec.Body.String(), `"parent":"finance"`) {
+		t.Errorf("body = %s, want it to contain \"parent\":\"finance\"", childRec.Body.String())
 	}
 }
 

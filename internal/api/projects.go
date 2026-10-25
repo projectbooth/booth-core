@@ -17,13 +17,15 @@ const maxProjectRequestBytes = 4 << 10
 
 // projectView is the wire shape of a project, fixed by the merged contract
 // (booth-architecture/contracts/projects.md): {slug, name, parent, description, color, icon,
-// archived, createdBy, createdAt}, every field always present (no omitempty — an unset parent/
-// color/icon is "", not absent). Open to any member — a project carries no authorization
-// meaning, and the picker/grouping UI needs the full list for every role.
+// archived, createdBy, createdAt}. The contract annotates parent specifically as "(slug or
+// null)" — unlike description/color/icon, which it leaves unannotated and so stay plain,
+// always-present strings ("" when unset) — so Parent alone is a *string: present as JSON null
+// for a top-level project, a string for a child. Open to any member — a project carries no
+// authorization meaning, and the picker/grouping UI needs the full list for every role.
 type projectView struct {
 	Slug        string    `json:"slug"`
 	Name        string    `json:"name"`
-	Parent      string    `json:"parent"`
+	Parent      *string   `json:"parent"`
 	Description string    `json:"description"`
 	Color       string    `json:"color"`
 	Icon        string    `json:"icon"`
@@ -33,10 +35,14 @@ type projectView struct {
 }
 
 func toProjectView(p project.Project) projectView {
-	return projectView{
-		Slug: p.Slug, Name: p.Name, Parent: p.Parent, Description: p.Description,
+	v := projectView{
+		Slug: p.Slug, Name: p.Name, Description: p.Description,
 		Color: p.Color, Icon: p.Icon, Archived: p.Archived, CreatedBy: p.CreatedBy, CreatedAt: p.CreatedAt,
 	}
+	if p.Parent != "" {
+		v.Parent = &p.Parent
+	}
+	return v
 }
 
 // handleListProjects lists every project in the caller's active workspace, open to any member.
