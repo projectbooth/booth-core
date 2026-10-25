@@ -35,6 +35,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/keycloakprov"
 	"github.com/projectbooth/booth-core/internal/lifecycle"
 	"github.com/projectbooth/booth-core/internal/natsauth"
+	"github.com/projectbooth/booth-core/internal/project"
 	"github.com/projectbooth/booth-core/internal/registry"
 	"github.com/projectbooth/booth-core/internal/serviceaccount"
 	"github.com/projectbooth/booth-core/internal/tlsprov"
@@ -317,6 +318,12 @@ func run() error {
 	// persistent store below. See internal/serviceaccount's package doc comment.
 	serviceAccounts := serviceaccount.NewSwitchable(serviceaccount.Unavailable{})
 
+	// Projects (ADR 0124): same posture as serviceAccounts above and for the same reason — a
+	// project is an explicit, owner-authored record, not an opportunistic cache entry. Every
+	// project route and every module's ?project=<slug> validation 503s until this is swapped to
+	// a real, persistent store below. See internal/project's package doc comment.
+	projects := project.NewSwitchable(project.Unavailable{})
+
 	switch {
 	case cfg.PostgresDSN != "":
 		pg, err := directory.NewPostgresStore(ctx, cfg.PostgresDSN)
@@ -355,13 +362,24 @@ func run() error {
 			return fmt.Errorf("connecting to the service-accounts database: %w", err)
 		}
 		serviceAccounts.Swap(svcAcctPg)
-		log.Print("user directory, credential-broker audit trail and service accounts: using the database from BOOTH_POSTGRES_DSN")
+		projectsPg, err := project.NewPostgresStore(ctx, cfg.PostgresDSN)
+		if err != nil {
+			return fmt.Errorf("configuring projects: %w", err)
+		}
+		defer projectsPg.Close()
+		if err := dbwait.Retry(ctx, "connecting to the projects database", dbwait.DefaultMaxElapsed, func() error {
+			return projectsPg.Ping(ctx)
+		}); err != nil {
+			return fmt.Errorf("connecting to the projects database: %w", err)
+		}
+		projects.Swap(projectsPg)
+		log.Print("user directory, credential-broker audit trail, service accounts and projects: using the database from BOOTH_POSTGRES_DSN")
 	case dbProv != nil:
-		go persistCoreDatabase(ctx, dbProv, cfg.KubeNamespace, users, recorder, audit, serviceAccounts)
+		go persistCoreDatabase(ctx, dbProv, cfg.KubeNamespace, users, recorder, audit, serviceAccounts, projects)
 	default:
 		log.Print("no database is configured (BOOTH_POSTGRES_DSN / BOOTH_POSTGRES_HOST); the user directory and the " +
 			"credential-broker audit trail are in-memory and will be empty after a restart (ADR 0047, ADR 0080); " +
-			"service accounts (ADR 0120) are unavailable (503) for as long as this is true")
+			"service accounts (ADR 0120) and projects (ADR 0124) are unavailable (503) for as long as this is true")
 	}
 
 	// Event bus: NATS/JetStream (ADR 0021). Connected in the background: NATS may not be
@@ -423,6 +441,7 @@ func run() error {
 		IframeIdentity:    iframeIdentitySvc,
 		CredentialBroker:  credentialBrokerSvc,
 		ServiceAccounts:   serviceAccounts,
+		Projects:          projects,
 
 		// ADR 0113: every module installed through the install API gets these as defaults,
 		// per its own identity-keys annotation. Derived straight from this same process's
@@ -598,11 +617,12 @@ func newScheme() (*runtime.Scheme, error) {
 }
 
 // persistCoreDatabase provisions core's own database and switches the user directory, the
-// credential-broker audit trail and the service-accounts store onto it, retrying with backoff
-// until the server is reachable (the bundled one may still be starting). Service accounts (ADR
-// 0120) 503 on every call until this succeeds — see serviceAccounts' construction above for why
-// there is no in-memory stand-in for them the way there is for the other two.
-func persistCoreDatabase(ctx context.Context, p *dbprov.Provisioner, namespace string, users *directory.Switchable, recorder *directory.Recorder, audit *credentialbroker.Switchable, serviceAccounts *serviceaccount.Switchable) {
+// credential-broker audit trail, the service-accounts store and the projects store onto it,
+// retrying with backoff until the server is reachable (the bundled one may still be starting).
+// Service accounts (ADR 0120) and projects (ADR 0124) 503 on every call until this succeeds —
+// see their construction above for why there is no in-memory stand-in for them the way there is
+// for the other two.
+func persistCoreDatabase(ctx context.Context, p *dbprov.Provisioner, namespace string, users *directory.Switchable, recorder *directory.Recorder, audit *credentialbroker.Switchable, serviceAccounts *serviceaccount.Switchable, projects *project.Switchable) {
 	const maxBackoff = 30 * time.Second
 	backoff := time.Second
 	for {
@@ -611,19 +631,25 @@ func persistCoreDatabase(ctx context.Context, p *dbprov.Provisioner, namespace s
 			var pg *directory.PostgresStore
 			var auditPg *credentialbroker.PostgresStore
 			var svcAcctPg *serviceaccount.PostgresStore
+			var projectsPg *project.PostgresStore
 			if pg, err = directory.NewPostgresStore(ctx, dsn); err == nil {
 				if auditPg, err = credentialbroker.NewPostgresStore(ctx, dsn); err == nil {
 					if svcAcctPg, err = serviceaccount.NewPostgresStore(ctx, dsn); err == nil {
-						users.Swap(pg)
-						recorder.Reset() // the new store is empty; re-record users on their next request
-						audit.Swap(auditPg)
-						serviceAccounts.Swap(svcAcctPg)
-						log.Print("user directory, credential-broker audit trail and service accounts are now persistent (core database provisioned)")
-						<-ctx.Done()
-						pg.Close()
-						auditPg.Close()
+						if projectsPg, err = project.NewPostgresStore(ctx, dsn); err == nil {
+							users.Swap(pg)
+							recorder.Reset() // the new store is empty; re-record users on their next request
+							audit.Swap(auditPg)
+							serviceAccounts.Swap(svcAcctPg)
+							projects.Swap(projectsPg)
+							log.Print("user directory, credential-broker audit trail, service accounts and projects are now persistent (core database provisioned)")
+							<-ctx.Done()
+							pg.Close()
+							auditPg.Close()
+							svcAcctPg.Close()
+							projectsPg.Close()
+							return
+						}
 						svcAcctPg.Close()
-						return
 					}
 					auditPg.Close()
 				}

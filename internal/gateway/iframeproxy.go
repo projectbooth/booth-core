@@ -51,7 +51,16 @@ func NewIframeURLIssuer(tokens *IframeTokenIssuer) *IframeURLIssuer {
 // address. A relative URL removes the failure mode entirely rather than making it configurable:
 // the shell routes /iframe/ to core itself (ADR 0069 item B), so this resolves correctly against
 // whatever origin the browser is already on with no operator configuration at all.
-func (i *IframeURLIssuer) URLFor(moduleID string, identity auth.Identity) (string, error) {
+//
+// project (ADR 0124), when non-empty, is appended as a second query parameter so the shell's
+// project picker reaches an iframe-proxied module: the caller (handleIframeURL) has already
+// validated it against the project slug grammar, and this still URL-encodes it before appending
+// as defense in depth. It survives IframeEntryHandler's one-time "clean redirect" (that redirect
+// only strips iframeQueryParam, every other query parameter passes through unchanged) and is
+// then forwarded on every subsequent proxied request untouched — proxyIframeRequest's Director
+// never touches RawQuery, only Path. An empty project leaves the URL exactly as it was before
+// this parameter existed.
+func (i *IframeURLIssuer) URLFor(moduleID string, identity auth.Identity, project string) (string, error) {
 	token, err := i.tokens.Issue(IframeClaims{
 		ModuleID:          moduleID,
 		Workspace:         identity.Active.Workspace,
@@ -63,7 +72,11 @@ func (i *IframeURLIssuer) URLFor(moduleID string, identity auth.Identity) (strin
 	if err != nil {
 		return "", fmt.Errorf("issuing iframe token: %w", err)
 	}
-	return fmt.Sprintf("/iframe/%s/?%s=%s", moduleID, iframeQueryParam, token), nil
+	u := fmt.Sprintf("/iframe/%s/?%s=%s", moduleID, iframeQueryParam, token)
+	if project != "" {
+		u += "&project=" + url.QueryEscape(project)
+	}
+	return u, nil
 }
 
 // IframeEntryHandler serves /iframe/{id}/*. First hit (query param present): verify,

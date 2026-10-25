@@ -19,6 +19,7 @@ import (
 	"github.com/projectbooth/booth-core/internal/gateway"
 	"github.com/projectbooth/booth-core/internal/iframeidentity"
 	"github.com/projectbooth/booth-core/internal/lifecycle"
+	"github.com/projectbooth/booth-core/internal/project"
 	"github.com/projectbooth/booth-core/internal/registry"
 	"github.com/projectbooth/booth-core/internal/serviceaccount"
 	"github.com/projectbooth/booth-core/internal/workload"
@@ -65,6 +66,12 @@ type Deps struct {
 	// persistent store exists yet, so the routes exist and 503 rather than 404 in that window; see
 	// internal/serviceaccount's package doc comment for why there is no in-memory stand-in.
 	ServiceAccounts serviceaccount.Store
+
+	// Projects serves /api/projects (ADR 0124). Optional: nil disables the routes. cmd/core
+	// always supplies one — project.Unavailable{} (via a Switchable) while no real, persistent
+	// store exists yet, same posture as ServiceAccounts above and for the same reason: see
+	// internal/project's package doc comment.
+	Projects project.Store
 }
 
 // NewRouter builds booth-core's full HTTP router.
@@ -131,6 +138,22 @@ func NewRouter(deps Deps) http.Handler {
 			r.Post("/api/service-accounts", requireAdmin(handleCreateServiceAccount(deps.ServiceAccounts, time.Now)))
 			r.Patch("/api/service-accounts/{name}", requireAdmin(handlePatchServiceAccount(deps.ServiceAccounts)))
 			r.Delete("/api/service-accounts/{name}", requireAdmin(handleDeleteServiceAccount(deps.ServiceAccounts)))
+		}
+
+		// Projects (ADR 0124): a navigation label, not a boundary — reads are open to any member
+		// (the picker and grouping UI need the full list for every role); writes are owner-only,
+		// same posture as service accounts and module install/uninstall. chi matches the static
+		// "/api/projects/bindings" ahead of the "/api/projects/{slug}" wildcard, so the two never
+		// collide.
+		if deps.Projects != nil {
+			r.Get("/api/projects", handleListProjects(deps.Projects))
+			r.Get("/api/projects/bindings", handleListWorkspaceBindings(deps.Projects))
+			r.Post("/api/projects", requireAdmin(handleCreateProject(deps.Projects, time.Now)))
+			r.Get("/api/projects/{slug}", handleGetProject(deps.Projects))
+			r.Patch("/api/projects/{slug}", requireAdmin(handlePatchProject(deps.Projects)))
+			r.Get("/api/projects/{slug}/bindings", handleListProjectBindings(deps.Projects))
+			r.Post("/api/projects/{slug}/bindings", requireAdmin(handleCreateProjectBinding(deps.Projects, time.Now)))
+			r.Delete("/api/projects/{slug}/bindings/{id}", requireAdmin(handleDeleteProjectBinding(deps.Projects)))
 		}
 	})
 
@@ -273,6 +296,12 @@ type moduleView struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 
+// handleIframeURL serves GET /api/modules/{id}/iframe-url. The optional ?project=<slug> (ADR
+// 0124) is validated against the project slug grammar here — the one place in this request path
+// that turns a bad value into a 400 — and threaded through to IframeURLIssuer.URLFor, which
+// URL-encodes it before appending (defense in depth, independent of this validation). An absent
+// or empty project parameter is unchanged from before this ADR: no project segment is appended
+// at all.
 func handleIframeURL(issuer *gateway.IframeURLIssuer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		identity, ok := auth.FromContext(r.Context())
@@ -282,13 +311,20 @@ func handleIframeURL(issuer *gateway.IframeURLIssuer) http.HandlerFunc {
 		}
 
 		moduleID := chi.URLParam(r, "id")
-		url, err := issuer.URLFor(moduleID, identity)
+
+		projectSlug := r.URL.Query().Get("project")
+		if projectSlug != "" && !project.SlugPattern.MatchString(projectSlug) {
+			http.Error(w, "invalid project slug", http.StatusBadRequest)
+			return
+		}
+
+		iframeURL, err := issuer.URLFor(moduleID, identity, projectSlug)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		writeJSON(w, http.StatusOK, map[string]string{"url": url})
+		writeJSON(w, http.StatusOK, map[string]string{"url": iframeURL})
 	}
 }
 

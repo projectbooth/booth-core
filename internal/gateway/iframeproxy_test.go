@@ -12,6 +12,115 @@ import (
 	"github.com/projectbooth/booth-core/internal/registry"
 )
 
+// TestIframeFlow_ProjectQueryParamSurvivesTheTokenStrippingRedirectAndReachesTheModule is ADR
+// 0124's iframe-proxy contract end to end: URLFor appends ?project=<slug> (URL-encoded) beside
+// the one-time navigation token; IframeEntryHandler's first-hit redirect strips ONLY
+// booth_iframe_token and must leave project alone; the second hit (cookie present) must still
+// forward it to the module, exactly like any other query parameter on this path.
+func TestIframeFlow_ProjectQueryParamSurvivesTheTokenStrippingRedirectAndReachesTheModule(t *testing.T) {
+	var gotQuery url.Values
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	lookup := fakeLookup{modules: map[string]registry.Module{
+		"pipeline": {Spec: boothv1alpha1.BoothModuleSpec{ID: "pipeline", ServiceRef: boothv1alpha1.ServiceReference{Name: backend.Listener.Addr().String()}}},
+	}}
+	gw := New(lookup)
+	tokens := NewIframeTokenIssuer([]byte("test-secret"))
+	issuer := NewIframeURLIssuer(tokens)
+
+	iframeURL, err := issuer.URLFor("pipeline", auth.Identity{
+		Claims: &auth.Claims{Subject: "user-1"},
+		Active: auth.Membership{Workspace: "acme-analytics", Role: auth.RoleOwner},
+	}, "finance-dev")
+	if err != nil {
+		t.Fatalf("URLFor: %v", err)
+	}
+	if !strings.Contains(iframeURL, "project=finance-dev") {
+		t.Fatalf("URLFor = %q, want it to contain project=finance-dev", iframeURL)
+	}
+
+	entry := gw.IframeEntryHandler(tokens,
+		func(r *http.Request) string { return "pipeline" },
+		func(r *http.Request) string { return "/" },
+	)
+
+	parsedURL, err := url.Parse(iframeURL)
+	if err != nil {
+		t.Fatalf("parsing iframe URL: %v", err)
+	}
+	req1 := httptest.NewRequest(http.MethodGet, parsedURL.RequestURI(), nil)
+	rec1 := httptest.NewRecorder()
+	entry.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusFound {
+		t.Fatalf("first hit status = %d, want 302", rec1.Code)
+	}
+	redirectedTo, err := url.Parse(rec1.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parsing redirect Location: %v", err)
+	}
+	if redirectedTo.Query().Get(iframeQueryParam) != "" {
+		t.Error("the clean redirect must strip the one-time navigation token")
+	}
+	if redirectedTo.Query().Get("project") != "finance-dev" {
+		t.Errorf("the clean redirect dropped project, got %q", redirectedTo.RawQuery)
+	}
+
+	cookies := rec1.Result().Cookies()
+	req2 := httptest.NewRequest(http.MethodGet, redirectedTo.RequestURI(), nil)
+	req2.AddCookie(cookies[0])
+	rec2 := httptest.NewRecorder()
+	entry.ServeHTTP(rec2, req2)
+
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second hit status = %d, want 200", rec2.Code)
+	}
+	if gotQuery.Get("project") != "finance-dev" {
+		t.Errorf("module received project=%q, want finance-dev", gotQuery.Get("project"))
+	}
+}
+
+// TestIframeURLIssuer_URLForOmitsProjectWhenEmpty confirms the ADR 0124 addition is fully
+// backward compatible: no project segment at all when the caller doesn't supply one.
+func TestIframeURLIssuer_URLForOmitsProjectWhenEmpty(t *testing.T) {
+	issuer := NewIframeURLIssuer(NewIframeTokenIssuer([]byte("test-secret")))
+	got, err := issuer.URLFor("superset", auth.Identity{
+		Claims: &auth.Claims{Subject: "user-1"},
+		Active: auth.Membership{Workspace: "acme-analytics", Role: auth.RoleOwner},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "project") {
+		t.Errorf("URLFor = %q, want no project parameter at all when none was given", got)
+	}
+}
+
+// TestIframeURLIssuer_URLForEscapesTheProjectParameter is the defense-in-depth half of the
+// contract: even though handleIframeURL validates the project slug grammar before calling this,
+// URLFor itself must never build an unescaped query string from a caller-supplied value.
+func TestIframeURLIssuer_URLForEscapesTheProjectParameter(t *testing.T) {
+	issuer := NewIframeURLIssuer(NewIframeTokenIssuer([]byte("test-secret")))
+	got, err := issuer.URLFor("superset", auth.Identity{
+		Claims: &auth.Claims{Subject: "user-1"},
+		Active: auth.Membership{Workspace: "acme-analytics", Role: auth.RoleOwner},
+	}, "a b&c=d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("URLFor produced an unparseable URL %q: %v", got, err)
+	}
+	if parsed.Query().Get("project") != "a b&c=d" {
+		t.Errorf("round-tripped project = %q, want the original value back, proving it was escaped not injected", parsed.Query().Get("project"))
+	}
+}
+
 func TestIframeFlow_NavigationThenCookieProxiesToModule(t *testing.T) {
 	var gotPath, gotWorkspace, gotRole string
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -32,7 +141,7 @@ func TestIframeFlow_NavigationThenCookieProxiesToModule(t *testing.T) {
 	iframeURL, err := issuer.URLFor("superset", auth.Identity{
 		Claims: &auth.Claims{Subject: "user-1"},
 		Active: auth.Membership{Workspace: "acme-analytics", Role: auth.RoleOwner},
-	})
+	}, "")
 	if err != nil {
 		t.Fatalf("URLFor: %v", err)
 	}
@@ -146,7 +255,7 @@ func TestIframeURLIssuer_URLForIsRelative(t *testing.T) {
 	got, err := issuer.URLFor("superset", auth.Identity{
 		Claims: &auth.Claims{Subject: "user-1"},
 		Active: auth.Membership{Workspace: "acme-analytics", Role: auth.RoleOwner},
-	})
+	}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +286,7 @@ func TestIframeURLIssuer_URLForDerivesIsOperatorFromGroups(t *testing.T) {
 			iframeURL, err := issuer.URLFor("superset", auth.Identity{
 				Claims: &auth.Claims{Subject: "user-1", Groups: tc.groups},
 				Active: auth.Membership{Workspace: "acme-analytics", Role: auth.RoleOwner},
-			})
+			}, "")
 			if err != nil {
 				t.Fatalf("URLFor: %v", err)
 			}
@@ -221,7 +330,7 @@ func TestIframeURLIssuer_URLForPreferredUsernameSurvivesRoundTripIncludingPipeCh
 			iframeURL, err := issuer.URLFor("superset", auth.Identity{
 				Claims: &auth.Claims{Subject: "user-1", PreferredUsername: tc.username},
 				Active: auth.Membership{Workspace: "acme-analytics", Role: auth.RoleOwner},
-			})
+			}, "")
 			if err != nil {
 				t.Fatalf("URLFor: %v", err)
 			}

@@ -26,6 +26,26 @@ func TestDeriveMemberships(t *testing.T) {
 	}
 }
 
+// ADR 0124 point 1 ("project carries no authorization meaning") is confirmed by this test, not
+// just asserted in a doc comment: a groups entry shaped like a project grant must produce no
+// membership at all, the same way any other unrelated IdP group is silently ignored — there is
+// no /projects/<slug>/<role> grammar for DeriveMemberships to match, on purpose, so a future
+// mistake (an IdP, or a module, emitting such a claim) can't accidentally become a role grant.
+func TestDeriveMemberships_IgnoresAProjectShapedGroupEntry(t *testing.T) {
+	groups := []string{
+		"/workspaces/acme-analytics/owner",
+		"/projects/finance/owner",
+		"/projects/finance-dev/editor",
+	}
+
+	got := DeriveMemberships(groups)
+	want := []Membership{{Workspace: "acme-analytics", Role: RoleOwner}}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DeriveMemberships() = %#v, want %#v (project-shaped entries must grant nothing)", got, want)
+	}
+}
+
 // ADR 0094: /platform/operator is a workspace-independent, literal-string claim, checked as an
 // exact match — not matched by DeriveMemberships' /workspaces/<slug>/<role> grammar, and not
 // derivable from any role.
