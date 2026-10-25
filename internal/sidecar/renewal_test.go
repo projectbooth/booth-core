@@ -165,10 +165,7 @@ func TestRenewer_RenewsOnlyOnceWithinTheMargin(t *testing.T) {
 	done := make(chan struct{})
 	go func() { _ = r.Run(ctx); close(done) }()
 
-	waitForCalls(t, broker, 1) // initial lease
-	if !r.Ready() {
-		t.Fatal("not ready after the initial lease")
-	}
+	waitForReady(t, r) // initial lease
 
 	// expiresAt is 5 minutes out; well outside the 1-minute margin, so ticks must not renew.
 	for i := 0; i < 20; i++ {
@@ -251,7 +248,7 @@ func TestRenewer_HalfLifetimeRenewsAtHalfTheLeasesRealLifetime(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { _ = r.Run(ctx); close(done) }()
-	waitForCalls(t, broker, 1)
+	waitForReady(t, r)
 
 	// Just under half the lease's lifetime: must not have renewed yet (a fixed 60s margin, the old
 	// default, would have renewed almost immediately against a 20-minute lease).
@@ -284,7 +281,7 @@ func TestRenewer_UsesTheRealExpiresAtNotTheRequestedTTL(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { _ = r.Run(ctx); close(done) }()
-	waitForCalls(t, broker, 1)
+	waitForReady(t, r)
 
 	clock.Advance(10 * time.Minute) // well past a hypothetical 5m ttlSeconds, nowhere near 15m expiresAt
 	time.Sleep(30 * time.Millisecond)
@@ -361,7 +358,7 @@ func TestRenewer_RenewalFailureNeverDropsTheCurrentLeaseOrExitsRun(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- r.Run(ctx) }()
-	waitForCalls(t, broker, 1)
+	waitForReady(t, r)
 	before := r.Current()
 
 	failRenewals.Store(true)
