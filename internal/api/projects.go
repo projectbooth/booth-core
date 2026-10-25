@@ -313,7 +313,14 @@ func handleCreateProjectBinding(store project.Store, now func() time.Time) http.
 	}
 }
 
-// handleDeleteProjectBinding removes one binding by id. Wrapped in requireAdmin by the router.
+// handleDeleteProjectBinding removes one binding by id, at the path the merged contract fixes —
+// DELETE /api/projects/{slug}/bindings/{id} (booth-architecture/contracts/projects.md) — not the
+// slug-less /api/projects/bindings/{id} this package built first. A binding id is already unique
+// per workspace (project.Store.DeleteBinding takes no slug), so {slug} isn't needed to find the
+// row, but it is still checked: deleting an id that exists but belongs to a different project
+// than the URL names is refused as a 404, the same "the URL's claim must be true" posture a
+// mismatched path segment gets everywhere else in this API, rather than silently deleting
+// whatever the id happens to resolve to. Wrapped in requireAdmin by the router.
 func handleDeleteProjectBinding(store project.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		identity, ok := auth.FromContext(r.Context())
@@ -321,11 +328,34 @@ func handleDeleteProjectBinding(store project.Store) http.HandlerFunc {
 			http.Error(w, "no identity", http.StatusUnauthorized)
 			return
 		}
+		slug, err := url.PathUnescape(chi.URLParam(r, "slug"))
+		if err != nil || slug == "" {
+			http.Error(w, "invalid slug", http.StatusBadRequest)
+			return
+		}
 		id, err := url.PathUnescape(chi.URLParam(r, "id"))
 		if err != nil || id == "" {
 			http.Error(w, "invalid id", http.StatusBadRequest)
 			return
 		}
+
+		bindings, err := store.ListBindings(r.Context(), identity.Active.Workspace, project.BindingFilter{ProjectSlug: slug})
+		if err != nil {
+			projectError(w, err)
+			return
+		}
+		found := false
+		for _, b := range bindings {
+			if b.ID == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			http.Error(w, "binding not found on this project", http.StatusNotFound)
+			return
+		}
+
 		if err := store.DeleteBinding(r.Context(), identity.Active.Workspace, id); err != nil {
 			projectError(w, err)
 			return

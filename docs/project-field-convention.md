@@ -8,8 +8,8 @@ grouping and filtering a list.
 
 Core stores the registry (`GET/POST/PATCH /api/projects`, `GET /api/projects/{slug}`) and
 bindings (`GET/POST /api/projects/{slug}/bindings`, `GET /api/projects/bindings?kind=...`,
-`DELETE /api/projects/bindings/{id}`). Reads are open to any workspace member; create/edit/
-archive and binding create/delete are owner-only. Full shapes: `contracts/projects.md`.
+`DELETE /api/projects/{slug}/bindings/{id}`). Reads are open to any workspace member; create/
+edit/archive and binding create/delete are owner-only. Full shapes: `contracts/projects.md`.
 
 There is no delete on a project itself — only archive. Core has no visibility into which modules
 still reference a slug (each module stores its own `project` field, not a core-side join), so it

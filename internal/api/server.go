@@ -153,7 +153,7 @@ func NewRouter(deps Deps) http.Handler {
 			r.Patch("/api/projects/{slug}", requireAdmin(handlePatchProject(deps.Projects)))
 			r.Get("/api/projects/{slug}/bindings", handleListProjectBindings(deps.Projects))
 			r.Post("/api/projects/{slug}/bindings", requireAdmin(handleCreateProjectBinding(deps.Projects, time.Now)))
-			r.Delete("/api/projects/bindings/{id}", requireAdmin(handleDeleteProjectBinding(deps.Projects)))
+			r.Delete("/api/projects/{slug}/bindings/{id}", requireAdmin(handleDeleteProjectBinding(deps.Projects)))
 		}
 	})
 

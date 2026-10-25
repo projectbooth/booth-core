@@ -364,6 +364,15 @@ func TestListWorkspaceBindings_FiltersByKind(t *testing.T) {
 	}
 }
 
+// withSlugAndIDParams sets both chi route params the merged contract's DELETE path carries:
+// /api/projects/{slug}/bindings/{id}.
+func withSlugAndIDParams(req *http.Request, slug, id string) *http.Request {
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("slug", slug)
+	rctx.URLParams.Add("id", id)
+	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+}
+
 func TestDeleteProjectBinding(t *testing.T) {
 	store := newFakeProjectStore()
 	ctx := context.Background()
@@ -373,14 +382,41 @@ func TestDeleteProjectBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rctx := chi.NewRouteContext()
-	rctx.URLParams.Add("id", b.ID)
-	req := withTestIdentity(httptest.NewRequest(http.MethodDelete, "/api/projects/bindings/"+b.ID, nil), auth.RoleOwner)
-	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	req := withSlugAndIDParams(
+		withTestIdentity(httptest.NewRequest(http.MethodDelete, "/api/projects/finance/bindings/"+b.ID, nil), auth.RoleOwner),
+		"finance", b.ID)
 	rec := httptest.NewRecorder()
 	handleDeleteProjectBinding(store)(rec, req)
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204, body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// The path's {slug} must actually own the binding being deleted — a correct id under the wrong
+// project in the URL is refused as a 404, not silently honoured.
+func TestDeleteProjectBinding_RefusesWhenTheSlugDoesNotOwnTheBinding(t *testing.T) {
+	store := newFakeProjectStore()
+	ctx := context.Background()
+	_ = store.Create(ctx, project.Project{Workspace: "acme-analytics", Slug: "finance", Name: "Finance"})
+	_ = store.Create(ctx, project.Project{Workspace: "acme-analytics", Slug: "nfl", Name: "NFL"})
+	b, err := store.CreateBinding(ctx, project.Binding{Workspace: "acme-analytics", ProjectSlug: "finance", Kind: project.BindingPostgresSchema, Value: "finance_dev"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := withSlugAndIDParams(
+		withTestIdentity(httptest.NewRequest(http.MethodDelete, "/api/projects/nfl/bindings/"+b.ID, nil), auth.RoleOwner),
+		"nfl", b.ID)
+	rec := httptest.NewRecorder()
+	handleDeleteProjectBinding(store)(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+
+	// The binding must still exist under its real project.
+	got, err := store.ListBindings(ctx, "acme-analytics", project.BindingFilter{ProjectSlug: "finance"})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("binding was deleted despite the mismatched slug: %+v, %v", got, err)
 	}
 }
 
