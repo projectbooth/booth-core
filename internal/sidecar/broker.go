@@ -95,11 +95,25 @@ type BrokerClient struct {
 	HTTPClient *http.Client
 }
 
-// NewBrokerClient builds a BrokerClient with a sane per-call timeout.
-func NewBrokerClient(baseURL, workspace string, token TokenSource) *BrokerClient {
+// DefaultBrokerCallTimeoutSeconds is NewBrokerClient's default when timeout is zero. Raised from
+// an original 10s (2026-10-31): SeaweedFS IAM minting takes about 6s normally (three sequential
+// IAM calls), and two concurrent mints serializing against the old 10s left too little margin —
+// the sidecar's own client timeout must stay at least as generous as the broker's
+// credentialbroker.DefaultProviderCallTimeout, since it wraps that whole call plus core's own
+// request handling.
+const DefaultBrokerCallTimeoutSeconds = 30
+
+// NewBrokerClient builds a BrokerClient. timeout bounds a single call to the broker; zero means
+// DefaultBrokerCallTimeoutSeconds (cmd/credential-sidecar/main.go resolves this from
+// --broker-timeout-seconds / BROKER_CALL_TIMEOUT_SECONDS, the same flag-plus-env shape as
+// --renew-margin-seconds).
+func NewBrokerClient(baseURL, workspace string, token TokenSource, timeout time.Duration) *BrokerClient {
+	if timeout <= 0 {
+		timeout = DefaultBrokerCallTimeoutSeconds * time.Second
+	}
 	return &BrokerClient{
 		BaseURL: strings.TrimRight(baseURL, "/"), Workspace: workspace, Token: token,
-		HTTPClient: &http.Client{Timeout: 10 * time.Second},
+		HTTPClient: &http.Client{Timeout: timeout},
 	}
 }
 

@@ -59,7 +59,7 @@ func (b *fakeBroker) callCount() int {
 }
 
 func newClient(broker *fakeBroker) *BrokerClient {
-	return NewBrokerClient(broker.URL, "acme", StaticToken("test-token"))
+	return NewBrokerClient(broker.URL, "acme", StaticToken("test-token"), 0)
 }
 
 func testRequest() credentialbroker.Request {
@@ -67,6 +67,57 @@ func testRequest() credentialbroker.Request {
 }
 
 // --- BrokerClient --------------------------------------------------------------------------------
+
+// --- Regression: the 2026-10-31 SeaweedFS IAM-minting incident (the sidecar's own broker-call
+// --- timeout raised from a hardcoded 10s to a configurable default of 30s). --------------------
+
+func TestNewBrokerClient_DefaultsTimeoutWhenZero(t *testing.T) {
+	c := NewBrokerClient("http://x", "acme", StaticToken("t"), 0)
+	want := DefaultBrokerCallTimeoutSeconds * time.Second
+	if c.HTTPClient.Timeout != want {
+		t.Errorf("HTTPClient.Timeout = %s, want the default %s", c.HTTPClient.Timeout, want)
+	}
+}
+
+func TestNewBrokerClient_HonoursAnExplicitTimeout(t *testing.T) {
+	c := NewBrokerClient("http://x", "acme", StaticToken("t"), 3*time.Second)
+	if c.HTTPClient.Timeout != 3*time.Second {
+		t.Errorf("HTTPClient.Timeout = %s, want 3s", c.HTTPClient.Timeout)
+	}
+}
+
+func TestDefaultBrokerCallTimeoutSeconds_Is30(t *testing.T) {
+	// Pinned explicitly, same reasoning and same incident as
+	// credentialbroker.DefaultProviderCallTimeout: the sidecar's own client timeout wraps the
+	// broker's whole call (including its own provider-call timeout), so it must stay at least as
+	// generous.
+	if DefaultBrokerCallTimeoutSeconds != 30 {
+		t.Errorf("DefaultBrokerCallTimeoutSeconds = %d, want 30", DefaultBrokerCallTimeoutSeconds)
+	}
+}
+
+// TestBrokerClient_Issue_ConfiguredTimeoutActuallyBoundsTheRealCall is the behavioral half: a
+// short, explicit timeout actually governs the real HTTP call against a slow broker, not just the
+// stored field. Bounded to run fast (a 50ms timeout against a broker that sleeps 500ms).
+func TestBrokerClient_Issue_ConfiguredTimeoutActuallyBoundsTheRealCall(t *testing.T) {
+	broker := newFakeBroker(t)
+	broker.respond = func(int, credentialbroker.Request) (int, any) {
+		time.Sleep(500 * time.Millisecond)
+		return http.StatusCreated, credentialbroker.Response{LeaseID: "lease-1", Kind: "s3", ExpiresAt: time.Now().Add(time.Hour), Credential: json.RawMessage(`{}`)}
+	}
+	client := NewBrokerClient(broker.URL, "acme", StaticToken("test-token"), 50*time.Millisecond)
+
+	start := time.Now()
+	_, err := client.Issue(context.Background(), testRequest())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("want an error (the 50ms timeout should have fired), got nil")
+	}
+	if elapsed > 400*time.Millisecond {
+		t.Errorf("Issue took %s, want well under the broker's 500ms sleep", elapsed)
+	}
+}
 
 func TestBrokerClient_Issue_SendsTheDocumentedHeadersAndBody(t *testing.T) {
 	broker := newFakeBroker(t)

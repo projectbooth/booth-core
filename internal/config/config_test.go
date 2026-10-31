@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestQualifyNATSURL(t *testing.T) {
@@ -81,6 +82,50 @@ func TestLoad_PostgresUnsetMeansProvisioningOff(t *testing.T) {
 	}
 	if cfg.Postgres.Host != "" {
 		t.Errorf("host = %q, want provisioning off", cfg.Postgres.Host)
+	}
+}
+
+// --- ADR 0080 §1 (2026-10-31): the credential broker's provider-call timeout, raised from an
+// original 10s to a configurable default of 30s after a real SeaweedFS IAM-minting incident. ---
+
+func TestLoad_ProviderCallTimeoutUnsetMeansZero(t *testing.T) {
+	t.Setenv("BOOTH_OIDC_ISSUER_URL", "https://idp")
+	t.Setenv("BOOTH_OIDC_CLIENT_ID", "c")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Zero here is deliberate, not a bug: credentialbroker.NewService treats zero as "use
+	// DefaultProviderCallTimeout" — config.Load itself never applies that default, the same
+	// division of responsibility CredentialBroker.MaxTTL already has.
+	if cfg.CredentialBroker.ProviderCallTimeout != 0 {
+		t.Errorf("ProviderCallTimeout = %v, want 0 (unset)", cfg.CredentialBroker.ProviderCallTimeout)
+	}
+}
+
+func TestLoad_ProviderCallTimeoutIsParsed(t *testing.T) {
+	t.Setenv("BOOTH_OIDC_ISSUER_URL", "https://idp")
+	t.Setenv("BOOTH_OIDC_CLIENT_ID", "c")
+	t.Setenv("BOOTH_CREDENTIAL_BROKER_PROVIDER_CALL_TIMEOUT", "45s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CredentialBroker.ProviderCallTimeout != 45*time.Second {
+		t.Errorf("ProviderCallTimeout = %v, want 45s", cfg.CredentialBroker.ProviderCallTimeout)
+	}
+}
+
+func TestLoad_RejectsNonPositiveProviderCallTimeout(t *testing.T) {
+	t.Setenv("BOOTH_OIDC_ISSUER_URL", "https://idp")
+	t.Setenv("BOOTH_OIDC_CLIENT_ID", "c")
+	for _, v := range []string{"0s", "-5s", "not-a-duration"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv("BOOTH_CREDENTIAL_BROKER_PROVIDER_CALL_TIMEOUT", v)
+			if _, err := Load(); err == nil {
+				t.Fatalf("BOOTH_CREDENTIAL_BROKER_PROVIDER_CALL_TIMEOUT=%q: expected an error", v)
+			}
+		})
 	}
 }
 

@@ -44,6 +44,7 @@ func run() error {
 		tokenFile         = flag.String("token-file", os.Getenv("BOOTH_TOKEN_FILE"), "path to re-read the bearer token from on every call, instead of --token (env BOOTH_TOKEN_FILE)")
 		renewMarginSecs   = flag.Int("renew-margin-seconds", envIntOr("RENEW_MARGIN_SECONDS", sidecar.DefaultRenewMarginSeconds), "renew this many seconds before the lease's real expiresAt (env RENEW_MARGIN_SECONDS); unless set, postgres mode's default is half the lease's own real lifetime instead of a fixed margin (ADR 0095 fifth amendment) — s3 mode always uses this fixed margin")
 		renewIntervalSecs = flag.Int("renew-interval-seconds", envIntOr("RENEW_INTERVAL_SECONDS", sidecar.DefaultRenewIntervalSeconds), "how often to check whether renewal is due (env RENEW_INTERVAL_SECONDS)")
+		brokerTimeoutSecs = flag.Int("broker-timeout-seconds", envIntOr("BROKER_CALL_TIMEOUT_SECONDS", sidecar.DefaultBrokerCallTimeoutSeconds), "HTTP client timeout for a single call to the credential broker (env BROKER_CALL_TIMEOUT_SECONDS)")
 	)
 	flag.Parse()
 
@@ -87,7 +88,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	client := sidecar.NewBrokerClient(*coreURL, *workspace, tokenSource)
+	client := sidecar.NewBrokerClient(*coreURL, *workspace, tokenSource, secondsDuration(*brokerTimeoutSecs))
 	renewer := &sidecar.Renewer{
 		Client: client,
 		Request: credentialbroker.Request{
