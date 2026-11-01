@@ -86,13 +86,13 @@ func TestNewBrokerClient_HonoursAnExplicitTimeout(t *testing.T) {
 	}
 }
 
-func TestDefaultBrokerCallTimeoutSeconds_Is30(t *testing.T) {
-	// Pinned explicitly, same reasoning and same incident as
-	// credentialbroker.DefaultProviderCallTimeout: the sidecar's own client timeout wraps the
-	// broker's whole call (including its own provider-call timeout), so it must stay at least as
-	// generous.
-	if DefaultBrokerCallTimeoutSeconds != 30 {
-		t.Errorf("DefaultBrokerCallTimeoutSeconds = %d, want 30", DefaultBrokerCallTimeoutSeconds)
+func TestDefaultBrokerCallTimeoutSeconds_Is45SecondsNotEqualToTheBrokersOwnDefault(t *testing.T) {
+	// Same incident as credentialbroker.DefaultProviderCallTimeout (30s), but deliberately not
+	// equal to it (coordinator review of PR #31): this call wraps the broker's whole provider
+	// call plus core's own request handling, so an equal value would race core's own timeout at
+	// the exact boundary instead of giving a clean margin.
+	if DefaultBrokerCallTimeoutSeconds != 45 {
+		t.Errorf("DefaultBrokerCallTimeoutSeconds = %d, want 45", DefaultBrokerCallTimeoutSeconds)
 	}
 }
 

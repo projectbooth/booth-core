@@ -97,11 +97,14 @@ type BrokerClient struct {
 
 // DefaultBrokerCallTimeoutSeconds is NewBrokerClient's default when timeout is zero. Raised from
 // an original 10s (2026-10-31): SeaweedFS IAM minting takes about 6s normally (three sequential
-// IAM calls), and two concurrent mints serializing against the old 10s left too little margin —
-// the sidecar's own client timeout must stay at least as generous as the broker's
-// credentialbroker.DefaultProviderCallTimeout, since it wraps that whole call plus core's own
-// request handling.
-const DefaultBrokerCallTimeoutSeconds = 30
+// IAM calls), and two concurrent mints serializing against the old 10s left too little margin.
+// Deliberately 15s more than credentialbroker.DefaultProviderCallTimeout (30s), not equal to it
+// (coordinator review of PR #31): this call wraps the broker's whole provider call *plus* core's
+// own request handling around it, so an equal value would let the sidecar's own timeout race
+// core's at the exact boundary — whichever fired first would look like the cause, when the real
+// story might be core's provider call alone taking the full 30s. 45s gives a clean, unambiguous
+// margin instead.
+const DefaultBrokerCallTimeoutSeconds = 45
 
 // NewBrokerClient builds a BrokerClient. timeout bounds a single call to the broker; zero means
 // DefaultBrokerCallTimeoutSeconds (cmd/credential-sidecar/main.go resolves this from
