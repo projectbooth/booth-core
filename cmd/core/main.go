@@ -425,7 +425,8 @@ func run() error {
 	// Credential broker (ADR 0080): always built, same as its keys — see credentialBrokerKeys'
 	// own comment on why there's no separate on/off toggle.
 	credentialBrokerSvc := credentialbroker.NewService(credentialBrokerKeys, reg, audit, credentialbroker.Options{
-		MaxTTL: cfg.CredentialBroker.MaxTTL,
+		MaxTTL:              cfg.CredentialBroker.MaxTTL,
+		ProviderCallTimeout: cfg.CredentialBroker.ProviderCallTimeout,
 	})
 
 	router := api.NewRouter(api.Deps{

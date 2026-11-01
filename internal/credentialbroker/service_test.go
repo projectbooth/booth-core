@@ -1,11 +1,14 @@
 package credentialbroker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -491,6 +494,130 @@ func TestDefaultMaxTTL_IsStricterThanAWorkloadToken(t *testing.T) {
 	// change to either constant is caught rather than silently drifting past the requirement.
 	if DefaultMaxTTL >= 10*time.Minute {
 		t.Errorf("DefaultMaxTTL = %s, want stricter (shorter) than workload's 10-minute token", DefaultMaxTTL)
+	}
+}
+
+// --- Regression: the 2026-10-31 SeaweedFS IAM-minting incident (providerCallTimeout raised from
+// --- 10s to a configurable default of 30s). ---------------------------------------------------
+
+func TestDefaultProviderCallTimeout_Is30Seconds(t *testing.T) {
+	// Pinned explicitly: raised from an original 10s because SeaweedFS IAM minting (three
+	// sequential IAM calls: CreateUser, PutUserPolicy, CreateAccessKey) takes about 6s normally,
+	// and two concurrent mints serializing against the old bound left too little margin.
+	if DefaultProviderCallTimeout != 30*time.Second {
+		t.Errorf("DefaultProviderCallTimeout = %s, want 30s", DefaultProviderCallTimeout)
+	}
+}
+
+func TestNewService_DefaultsProviderCallTimeoutWhenNotSet(t *testing.T) {
+	keys, err := NewKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(keys, &stubModules{}, NewMemoryStore(), Options{})
+	if svc.opts.ProviderCallTimeout != DefaultProviderCallTimeout {
+		t.Errorf("ProviderCallTimeout = %s, want the default %s", svc.opts.ProviderCallTimeout, DefaultProviderCallTimeout)
+	}
+	if svc.opts.HTTPClient.Timeout != DefaultProviderCallTimeout {
+		t.Errorf("HTTPClient.Timeout = %s, want the default %s", svc.opts.HTTPClient.Timeout, DefaultProviderCallTimeout)
+	}
+}
+
+func TestNewService_HonoursAnExplicitProviderCallTimeout(t *testing.T) {
+	keys, err := NewKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(keys, &stubModules{}, NewMemoryStore(), Options{ProviderCallTimeout: 3 * time.Second})
+	if svc.opts.ProviderCallTimeout != 3*time.Second {
+		t.Errorf("ProviderCallTimeout = %s, want 3s", svc.opts.ProviderCallTimeout)
+	}
+	if svc.opts.HTTPClient.Timeout != 3*time.Second {
+		t.Errorf("HTTPClient.Timeout = %s, want 3s", svc.opts.HTTPClient.Timeout)
+	}
+}
+
+// TestIssue_ProviderCallTimeoutActuallyBoundsTheRealCall is the behavioral half of the above: a
+// configured Options.ProviderCallTimeout isn't just stored, it actually governs callProvider's
+// context deadline against a real, slow HTTP provider. Bounded to run fast (a 50ms timeout
+// against a provider that sleeps 500ms) rather than waiting out a real multi-second timeout.
+func TestIssue_ProviderCallTimeoutActuallyBoundsTheRealCall(t *testing.T) {
+	provider := newRealProvider(t)
+	provider.respond = func(providerRequest) (int, any) {
+		time.Sleep(500 * time.Millisecond)
+		return http.StatusCreated, Response{LeaseID: "lease-abc", Kind: "s3", ExpiresAt: time.Now().Add(time.Hour), Credential: json.RawMessage(`{}`)}
+	}
+	svc, _, _ := newFixture(t, provider, "s3")
+	svc.opts.ProviderCallTimeout = 50 * time.Millisecond
+
+	start := time.Now()
+	_, err := svc.Issue(context.Background(), "u-x", "acme", auth.RoleOwner, req("s3", AccessRead))
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrProviderUnavailable) {
+		t.Fatalf("err = %v, want ErrProviderUnavailable (the 50ms timeout should have fired)", err)
+	}
+	if elapsed > 400*time.Millisecond {
+		t.Errorf("Issue took %s, want well under the provider's 500ms sleep (the 50ms timeout should have cut it short)", elapsed)
+	}
+}
+
+func TestExtractBackendID(t *testing.T) {
+	cases := []struct {
+		name  string
+		scope json.RawMessage
+		want  string
+	}{
+		{"present", json.RawMessage(`{"backendId":"lake","path":"t1"}`), "lake"},
+		{"absent", json.RawMessage(`{"path":"t1"}`), ""},
+		{"empty object", json.RawMessage(`{}`), ""},
+		{"malformed json", json.RawMessage(`not-json`), ""},
+		{"nil scope", nil, ""},
+		{"null scope", json.RawMessage(`null`), ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := extractBackendID(c.scope); got != c.want {
+				t.Errorf("extractBackendID(%s) = %q, want %q", c.scope, got, c.want)
+			}
+		})
+	}
+}
+
+// TestLogSlowProviderCall exercises the threshold decision directly with synthetic durations —
+// no real sleeping — so the exact 5s boundary is tested precisely and fast.
+func TestLogSlowProviderCall(t *testing.T) {
+	cases := []struct {
+		name     string
+		duration time.Duration
+		wantLog  bool
+	}{
+		{"well under threshold", 1 * time.Second, false},
+		{"just under threshold", slowProviderCallLogThreshold - time.Millisecond, false},
+		{"exactly at threshold", slowProviderCallLogThreshold, false},
+		{"just over threshold", slowProviderCallLogThreshold + time.Millisecond, true},
+		{"well over threshold", 8 * time.Second, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			log.SetOutput(&buf)
+			t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+			logSlowProviderCall("s3", "storage", "lake", c.duration)
+
+			got := buf.Len() > 0
+			if got != c.wantLog {
+				t.Errorf("logged = %v, want %v (duration %s, threshold %s); output: %q", got, c.wantLog, c.duration, slowProviderCallLogThreshold, buf.String())
+			}
+			if c.wantLog {
+				for _, want := range []string{"kind=s3", "provider=storage", `backendId="lake"`} {
+					if !strings.Contains(buf.String(), want) {
+						t.Errorf("log output %q missing %q", buf.String(), want)
+					}
+				}
+			}
+		})
 	}
 }
 

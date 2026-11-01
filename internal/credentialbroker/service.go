@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strings"
@@ -45,9 +46,20 @@ const (
 	// requested kind.
 	ProviderPath = "/internal/credentials"
 
-	// providerCallTimeout bounds a single provider call, so one slow/hung provider can't stall
-	// the broker route indefinitely.
-	providerCallTimeout = 10 * time.Second
+	// DefaultProviderCallTimeout bounds a single provider call, so one slow/hung provider can't
+	// stall the broker route indefinitely — overridable via Options.ProviderCallTimeout, which
+	// internal/config reads from BOOTH_CREDENTIAL_BROKER_PROVIDER_CALL_TIMEOUT (same bare-env-var
+	// shape as the existing BOOTH_CREDENTIAL_BROKER_MAX_TTL, no chart value — see that config
+	// field's own comment). Raised from an original 10s after a real incident (2026-10-31):
+	// SeaweedFS IAM minting takes about 6s normally (three sequential IAM calls — CreateUser,
+	// PutUserPolicy, CreateAccessKey), and two concurrent mints serializing against that left too
+	// little margin against the old 10s bound.
+	DefaultProviderCallTimeout = 30 * time.Second
+
+	// slowProviderCallLogThreshold is fixed, not configurable (unlike the two timeouts above) —
+	// it's an operational signal, not a behavior knob. Logged at INFO (see logSlowProviderCall)
+	// so a mint that's merely slow, not yet timing out, shows up before it becomes an outage.
+	slowProviderCallLogThreshold = 5 * time.Second
 
 	// AccessRead / AccessReadWrite / AccessTableWrite are the values Request.Access accepts.
 	// Shared, broker-level vocabulary (unlike Scope, which is opaque per kind) specifically
@@ -168,7 +180,14 @@ type Modules interface {
 
 // Options configures a Service.
 type Options struct {
-	MaxTTL     time.Duration
+	MaxTTL time.Duration
+
+	// ProviderCallTimeout bounds a single provider call (see DefaultProviderCallTimeout). Zero
+	// means the default. Only takes effect on the context deadline callProvider sets on every
+	// call; if HTTPClient is also set explicitly, its own Timeout field (if any) still applies
+	// independently — the shorter of the two governs in practice.
+	ProviderCallTimeout time.Duration
+
 	HTTPClient *http.Client
 	Now        func() time.Time
 }
@@ -184,14 +203,17 @@ type Service struct {
 	opts    Options
 }
 
-// NewService builds a Service. Defaults: DefaultMaxTTL, a 10s-per-call HTTP client, the system
+// NewService builds a Service. Defaults: DefaultMaxTTL, DefaultProviderCallTimeout, the system
 // clock.
 func NewService(keys *Keys, modules Modules, audit AuditStore, opts Options) *Service {
 	if opts.MaxTTL <= 0 {
 		opts.MaxTTL = DefaultMaxTTL
 	}
+	if opts.ProviderCallTimeout <= 0 {
+		opts.ProviderCallTimeout = DefaultProviderCallTimeout
+	}
 	if opts.HTTPClient == nil {
-		opts.HTTPClient = &http.Client{Timeout: providerCallTimeout}
+		opts.HTTPClient = &http.Client{Timeout: opts.ProviderCallTimeout}
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -233,7 +255,12 @@ func (s *Service) Issue(ctx context.Context, subject, workspace string, role aut
 	// options.revoke=true, tables: []) answers 201 with credential: null — a genuine success,
 	// not an incomplete response, and the one case this layer must not reject the way it rejects
 	// every other provider that forgets to include a credential.
+	// time.Now() directly, not s.opts.Now(): that option exists for audit-timestamp bookkeeping
+	// and a test is free to freeze it, which must never also freeze this measurement of real
+	// elapsed wall-clock time.
+	callStart := time.Now()
 	resp, err := s.callProvider(ctx, mod, body, isRevokeRequest(req))
+	logSlowProviderCall(req.Kind, mod.Spec.ID, extractBackendID(req.Scope), time.Since(callStart))
 	if err != nil {
 		return Response{}, err
 	}
@@ -315,6 +342,36 @@ func (s *Service) findProvider(kind string) (registry.Module, error) {
 	}
 }
 
+// extractBackendID best-effort pulls a "backendId" field out of an opaque, kind-specific scope —
+// present by convention on every kind actually in use today (s3's {backendId, path, ...}; see
+// req() in the test file), but scope's shape is never guaranteed fleet-wide, so a missing or
+// unparseable field returns "" rather than erroring. Used only for the slow-call log line below;
+// never for any authorization or routing decision.
+func extractBackendID(scope json.RawMessage) string {
+	var v struct {
+		BackendID string `json:"backendId"`
+	}
+	if err := json.Unmarshal(scope, &v); err != nil {
+		return ""
+	}
+	return v.BackendID
+}
+
+// logSlowProviderCall logs at INFO when a single provider call (callProvider, inside Issue) took
+// longer than slowProviderCallLogThreshold — an operational early-warning signal distinct from
+// ProviderCallTimeout itself: this fires well before a call would actually time out, so a
+// provider trending slow (the 2026-10-31 SeaweedFS IAM-minting incident this was added for)
+// shows up in logs before it becomes an outage. Fires regardless of whether the call ultimately
+// succeeded or failed — a slow call that then times out is exactly as diagnostically interesting
+// as a slow call that didn't.
+func logSlowProviderCall(kind, providerModuleID, backendID string, d time.Duration) {
+	if d <= slowProviderCallLogThreshold {
+		return
+	}
+	log.Printf("credential broker: INFO: slow provider call: kind=%s provider=%s backendId=%q duration=%s",
+		kind, providerModuleID, backendID, d)
+}
+
 // isRevokeRequest reports whether req is booth-database's documented revoke shape (ADR 0117
 // "Reconciled design" item 4 / docs/design-app-writes.md §3 in booth-database: access
 // "tablewrite", options: {"revoke": true}) — the one request shape a provider's 201 may legally
@@ -342,7 +399,7 @@ func isNullOrAbsent(raw json.RawMessage) bool {
 }
 
 func (s *Service) callProvider(ctx context.Context, mod registry.Module, body []byte, allowNullCredential bool) (Response, error) {
-	callCtx, cancel := context.WithTimeout(ctx, providerCallTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, s.opts.ProviderCallTimeout)
 	defer cancel()
 
 	url := strings.TrimRight(mod.BaseURL(), "/") + ProviderPath

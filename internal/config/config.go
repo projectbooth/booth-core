@@ -167,6 +167,13 @@ type CredentialBrokerConfig struct {
 	// "a stricter default ceiling than an HTTP grant() token's"). Zero means the default
 	// (credentialbroker.DefaultMaxTTL, 5 minutes).
 	MaxTTL time.Duration
+
+	// ProviderCallTimeout bounds a single call from the broker to a provider module. Zero means
+	// the default (credentialbroker.DefaultProviderCallTimeout, 30 seconds). Same bare-env-var
+	// shape as MaxTTL above, no chart value — raise it (BOOTH_CREDENTIAL_BROKER_PROVIDER_CALL_
+	// TIMEOUT) if a provider's own backing calls (e.g. SeaweedFS IAM minting) are legitimately
+	// slower than that.
+	ProviderCallTimeout time.Duration
 }
 
 // PostgresConfig is the shared-PostgreSQL configuration (ADR 0053). The bundled Helm chart
@@ -289,6 +296,13 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("BOOTH_CREDENTIAL_BROKER_MAX_TTL: %q is not a positive duration (e.g. 5m)", v)
 		}
 		cfg.CredentialBroker.MaxTTL = d
+	}
+	if v := os.Getenv("BOOTH_CREDENTIAL_BROKER_PROVIDER_CALL_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return Config{}, fmt.Errorf("BOOTH_CREDENTIAL_BROKER_PROVIDER_CALL_TIMEOUT: %q is not a positive duration (e.g. 30s)", v)
+		}
+		cfg.CredentialBroker.ProviderCallTimeout = d
 	}
 	cfg.NATSModuleURL = getEnv("BOOTH_NATS_MODULE_URL", qualifyNATSURL(cfg.NATSURL, cfg.KubeNamespace))
 
